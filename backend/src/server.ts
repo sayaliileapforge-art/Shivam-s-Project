@@ -12,8 +12,18 @@ import orderRoutes from './routes/orders';
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+function parseCsvOrigins(value?: string): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 const allowedOrigins = new Set([
-  process.env.CORS_ORIGIN || 'http://localhost:5173',
+  ...parseCsvOrigins(process.env.CORS_ORIGIN),
+  ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL.trim()] : []),
+  'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:5175',
 ]);

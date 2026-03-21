@@ -4,7 +4,24 @@
  * Falls back to localStorage if API unavailable
  */
 
-const API_BASE = '/api';
+declare global {
+  interface ImportMetaEnv {
+    readonly VITE_API_BASE_URL?: string;
+  }
+}
+
+function resolveApiBase(): string {
+  const raw = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
+  if (!raw) return '/api';
+
+  const normalized = raw.replace(/\/$/, '');
+  if (normalized.endsWith('/api')) {
+    return normalized;
+  }
+  return `${normalized}/api`;
+}
+
+const API_BASE = resolveApiBase();
 
 interface ApiResponse<T> {
   success: boolean;

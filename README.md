@@ -168,6 +168,31 @@ Backend: Already configured in `backend/.env`
 
 ## Deployment
 
+### Deploy on Render
+
+This repo includes a Render blueprint file at render.yaml for deploying both services:
+
+- Frontend static site (Vite build output)
+- Backend Node web service (Express + MongoDB)
+
+Steps:
+
+1. Push your latest code to GitHub.
+2. In Render, create a new Blueprint and select this repository.
+3. Render will detect render.yaml and create two services.
+4. Set backend environment variables:
+	- MONGODB_URI
+	- CORS_ORIGIN (set to your frontend Render URL)
+	- FRONTEND_URL (same frontend URL)
+5. Set frontend environment variable:
+	- VITE_API_BASE_URL (set to your backend Render URL, for example https://your-backend.onrender.com)
+6. Deploy both services.
+
+After deployment:
+
+- Backend health check: /health
+- Frontend serves SPA routes via rewrite to /index.html
+
 ### Production Build
 
 **Frontend:**
