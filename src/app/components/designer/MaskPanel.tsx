@@ -5,6 +5,7 @@ import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import { Slider } from "../ui/slider";
 import { Separator } from "../ui/separator";
+import { Switch } from "../ui/switch";
 import { Upload, X } from "lucide-react";
 import type { FabricCanvasHandle, ImageMaskShape } from "./FabricCanvas";
 
@@ -110,6 +111,22 @@ function SLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+function hexToRgba(hex: string, alpha: number): string {
+  const value = hex.replace("#", "");
+  const normalized =
+    value.length === 3
+      ? value
+          .split("")
+          .map((char) => `${char}${char}`)
+          .join("")
+      : value;
+  const intValue = Number.parseInt(normalized, 16);
+  const r = (intValue >> 16) & 255;
+  const g = (intValue >> 8) & 255;
+  const b = intValue & 255;
+  return `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, alpha))})`;
+}
+
 export function MaskPanel({ selected, canvasRef, onRefresh }: Props) {
   const isImage = selected?.type === "image";
   const pngMaskInputRef = useRef<HTMLInputElement>(null);
@@ -135,10 +152,138 @@ export function MaskPanel({ selected, canvasRef, onRefresh }: Props) {
     maskRadius?: number;
     _pngMaskSrc?: string;
     _originalSrc?: string;
+    fxBorderWidth?: number;
+    fxBorderColor?: string;
+    fxUseGradientBorder?: boolean;
+    fxGradientFrom?: string;
+    fxGradientTo?: string;
+    fxGradientAngle?: number;
+    fxShadowEnabled?: boolean;
+    fxShadowX?: number;
+    fxShadowY?: number;
+    fxShadowBlur?: number;
+    fxShadowColor?: string;
+    fxShadowOpacity?: number;
+    fxOpacity?: number;
+    fxGlowEnabled?: boolean;
+    fxGlowColor?: string;
+    fxGlowIntensity?: number;
+    fxGlowSize?: number;
   };
   const maskShape  = image.maskShape  ?? "none";
   const maskRadius = Number(image.maskRadius ?? 24);
   const hasPngMask = Boolean(image._pngMaskSrc);
+
+  const fx = {
+    borderWidth: Number(image.fxBorderWidth ?? image.strokeWidth ?? 0),
+    borderColor: String(image.fxBorderColor ?? "#0f172a"),
+    useGradientBorder: Boolean(image.fxUseGradientBorder ?? false),
+    gradientFrom: String(image.fxGradientFrom ?? "#06b6d4"),
+    gradientTo: String(image.fxGradientTo ?? "#8b5cf6"),
+    gradientAngle: Number(image.fxGradientAngle ?? 120),
+
+    shadowEnabled: Boolean(image.fxShadowEnabled ?? false),
+    shadowX: Number(image.fxShadowX ?? 0),
+    shadowY: Number(image.fxShadowY ?? 10),
+    shadowBlur: Number(image.fxShadowBlur ?? 24),
+    shadowColor: String(image.fxShadowColor ?? "#0f172a"),
+    shadowOpacity: Number(image.fxShadowOpacity ?? 0.35),
+
+    opacity: Number(image.fxOpacity ?? image.opacity ?? 1),
+
+    glowEnabled: Boolean(image.fxGlowEnabled ?? false),
+    glowColor: String(image.fxGlowColor ?? "#22d3ee"),
+    glowIntensity: Number(image.fxGlowIntensity ?? 0.7),
+    glowSize: Number(image.fxGlowSize ?? 24),
+  };
+
+  const applyFx = (patch: Partial<typeof fx>) => {
+    const next = { ...fx, ...patch };
+    const width = image.width ?? 0;
+    const height = image.height ?? 0;
+
+    let stroke: any = next.borderColor;
+    if (next.useGradientBorder && width > 0 && height > 0) {
+      const theta = (next.gradientAngle * Math.PI) / 180;
+      const dx = Math.cos(theta) * width * 0.5;
+      const dy = Math.sin(theta) * height * 0.5;
+      stroke = new fabric.Gradient({
+        type: "linear",
+        coords: {
+          x1: -dx,
+          y1: -dy,
+          x2: dx,
+          y2: dy,
+        },
+        colorStops: [
+          { offset: 0, color: next.gradientFrom },
+          { offset: 1, color: next.gradientTo },
+        ],
+      });
+    }
+
+    let shadow: fabric.Shadow | null = null;
+    if (next.shadowEnabled || next.glowEnabled) {
+      const glowBlur = Math.max(1, next.glowSize * 2);
+      const shadowBlur = Math.max(0, next.shadowBlur);
+
+      let shadowColor = hexToRgba(next.shadowColor, next.shadowOpacity);
+      let blur = shadowBlur;
+      let offsetX = next.shadowEnabled ? next.shadowX : 0;
+      let offsetY = next.shadowEnabled ? next.shadowY : 0;
+
+      if (next.glowEnabled && next.shadowEnabled) {
+        // Single Fabric shadow can only hold one layer; combine both effects so glow controls still matter.
+        shadowColor = hexToRgba(next.glowColor, Math.max(next.glowIntensity, next.shadowOpacity));
+        blur = shadowBlur + glowBlur;
+      } else if (next.glowEnabled) {
+        shadowColor = hexToRgba(next.glowColor, Math.max(0.1, next.glowIntensity));
+        blur = glowBlur;
+        offsetX = 0;
+        offsetY = 0;
+      }
+
+      shadow = new fabric.Shadow({
+        color: shadowColor,
+        blur,
+        offsetX,
+        offsetY,
+      });
+    }
+
+    image.set({
+      stroke,
+      strokeWidth: Math.max(0, next.borderWidth),
+      strokeUniform: true,
+      opacity: Math.max(0, Math.min(1, next.opacity)),
+      shadow,
+
+      fxBorderWidth: next.borderWidth,
+      fxBorderColor: next.borderColor,
+      fxUseGradientBorder: next.useGradientBorder,
+      fxGradientFrom: next.gradientFrom,
+      fxGradientTo: next.gradientTo,
+      fxGradientAngle: next.gradientAngle,
+
+      fxShadowEnabled: next.shadowEnabled,
+      fxShadowX: next.shadowX,
+      fxShadowY: next.shadowY,
+      fxShadowBlur: next.shadowBlur,
+      fxShadowColor: next.shadowColor,
+      fxShadowOpacity: next.shadowOpacity,
+
+      fxOpacity: next.opacity,
+
+      fxGlowEnabled: next.glowEnabled,
+      fxGlowColor: next.glowColor,
+      fxGlowIntensity: next.glowIntensity,
+      fxGlowSize: next.glowSize,
+      dirty: true,
+    });
+
+    canvasRef.current?.getCanvas()?.requestRenderAll();
+    onRefresh();
+  };
 
   const handlePngMaskUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -250,6 +395,182 @@ export function MaskPanel({ selected, canvasRef, onRefresh }: Props) {
             canvasRef.current?.setImageBorderRadius(v);
             onRefresh();
           }}
+        />
+      </div>
+
+      <Separator />
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <SLabel>Border</SLabel>
+          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+            <span>Gradient</span>
+            <Switch
+              checked={fx.useGradientBorder}
+              onCheckedChange={(checked) => applyFx({ useGradientBorder: checked })}
+            />
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+            <span>Thickness</span>
+            <span>{Math.round(fx.borderWidth)}px</span>
+          </div>
+          <Slider
+            min={0}
+            max={10}
+            step={1}
+            value={[Math.max(0, Math.min(10, fx.borderWidth))]}
+            onValueChange={([v]) => applyFx({ borderWidth: v })}
+          />
+        </div>
+
+        {fx.useGradientBorder ? (
+          <>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">From</Label>
+                <Input
+                  type="color"
+                  value={fx.gradientFrom}
+                  onChange={(e) => applyFx({ gradientFrom: e.target.value })}
+                  className="h-8 p-1"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">To</Label>
+                <Input
+                  type="color"
+                  value={fx.gradientTo}
+                  onChange={(e) => applyFx({ gradientTo: e.target.value })}
+                  className="h-8 p-1"
+                />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                <span>Angle</span>
+                <span>{Math.round(fx.gradientAngle)}deg</span>
+              </div>
+              <Slider
+                min={0}
+                max={360}
+                step={1}
+                value={[Math.max(0, Math.min(360, fx.gradientAngle))]}
+                onValueChange={([v]) => applyFx({ gradientAngle: v })}
+              />
+            </div>
+          </>
+        ) : (
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground">Border Color</Label>
+            <Input
+              type="color"
+              value={fx.borderColor}
+              onChange={(e) => applyFx({ borderColor: e.target.value })}
+              className="h-8 p-1"
+            />
+          </div>
+        )}
+      </div>
+
+      <Separator />
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <SLabel>Shadow</SLabel>
+          <Switch
+            checked={fx.shadowEnabled}
+            onCheckedChange={(checked) => applyFx({ shadowEnabled: checked })}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+              <span>Offset X</span>
+              <span>{Math.round(fx.shadowX)}px</span>
+            </div>
+            <Slider min={-40} max={40} step={1} value={[fx.shadowX]} onValueChange={([v]) => applyFx({ shadowX: v })} />
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+              <span>Offset Y</span>
+              <span>{Math.round(fx.shadowY)}px</span>
+            </div>
+            <Slider min={-40} max={40} step={1} value={[fx.shadowY]} onValueChange={([v]) => applyFx({ shadowY: v })} />
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+            <span>Blur</span>
+            <span>{Math.round(fx.shadowBlur)}px</span>
+          </div>
+          <Slider min={0} max={80} step={1} value={[fx.shadowBlur]} onValueChange={([v]) => applyFx({ shadowBlur: v })} />
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground">Shadow Color</Label>
+            <Input type="color" value={fx.shadowColor} onChange={(e) => applyFx({ shadowColor: e.target.value })} className="h-8 p-1" />
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+              <span>Opacity</span>
+              <span>{fx.shadowOpacity.toFixed(2)}</span>
+            </div>
+            <Slider min={0} max={1} step={0.01} value={[fx.shadowOpacity]} onValueChange={([v]) => applyFx({ shadowOpacity: v })} />
+          </div>
+        </div>
+      </div>
+
+      <Separator />
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <SLabel>Glow</SLabel>
+          <Switch
+            checked={fx.glowEnabled}
+            onCheckedChange={(checked) => applyFx({ glowEnabled: checked })}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground">Glow Color</Label>
+            <Input type="color" value={fx.glowColor} onChange={(e) => applyFx({ glowColor: e.target.value })} className="h-8 p-1" />
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+              <span>Glow Size</span>
+              <span>{Math.round(fx.glowSize)}px</span>
+            </div>
+            <Slider min={4} max={60} step={1} value={[fx.glowSize]} onValueChange={([v]) => applyFx({ glowSize: v })} />
+          </div>
+        </div>
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+            <span>Glow Intensity</span>
+            <span>{fx.glowIntensity.toFixed(2)}</span>
+          </div>
+          <Slider min={0} max={1} step={0.01} value={[fx.glowIntensity]} onValueChange={([v]) => applyFx({ glowIntensity: v })} />
+        </div>
+      </div>
+
+      <Separator />
+
+      <div className="space-y-1.5">
+        <SLabel>Opacity</SLabel>
+        <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+          <span>Image Opacity</span>
+          <span>{fx.opacity.toFixed(2)}</span>
+        </div>
+        <Slider
+          min={0}
+          max={1}
+          step={0.01}
+          value={[Math.max(0, Math.min(1, fx.opacity))]}
+          onValueChange={([v]) => applyFx({ opacity: v })}
         />
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { DndProvider, useDrag, useDrop } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
@@ -52,13 +52,15 @@ import {
 import { Can } from "../../lib/rbac";
 import { Permission } from "../../lib/rbac";
 import {
-  loadProjects,
-  addProject,
-  updateProjectStage,
-  deleteProject,
   type Project,
 } from "../../lib/projectStore";
-import { loadClients } from "../../lib/clientStore";
+import { loadClients, type Client } from "../../lib/clientStore";
+import {
+  fetchProjects as apiFetchProjects,
+  createProject as apiCreateProject,
+  updateProject as apiUpdateProject,
+  deleteProject as apiDeleteProject,
+} from "../../lib/apiService";
 
 const stages = [
   { id: "draft", name: "Draft", color: "bg-gray-100 border-gray-300" },
@@ -84,6 +86,7 @@ const getPriorityBadge = (priority: string) => {
 const emptyForm = {
   name: "",
   clientId: "",
+  workflowType: "variable_data" as "variable_data" | "direct_print",
   stage: "draft",
   priority: "medium" as Project["priority"],
   dueDate: "",
@@ -92,12 +95,33 @@ const emptyForm = {
   description: "",
 };
 
+const mapApiProjectToUi = (p: any): Project => {
+  const populatedClient = typeof p.clientId === "object" && p.clientId !== null ? p.clientId : null;
+  const status = String(p.stage || p.status || "draft");
+
+  return {
+    id: String(p._id || p.id),
+    name: String(p.name || "Untitled Project"),
+    client: String(p.client || populatedClient?.clientName || "Unknown Client"),
+    clientId: String(populatedClient?._id || p.clientId || ""),
+    stage: status,
+    priority: (p.priority || "medium") as Project["priority"],
+    dueDate: String(p.dueDate || ""),
+    assignee: String(p.assignee || ""),
+    amount: Number(p.amount || 0),
+    description: String(p.description || ""),
+    workflowType: (p.workflowType || "variable_data") as Project["workflowType"],
+    createdAt: String(p.createdAt || new Date().toISOString()),
+  };
+};
+
 interface ProjectCardProps {
   project: Project;
   onDelete: (id: string) => void;
+  onEdit: (project: Project) => void;
 }
 
-const ProjectCard = ({ project, onDelete }: ProjectCardProps) => {
+const ProjectCard = ({ project, onDelete, onEdit }: ProjectCardProps) => {
   const [{ isDragging }, drag] = useDrag(() => ({
     type: "PROJECT",
     item: { id: project.id, stage: project.stage },
@@ -106,7 +130,9 @@ const ProjectCard = ({ project, onDelete }: ProjectCardProps) => {
 
   return (
     <div
-      ref={drag}
+      ref={(node) => {
+        drag(node);
+      }}
       className={`bg-white rounded-lg border shadow-sm p-4 cursor-move hover:shadow-md transition-shadow ${
         isDragging ? "opacity-50" : ""
       }`}
@@ -136,7 +162,7 @@ const ProjectCard = ({ project, onDelete }: ProjectCardProps) => {
               </Link>
             </DropdownMenuItem>
             <Can permission={Permission.PROJECTS__CREATE}>
-              <DropdownMenuItem>
+              <DropdownMenuItem onClick={() => onEdit(project)}>
                 <Edit className="h-4 w-4 mr-2" />
                 Edit Project
               </DropdownMenuItem>
@@ -196,9 +222,10 @@ interface KanbanColumnProps {
   projects: Project[];
   onDrop: (id: string, stage: string) => void;
   onDelete: (id: string) => void;
+  onEdit: (project: Project) => void;
 }
 
-const KanbanColumn = ({ stage, projects, onDrop, onDelete }: KanbanColumnProps) => {
+const KanbanColumn = ({ stage, projects, onDrop, onDelete, onEdit }: KanbanColumnProps) => {
   const [{ isOver }, drop] = useDrop(() => ({
     accept: "PROJECT",
     drop: (item: { id: string; stage: string }) => {
@@ -213,7 +240,9 @@ const KanbanColumn = ({ stage, projects, onDrop, onDelete }: KanbanColumnProps) 
 
   return (
     <div
-      ref={drop}
+      ref={(node) => {
+        drop(node);
+      }}
       className={`flex-shrink-0 w-80 rounded-lg border-2 ${stage.color} ${
         isOver ? "ring-2 ring-secondary" : ""
       }`}
@@ -229,7 +258,7 @@ const KanbanColumn = ({ stage, projects, onDrop, onDelete }: KanbanColumnProps) 
       <ScrollArea className="h-[calc(100vh-300px)]">
         <div className="p-4 space-y-3">
           {stageProjects.map((project) => (
-            <ProjectCard key={project.id} project={project} onDelete={onDelete} />
+            <ProjectCard key={project.id} project={project} onDelete={onDelete} onEdit={onEdit} />
           ))}
         </div>
       </ScrollArea>
@@ -239,14 +268,59 @@ const KanbanColumn = ({ stage, projects, onDrop, onDelete }: KanbanColumnProps) 
 
 export function Projects() {
   const [viewMode, setViewMode] = useState<"kanban" | "list">("kanban");
+  const [clients, setClients] = useState<Client[]>([]);
+  const [allProjects, setAllProjects] = useState<Project[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [errors, setErrors] = useState<Partial<typeof emptyForm>>({});
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
+  const [editForm, setEditForm] = useState(emptyForm);
+  const [editErrors, setEditErrors] = useState<Partial<typeof emptyForm>>({});
   const [version, setVersion] = useState(0);
 
-  const allProjects = loadProjects();
-  const clients = loadClients();
+  useEffect(() => {
+    let mounted = true;
+    loadClients()
+      .then((data) => {
+        if (mounted) {
+          setClients(Array.isArray(data) ? data : []);
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setClients([]);
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    apiFetchProjects()
+      .then((data) => {
+        if (!mounted) return;
+        if (!Array.isArray(data)) {
+          setAllProjects([]);
+          return;
+        }
+        setAllProjects(data.map(mapApiProjectToUi));
+      })
+      .catch(() => {
+        if (mounted) {
+          setAllProjects([]);
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, [version]);
+
   void version;
 
   const filtered = allProjects.filter(
@@ -285,10 +359,10 @@ export function Projects() {
     return Object.keys(e).length === 0;
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!validate()) return;
     const client = clients.find((c) => c.id === form.clientId);
-    addProject({
+    const payload = {
       name: form.name,
       clientId: form.clientId,
       client: client?.clientName ?? form.clientId,
@@ -298,21 +372,88 @@ export function Projects() {
       assignee: form.assignee,
       amount: Number(form.amount),
       description: form.description,
-    });
+      workflowType: form.workflowType,
+    };
+
+    const created = await apiCreateProject(payload);
+    if (created) {
+      setVersion((v) => v + 1);
+    }
+
     setForm(emptyForm);
     setErrors({});
     setIsDialogOpen(false);
-    setVersion((v) => v + 1);
   };
 
-  const handleDrop = (id: string, stage: string) => {
-    updateProjectStage(id, stage);
-    setVersion((v) => v + 1);
+  const handleEditOpen = (project: Project) => {
+    setEditingProject(project);
+    setEditForm({
+      name: project.name,
+      clientId: project.clientId,
+      workflowType: project.workflowType || "variable_data",
+      stage: project.stage,
+      priority: project.priority,
+      dueDate: project.dueDate,
+      assignee: project.assignee,
+      amount: String(project.amount),
+      description: project.description,
+    });
+    setEditErrors({});
+    setIsEditDialogOpen(true);
   };
 
-  const handleDelete = (id: string) => {
-    deleteProject(id);
-    setVersion((v) => v + 1);
+  const validateEdit = () => {
+    const e: Partial<typeof editForm> = {};
+    if (!editForm.name.trim()) e.name = "Project name is required";
+    if (!editForm.clientId) e.clientId = "Select a client";
+    if (!editForm.dueDate) e.dueDate = "Due date is required";
+    if (!editForm.amount || Number(editForm.amount) < 0) e.amount = "Enter a valid amount";
+    setEditErrors(e);
+    return Object.keys(e).length === 0;
+  };
+
+  const handleEditSubmit = async () => {
+    if (!validateEdit() || !editingProject) return;
+    const client = clients.find((c) => c.id === editForm.clientId);
+    const updated = await apiUpdateProject(editingProject.id, {
+      name: editForm.name,
+      clientId: editForm.clientId,
+      client: client?.clientName ?? editForm.clientId,
+      stage: editForm.stage,
+      priority: editForm.priority,
+      dueDate: editForm.dueDate,
+      assignee: editForm.assignee,
+      amount: Number(editForm.amount),
+      description: editForm.description,
+      workflowType: editForm.workflowType,
+    });
+
+    if (updated) {
+      setVersion((v) => v + 1);
+    }
+
+    setEditingProject(null);
+    setEditForm(emptyForm);
+    setEditErrors({});
+    setIsEditDialogOpen(false);
+  };
+
+  const setEditField = (field: keyof typeof emptyForm) =>
+    (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
+      setEditForm((f) => ({ ...f, [field]: e.target.value }));
+
+  const handleDrop = async (id: string, stage: string) => {
+    const updated = await apiUpdateProject(id, { stage });
+    if (updated) {
+      setVersion((v) => v + 1);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    const ok = await apiDeleteProject(id);
+    if (ok) {
+      setVersion((v) => v + 1);
+    }
   };
 
   return (
@@ -356,6 +497,17 @@ export function Projects() {
                     </SelectContent>
                   </Select>
                   {errors.clientId && <p className="text-xs text-destructive">{errors.clientId}</p>}
+                </div>
+                {/* Workflow Type */}
+                <div className="space-y-2">
+                  <Label>Workflow Type <span className="text-destructive">*</span></Label>
+                  <Select value={form.workflowType} onValueChange={(v) => setForm((f) => ({ ...f, workflowType: v as "variable_data" | "direct_print" }))}>
+                    <SelectTrigger><SelectValue placeholder="Select workflow type" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="variable_data">Variable Data Printing</SelectItem>
+                      <SelectItem value="direct_print">Direct Print Order</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
                 {/* Stage & Priority */}
                 <div className="grid grid-cols-2 gap-4">
@@ -416,6 +568,102 @@ export function Projects() {
             </DialogContent>
           </Dialog>
         </Can>
+        
+        {/* Edit Project Dialog */}
+        <Dialog open={isEditDialogOpen} onOpenChange={(open) => { setIsEditDialogOpen(open); if (!open) { setEditingProject(null); setEditForm(emptyForm); setEditErrors({}); } }}>
+          <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>Edit Project</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4 py-2">
+              {/* Name */}
+              <div className="space-y-2">
+                <Label>Project Name <span className="text-destructive">*</span></Label>
+                <Input placeholder="Project name" value={editForm.name} onChange={setEditField("name")} />
+                {editErrors.name && <p className="text-xs text-destructive">{editErrors.name}</p>}
+              </div>
+              {/* Client */}
+              <div className="space-y-2">
+                <Label>Client <span className="text-destructive">*</span></Label>
+                <Select value={editForm.clientId} onValueChange={(v) => setEditForm((f) => ({ ...f, clientId: v }))}>
+                  <SelectTrigger><SelectValue placeholder="Select client" /></SelectTrigger>
+                  <SelectContent className="max-h-60">
+                    {clients.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>{c.clientName}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {editErrors.clientId && <p className="text-xs text-destructive">{editErrors.clientId}</p>}
+              </div>
+              {/* Workflow Type */}
+              <div className="space-y-2">
+                <Label>Workflow Type <span className="text-destructive">*</span></Label>
+                <Select value={editForm.workflowType} onValueChange={(v) => setEditForm((f) => ({ ...f, workflowType: v as "variable_data" | "direct_print" }))}>
+                  <SelectTrigger><SelectValue placeholder="Select workflow type" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="variable_data">Variable Data Printing</SelectItem>
+                    <SelectItem value="direct_print">Direct Print Order</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {/* Stage & Priority */}
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Stage</Label>
+                  <Select value={editForm.stage} onValueChange={(v) => setEditForm((f) => ({ ...f, stage: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {stages.map((s) => (
+                        <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label>Priority</Label>
+                  <Select value={editForm.priority} onValueChange={(v) => setEditForm((f) => ({ ...f, priority: v as Project["priority"] }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="low">Low</SelectItem>
+                      <SelectItem value="medium">Medium</SelectItem>
+                      <SelectItem value="high">High</SelectItem>
+                      <SelectItem value="urgent">Urgent</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              {/* Due Date & Amount */}
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Due Date <span className="text-destructive">*</span></Label>
+                  <Input type="date" value={editForm.dueDate} onChange={setEditField("dueDate")} />
+                  {editErrors.dueDate && <p className="text-xs text-destructive">{editErrors.dueDate}</p>}
+                </div>
+                <div className="space-y-2">
+                  <Label>Amount (₹) <span className="text-destructive">*</span></Label>
+                  <Input type="number" placeholder="0" min={0} value={editForm.amount} onChange={setEditField("amount")} />
+                  {editErrors.amount && <p className="text-xs text-destructive">{editErrors.amount}</p>}
+                </div>
+              </div>
+              {/* Assignee */}
+              <div className="space-y-2">
+                <Label>Assignee</Label>
+                <Input placeholder="Assignee name" value={editForm.assignee} onChange={setEditField("assignee")} />
+              </div>
+              {/* Description */}
+              <div className="space-y-2">
+                <Label>Description</Label>
+                <Textarea placeholder="Project description" rows={3} value={editForm.description} onChange={setEditField("description")} />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="outline" onClick={() => { setIsEditDialogOpen(false); setEditingProject(null); setEditForm(emptyForm); setEditErrors({}); }}>
+                Cancel
+              </Button>
+              <Button onClick={handleEditSubmit}>Save Changes</Button>
+            </div>
+          </DialogContent>
+        </Dialog>
       </div>
 
       {/* Filters */}
@@ -520,6 +768,7 @@ export function Projects() {
                       projects={filtered}
                       onDrop={handleDrop}
                       onDelete={handleDelete}
+                      onEdit={handleEditOpen}
                     />
                   ))}
                 </div>

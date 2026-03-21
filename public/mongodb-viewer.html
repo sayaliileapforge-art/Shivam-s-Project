@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MongoDB Data Viewer</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: white; padding: 20px; margin: 10px 0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; }
+        h2 { color: #666; border-bottom: 2px solid #007bff; padding-bottom: 10px; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .stat-box { background: #f9f9f9; padding: 15px; border-left: 4px solid #007bff; }
+        .stat-number { font-size: 24px; font-weight: bold; color: #007bff; }
+        .stat-label { font-size: 12px; color: #666; text-transform: uppercase; }
+        pre { background: #f1f1f1; padding: 10px; overflow-x: auto; border-radius: 3px; }
+        .empty { color: #999; padding: 20px; text-align: center; }
+        .success { color: green; }
+        .warning { color: #ff9800; }
+        .error { color: red; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 3px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 MongoDB Data Viewer</h1>
+        <p>Real-time view of all data saved in MongoDB (via backend API)</p>
+
+        <!-- Statistics -->
+        <div class="card">
+            <h2>Database Statistics</h2>
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="stat-number" id="projectCount">-</div>
+                    <div class="stat-label">Projects</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number" id="clientCount">-</div>
+                    <div class="stat-label">Clients</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number" id="productCount">-</div>
+                    <div class="stat-label">Products</div>
+                </div>
+            </div>
+            <button onclick="refreshData()" style="margin-top: 15px;">🔄 Refresh Data</button>
+        </div>
+
+        <!-- Clients -->
+        <div class="card">
+            <h2>👥 Clients (MongoDB)</h2>
+            <div id="clientsData" class="empty">Loading...</div>
+        </div>
+
+        <!-- Projects -->
+        <div class="card">
+            <h2>📁 Projects (MongoDB)</h2>
+            <div id="projectsData" class="empty">Loading...</div>
+        </div>
+
+        <!-- Products -->
+        <div class="card">
+            <h2>🛍️ Products (MongoDB)</h2>
+            <div id="productsData" class="empty">Loading...</div>
+        </div>
+
+        <!-- Local Storage Info -->
+        <div class="card">
+            <h2>💾 Local Storage (Browser)</h2>
+            <p>Data stored in your browser (not in MongoDB yet):</p>
+            <div id="localStorageData"></div>
+        </div>
+
+        <!-- MongoDB Structure Info -->
+        <div class="card">
+            <h2>🗄️ MongoDB Database Structure</h2>
+            <pre>
+Database: aaryaleap (or your database name)
+Collections:
+  ├── projects
+  │   ├── _id (ObjectId - auto generated)
+  │   ├── name (string)
+  │   ├── description (string)
+  │   ├── clientId (ObjectId - reference to client)
+  │   ├── status (string: draft, active, archived, completed)
+  │   └── createdAt (Date)
+  │
+  ├── clients
+  │   ├── _id (ObjectId - auto generated)
+  │   ├── name (string)
+  │   ├── email (string - unique)
+  │   ├── phone (string)
+  │   ├── address (string)
+  │   ├── city (string)
+  │   ├── country (string)
+  │   ├── status (string: active, inactive, blocked)
+  │   └── createdAt (Date)
+  │
+  └── products
+      ├── _id (ObjectId - auto generated)
+      ├── name (string)
+      ├── sku (string - unique)
+      ├── category (string)
+      ├── price (number)
+      ├── stock (number)
+      ├── visibility (string: public, private, restricted)
+      └── createdAt (Date)
+            </pre>
+        </div>
+    </div>
+
+    <script>
+        async function fetchData(endpoint) {
+            try {
+                const response = await fetch(`/api${endpoint}`);
+                const json = await response.json();
+                return json.data || [];
+            } catch (error) {
+                console.error(`Error fetching ${endpoint}:`, error);
+                return [];
+            }
+        }
+
+        function formatDate(dateString) {
+            const date = new Date(dateString);
+            return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+        }
+
+        async function refreshData() {
+            // Fetch from MongoDB
+            const clients = await fetchData('/clients');
+            const projects = await fetchData('/projects');
+            const products = await fetchData('/products');
+
+            // Update stats
+            document.getElementById('clientCount').textContent = clients.length;
+            document.getElementById('projectCount').textContent = projects.length;
+            document.getElementById('productCount').textContent = products.length;
+
+            // Display Clients
+            if (clients.length === 0) {
+                document.getElementById('clientsData').innerHTML = '<div class="empty warning">No clients in MongoDB yet</div>';
+            } else {
+                let html = '<table style="width:100%; border-collapse: collapse;">';
+                html += '<tr style="background:#f0f0f0;"><th style="border:1px solid #ddd; padding:10px; text-align:left;">Name</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Email</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Phone</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">City</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Created</th></tr>';
+                clients.forEach(c => {
+                    html += `<tr>
+                        <td style="border:1px solid #ddd; padding:10px;">${c.name}</td>
+                        <td style="border:1px solid #ddd; padding:10px;">${c.email || '-'}</td>
+                        <td style="border:1px solid #ddd; padding:10px;">${c.phone || '-'}</td>
+                        <td style="border:1px solid #ddd; padding:10px;">${c.city || '-'}</td>
+                        <td style="border:1px solid #ddd; padding:10px;">${formatDate(c.createdAt)}</td>
+                    </tr>`;
+                });
+                html += '</table>';
+                document.getElementById('clientsData').innerHTML = html;
+            }
+
+            // Display Projects
+            if (projects.length === 0) {
+                document.getElementById('projectsData').innerHTML = '<div class="empty warning">No projects in MongoDB yet</div>';
+            } else {
+                let html = '<table style="width:100%; border-collapse: collapse;">';
+                html += '<tr style="background:#f0f0f0;"><th style="border:1px solid #ddd; padding:10px; text-align:left;">Name</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Status</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Created</th></tr>';
+                projects.forEach(p => {
+                    html += `<tr><td style="border:1px solid #ddd; padding:10px;">${p.name}</td><td style="border:1px solid #ddd; padding:10px;">${p.status}</td><td style="border:1px solid #ddd; padding:10px;">${formatDate(p.createdAt)}</td></tr>`;
+                });
+                html += '</table>';
+                document.getElementById('projectsData').innerHTML = html;
+            }
+
+            // Display Products
+            if (products.length === 0) {
+                document.getElementById('productsData').innerHTML = '<div class="empty warning">No products in MongoDB yet</div>';
+            } else {
+                let html = '<table style="width:100%; border-collapse: collapse;">';
+                html += '<tr style="background:#f0f0f0;"><th style="border:1px solid #ddd; padding:10px; text-align:left;">Name</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">SKU</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Price</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Stock</th></tr>';
+                products.forEach(p => {
+                    html += `<tr><td style="border:1px solid #ddd; padding:10px;">${p.name}</td><td style="border:1px solid #ddd; padding:10px;">${p.sku}</td><td style="border:1px solid #ddd; padding:10px;">$${p.price}</td><td style="border:1px solid #ddd; padding:10px;">${p.stock}</td></tr>`;
+                });
+                html += '</table>';
+                document.getElementById('productsData').innerHTML = html;
+            }
+
+            // Show Local Storage
+            let localHtml = '<table style="width:100%; border-collapse: collapse;">';
+            localHtml += '<tr style="background:#f0f0f0;"><th style="border:1px solid #ddd; padding:10px; text-align:left;">Storage Key</th><th style="border:1px solid #ddd; padding:10px; text-align:left;">Items</th></tr>';
+            
+            const keys = ['vendor_clients', 'vendor_projects', 'vendor_products'];
+            keys.forEach(key => {
+                const data = localStorage.getItem(key);
+                const count = data ? JSON.parse(data).length : 0;
+                localHtml += `<tr><td style="border:1px solid #ddd; padding:10px; color:#666;">${key}</td><td style="border:1px solid #ddd; padding:10px;">${count} items</td></tr>`;
+            });
+            localHtml += '</table>';
+            document.getElementById('localStorageData').innerHTML = localHtml;
+        }
+
+        // Load on page load
+        refreshData();
+    </script>
+</body>
+</html>

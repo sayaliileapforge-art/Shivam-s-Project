@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Wallet, TrendingUp, DollarSign, AlertCircle, Plus, Trash2,
   ArrowUpCircle, ArrowDownCircle, RefreshCcw, CreditCard, Search,
@@ -27,7 +27,7 @@ import {
   getTotalRevenue, getPending, getOverdue, getMonthlyRevenue,
   type Transaction, type TxnType, type TxnStatus,
 } from "../../lib/transactionStore";
-import { loadClients } from "../../lib/clientStore";
+import { loadClients, type Client } from "../../lib/clientStore";
 
 const TXN_TYPES: TxnType[] = ["payment", "invoice", "refund", "credit"];
 const TXN_STATUSES: TxnStatus[] = ["paid", "pending", "overdue", "refunded"];
@@ -51,6 +51,7 @@ const emptyForm = {
 
 export function Finance() {
   const [txns, setTxns] = useState<Transaction[]>(() => loadTransactions());
+  const [clients, setClients] = useState<Client[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState(emptyForm);
@@ -58,7 +59,25 @@ export function Finance() {
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState<string>("all");
 
-  const clients = loadClients();
+  useEffect(() => {
+    let mounted = true;
+    loadClients()
+      .then((data) => {
+        if (mounted) {
+          setClients(Array.isArray(data) ? data : []);
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setClients([]);
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const refresh = () => setTxns(loadTransactions());
 
   const filtered = txns.filter((t) => {

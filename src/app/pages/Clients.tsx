@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { Link, useNavigate } from "react-router";
 import {
   Plus,
@@ -50,27 +50,52 @@ const TYPE_COLORS: Record<string, string> = {
 
 export function Clients() {
   const navigate = useNavigate();
-  const [clients, setClients] = useState<Client[]>(() => loadClients());
+  const [clients, setClients] = useState<Client[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [salesPersonFilter, setSalesPersonFilter] = useState("all");
 
-  const reload = () => setClients(loadClients());
+  useEffect(() => {
+    const fetchClients = async () => {
+      try {
+        setIsLoading(true);
+        const data = await loadClients();
+        setClients(data || []);
+      } catch (error) {
+        console.error("Failed to load clients:", error);
+        setClients([]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    fetchClients();
+  }, []);
 
-  const salesPersonOptions = useMemo(() => {
-    const names = clients
-      .map((c) => c.salesPerson)
-      .filter((s): s is string => Boolean(s));
-    return Array.from(new Set(names)).sort();
-  }, [clients]);
-
-  const handleDelete = (id: string) => {
-    deleteClient(id);
-    reload();
+  const reload = async () => {
+    try {
+      const data = await loadClients();
+      setClients(data || []);
+    } catch (error) {
+      console.error("Failed to reload clients:", error);
+    }
   };
 
-  const handleAssignSalesPerson = (clientId: string, person: string) => {
-    updateClient(clientId, { salesPerson: person === "__none__" ? "" : person });
-    reload();
+  const handleDelete = async (id: string) => {
+    try {
+      await deleteClient(id);
+      await reload();
+    } catch (error) {
+      console.error("Failed to delete client:", error);
+    }
+  };
+
+  const handleAssignSalesPerson = async (clientId: string, person: string) => {
+    try {
+      await updateClient(clientId, { salesPerson: person === "__none__" ? "" : person });
+      await reload();
+    } catch (error) {
+      console.error("Failed to assign sales person:", error);
+    }
   };
 
   const filteredClients = clients.filter((client) => {
@@ -88,6 +113,13 @@ export function Clients() {
 
     return matchesSearch && matchesSalesPerson;
   });
+
+  const salesPersonOptions = useMemo(() => {
+    const names = clients
+      .map((c) => c.salesPerson)
+      .filter((s): s is string => Boolean(s));
+    return Array.from(new Set(names)).sort();
+  }, [clients]);
 
   return (
     <div className="space-y-6">
@@ -168,7 +200,12 @@ export function Clients() {
           </CardTitle>
         </CardHeader>
         <CardContent className="p-0">
-          <div className="overflow-x-auto">
+          {isLoading ? (
+            <div className="p-8 text-center text-muted-foreground">
+              <p>Loading clients...</p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
             <Table>
               <TableHeader>
                 <TableRow className="bg-muted/40">
@@ -327,7 +364,8 @@ export function Clients() {
                 )}
               </TableBody>
             </Table>
-          </div>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

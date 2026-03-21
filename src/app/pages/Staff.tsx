@@ -28,6 +28,7 @@ import {
   loadStaff, addStaffMember, updateStaffMember, deleteStaffMember,
   type StaffMember, type StaffRole,
 } from "../../lib/staffStore";
+import { STATE_DISTRICTS } from "../../lib/districts";
 
 const ROLES: StaffRole[] = ["Staff", "Salesperson", "Credit_manager", "Accounts", "Admin"];
 
@@ -62,6 +63,7 @@ export function Staff() {
   const [search, setSearch] = useState("");
   const [filterRole, setFilterRole] = useState<string>("all");
   const [viewMember, setViewMember] = useState<StaffMember | null>(null);
+  const [districtSearch, setDistrictSearch] = useState("");
   const photoInputRef = useRef<HTMLInputElement>(null);
 
   const refresh = () => setMembers(loadStaff());
@@ -409,7 +411,10 @@ export function Staff() {
             {/* State */}
             <div className="space-y-1.5">
               <Label>State</Label>
-              <Select value={form.state} onValueChange={set("state")}>
+              <Select 
+                value={form.state} 
+                onValueChange={(v) => setForm((f) => ({ ...f, state: v, district: "" }))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="Select State" />
                 </SelectTrigger>
@@ -421,8 +426,31 @@ export function Staff() {
 
             {/* District */}
             <div className="space-y-1.5">
-              <Label>District</Label>
-              <Input value={form.district} onChange={(e) => set("district")(e.target.value)} placeholder="Select District" />
+              <Label htmlFor="district">Select District</Label>
+              <Select
+                value={form.district}
+                onValueChange={(v) => setForm((f) => ({ ...f, district: v }))}
+                disabled={!form.state}
+                required
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose District" />
+                </SelectTrigger>
+                <SelectContent className="max-h-60">
+                  <div className="px-2 py-1">
+                    <Input
+                      placeholder="Search district..."
+                      value={districtSearch}
+                      onChange={e => setDistrictSearch(e.target.value)}
+                      className="mb-2"
+                      disabled={!form.state}
+                    />
+                  </div>
+                  {form.state && (STATE_DISTRICTS[form.state]?.filter((d: string) => d.toLowerCase().includes(districtSearch.toLowerCase())) || []).map((d: string) => (
+                    <SelectItem key={d} value={d}>{d}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           </div>
 

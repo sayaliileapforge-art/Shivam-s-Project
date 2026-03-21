@@ -15,12 +15,10 @@ import { Slider } from "../ui/slider";
 import {
   AlignLeft, AlignCenter, AlignRight, Bold, Italic, Underline, ImagePlus,
   Lock, Unlock, ChevronsUp, ChevronsDown, ArrowUp, ArrowDown, Maximize2,
-  WrapText, RefreshCw, Upload,
+  WrapText, RefreshCw, Upload, CaseUpper, CaseLower, CaseSensitive, Trash2,
 } from "lucide-react";
 import { pxToMm, MM_TO_PX } from "../../../lib/fabricUtils";
 import type { FabricCanvasHandle } from "./FabricCanvas";
-import type { CurvedTextOpts } from "./CurvedTextObject";
-import { CurvedText } from "./CurvedTextObject";
 
 export type CustomFont = { name: string; dataUrl: string };
 
@@ -38,6 +36,210 @@ const FONT_FAMILIES = [
   "Times New Roman", "Courier New", "Arial",
 ];
 
+const CUSTOM_TEXT_EFFECTS_KEY = "designer_custom_text_effects";
+
+type TextEffectConfig = {
+  stroke: string;
+  strokeWidth: number;
+  shadowEnabled: boolean;
+  shadowColor: string;
+  shadowOpacity: number;
+  shadowBlur: number;
+  shadowOffsetX: number;
+  shadowOffsetY: number;
+};
+
+type TextEffectPreset = {
+  id: string;
+  label: string;
+  config: TextEffectConfig;
+};
+
+const TEXT_EFFECT_PRESETS: TextEffectPreset[] = [
+  {
+    id: "clean",
+    label: "Clean",
+    config: {
+      stroke: "#000000",
+      strokeWidth: 0,
+      shadowEnabled: false,
+      shadowColor: "#000000",
+      shadowOpacity: 0.35,
+      shadowBlur: 0,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
+    },
+  },
+  {
+    id: "outline-bold",
+    label: "Outline",
+    config: {
+      stroke: "#0f172a",
+      strokeWidth: 2,
+      shadowEnabled: false,
+      shadowColor: "#000000",
+      shadowOpacity: 0.35,
+      shadowBlur: 0,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
+    },
+  },
+  {
+    id: "drop-shadow",
+    label: "Shadow",
+    config: {
+      stroke: "#000000",
+      strokeWidth: 0,
+      shadowEnabled: true,
+      shadowColor: "#0f172a",
+      shadowOpacity: 0.35,
+      shadowBlur: 10,
+      shadowOffsetX: 3,
+      shadowOffsetY: 4,
+    },
+  },
+  {
+    id: "glow-cyan",
+    label: "Glow",
+    config: {
+      stroke: "#06b6d4",
+      strokeWidth: 1,
+      shadowEnabled: true,
+      shadowColor: "#22d3ee",
+      shadowOpacity: 0.85,
+      shadowBlur: 20,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
+    },
+  },
+  {
+    id: "soft-pop",
+    label: "Soft Pop",
+    config: {
+      stroke: "#ffffff",
+      strokeWidth: 1,
+      shadowEnabled: true,
+      shadowColor: "#111827",
+      shadowOpacity: 0.22,
+      shadowBlur: 14,
+      shadowOffsetX: 2,
+      shadowOffsetY: 2,
+    },
+  },
+  {
+    id: "hard-shadow",
+    label: "Hard Shadow",
+    config: {
+      stroke: "#000000",
+      strokeWidth: 0,
+      shadowEnabled: true,
+      shadowColor: "#000000",
+      shadowOpacity: 0.5,
+      shadowBlur: 0,
+      shadowOffsetX: 4,
+      shadowOffsetY: 4,
+    },
+  },
+];
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, n));
+}
+
+function hexToRgba(hex: string, opacity: number): string {
+  const cleaned = hex.trim().replace("#", "");
+  if (!/^[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(cleaned)) {
+    return `rgba(0,0,0,${clamp(opacity, 0, 1)})`;
+  }
+  const expanded = cleaned.length === 3
+    ? cleaned.split("").map((ch) => `${ch}${ch}`).join("")
+    : cleaned;
+  const value = Number.parseInt(expanded, 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r},${g},${b},${clamp(opacity, 0, 1).toFixed(3)})`;
+}
+
+function normalizeColorToHex(color: string | undefined, fallback = "#000000"): string {
+  if (!color) return fallback;
+  const raw = color.trim();
+
+  const hex = raw.match(/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/);
+  if (hex) {
+    const token = hex[1];
+    if (token.length === 3) {
+      const expanded = token.split("").map((ch) => `${ch}${ch}`).join("");
+      return `#${expanded}`;
+    }
+    return `#${token.slice(0, 6)}`;
+  }
+
+  const rgba = raw.match(/rgba?\(([^)]+)\)/i);
+  if (!rgba) return fallback;
+  const parts = rgba[1].split(",").map((part) => Number(part.trim()));
+  const r = clamp(Number.isFinite(parts[0]) ? parts[0] : 0, 0, 255);
+  const g = clamp(Number.isFinite(parts[1]) ? parts[1] : 0, 0, 255);
+  const b = clamp(Number.isFinite(parts[2]) ? parts[2] : 0, 0, 255);
+  const toHex = (n: number) => Math.round(n).toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+function parseColorOpacity(color: string | undefined): { hex: string; opacity: number } {
+  if (!color) return { hex: "#000000", opacity: 1 };
+  const raw = color.trim();
+
+  const rgba = raw.match(/rgba?\(([^)]+)\)/i);
+  if (rgba) {
+    const parts = rgba[1].split(",").map((part) => part.trim());
+    const r = Number(parts[0] ?? 0);
+    const g = Number(parts[1] ?? 0);
+    const b = Number(parts[2] ?? 0);
+    const a = Number(parts[3] ?? 1);
+    const toHex = (n: number) => clamp(Math.round(n), 0, 255).toString(16).padStart(2, "0");
+    return {
+      hex: `#${toHex(r)}${toHex(g)}${toHex(b)}`,
+      opacity: clamp(Number.isFinite(a) ? a : 1, 0, 1),
+    };
+  }
+
+  return { hex: normalizeColorToHex(raw), opacity: 1 };
+}
+
+function loadCustomTextEffects(): TextEffectPreset[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CUSTOM_TEXT_EFFECTS_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistCustomTextEffects(effects: TextEffectPreset[]) {
+  localStorage.setItem(CUSTOM_TEXT_EFFECTS_KEY, JSON.stringify(effects));
+}
+
+function getTextEffectFromObject(text: fabric.IText | fabric.Textbox): TextEffectConfig {
+  const shadowRaw =
+    text.shadow instanceof fabric.Shadow
+      ? text.shadow.toObject()
+      : (text.shadow as Record<string, unknown> | null | undefined);
+  const shadowColor = parseColorOpacity(
+    typeof shadowRaw?.color === "string" ? shadowRaw.color : undefined
+  );
+
+  return {
+    stroke: normalizeColorToHex(text.stroke as string | undefined, "#000000"),
+    strokeWidth: Number(text.strokeWidth ?? 0),
+    shadowEnabled: Boolean(shadowRaw),
+    shadowColor: shadowColor.hex,
+    shadowOpacity: shadowColor.opacity,
+    shadowBlur: Number((shadowRaw?.blur as number | undefined) ?? 0),
+    shadowOffsetX: Number((shadowRaw?.offsetX as number | undefined) ?? 0),
+    shadowOffsetY: Number((shadowRaw?.offsetY as number | undefined) ?? 0),
+  };
+}
+
 function SLabel({ children }: { children: React.ReactNode }) {
   return (
     <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
@@ -50,6 +252,8 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
   const imageInputRef = useRef<HTMLInputElement>(null);
   const fontInputRef  = useRef<HTMLInputElement>(null);
   const [lockRatio, setLockRatio] = useState(false);
+  const [customTextEffects, setCustomTextEffects] = useState<TextEffectPreset[]>(loadCustomTextEffects);
+  const [customEffectName, setCustomEffectName] = useState("");
 
   // Display px ↔ mm conversion (canvas px = realMm * MM_TO_PX * displayScale)
   const scale = displayScale > 0 ? displayScale : 1;
@@ -67,7 +271,12 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
     const ratio  = selected.getScaledHeight() / (selected.getScaledWidth() || 1);
     selected.set({ scaleX: newWpx / (selected.width ?? 1) });
     if (lockRatio) selected.set({ scaleY: (newWpx * ratio) / (selected.height ?? 1) });
+    if (selected instanceof fabric.IText || selected instanceof fabric.Textbox) {
+      (selected as any).initDimensions?.();
+    }
     selected.setCoords();
+    canvasRef.current?.constrainSelectedToSafeArea();
+    fc?.fire("object:modified", { target: selected });
     fc?.renderAll();
     onRefresh();
   };
@@ -78,7 +287,12 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
     const ratio  = selected.getScaledWidth() / (selected.getScaledHeight() || 1);
     selected.set({ scaleY: newHpx / (selected.height ?? 1) });
     if (lockRatio) selected.set({ scaleX: (newHpx * ratio) / (selected.width ?? 1) });
+    if (selected instanceof fabric.IText || selected instanceof fabric.Textbox) {
+      (selected as any).initDimensions?.();
+    }
     selected.setCoords();
+    canvasRef.current?.constrainSelectedToSafeArea();
+    fc?.fire("object:modified", { target: selected });
     fc?.renderAll();
     onRefresh();
   };
@@ -117,16 +331,71 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
     e.target.value = "";
   };
 
-  const isCurvedText = (selected as any)?.type === "CurvedText";
-  const isText  = !isCurvedText && (selected instanceof fabric.IText || selected instanceof fabric.Textbox);
+  const isText  = selected instanceof fabric.IText || selected instanceof fabric.Textbox;
   const isTextbox = selected instanceof fabric.Textbox;
   const fc = canvasRef.current?.getCanvas();
   const allFonts = [...FONT_FAMILIES, ...customFonts.map(f => f.name)];
+  const textEffect = isText ? getTextEffectFromObject(selected as fabric.IText | fabric.Textbox) : null;
+
+  const applyTextEffect = (effect: TextEffectConfig) => {
+    if (!isText) return;
+    const text = selected as fabric.IText | fabric.Textbox;
+    const shadow = effect.shadowEnabled
+      ? new fabric.Shadow({
+        color: hexToRgba(effect.shadowColor, effect.shadowOpacity),
+        blur: Math.max(0, effect.shadowBlur),
+        offsetX: effect.shadowOffsetX,
+        offsetY: effect.shadowOffsetY,
+      })
+      : null;
+
+    text.set({
+      stroke: effect.stroke,
+      strokeWidth: Math.max(0, effect.strokeWidth),
+      shadow,
+    });
+    (text as any).initDimensions?.();
+    text.setCoords();
+    canvasRef.current?.constrainSelectedToSafeArea();
+    fc?.fire("object:modified", { target: text });
+    fc?.renderAll();
+    onRefresh();
+  };
+
+  const updateTextEffect = (patch: Partial<TextEffectConfig>) => {
+    if (!textEffect) return;
+    applyTextEffect({ ...textEffect, ...patch });
+  };
+
+  const saveCurrentTextEffect = () => {
+    if (!textEffect) return;
+    const label = customEffectName.trim() || `Custom ${customTextEffects.length + 1}`;
+    const nextPreset: TextEffectPreset = {
+      id: `${Date.now()}`,
+      label,
+      config: textEffect,
+    };
+    const next = [nextPreset, ...customTextEffects];
+    setCustomTextEffects(next);
+    persistCustomTextEffects(next);
+    setCustomEffectName("");
+  };
+
+  const deleteCustomTextEffect = (id: string) => {
+    const next = customTextEffects.filter((effect) => effect.id !== id);
+    setCustomTextEffects(next);
+    persistCustomTextEffects(next);
+  };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const set = (props: Record<string, any>) => {
     if (!fc || !selected) return;
     selected.set(props);
+    if (selected instanceof fabric.IText || selected instanceof fabric.Textbox) {
+      (selected as any).initDimensions?.();
+    }
     selected.setCoords();
+    canvasRef.current?.constrainSelectedToSafeArea();
+    fc.fire("object:modified", { target: selected });
     fc.renderAll();
     onRefresh();
   };
@@ -146,103 +415,7 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
 
       <Separator />
 
-      {isCurvedText && selected ? (
-        /* ──────────── Curved Text properties ──────────── */
-        <>
-          <div>
-            <SLabel>Arc Text</SLabel>
-            <Input
-              value={(selected as CurvedText).text ?? ""}
-              onChange={(e) => { canvasRef.current?.updateCurvedText({ text: e.target.value }); onRefresh(); }}
-              className="h-8 text-sm mb-2" placeholder="Curved text content"
-            />
-            <Select
-              value={(selected as CurvedText).fontFamily ?? "Inter"}
-              onValueChange={(v) => { canvasRef.current?.updateCurvedText({ fontFamily: v }); onRefresh(); }}
-            >
-              <SelectTrigger className="h-8 text-xs mb-2"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {allFonts.map((f) => <SelectItem key={f} value={f} className="text-xs">{f}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            <div className="flex items-center gap-2 mb-2">
-              <Label className="text-xs text-muted-foreground w-16 shrink-0">Font Size</Label>
-              <Slider min={8} max={80} step={1}
-                value={[(selected as CurvedText).fontSize ?? 24]}
-                onValueChange={([v]) => { canvasRef.current?.updateCurvedText({ fontSize: v }); onRefresh(); }}
-                className="flex-1" />
-              <span className="text-xs text-muted-foreground w-8 text-right">{(selected as CurvedText).fontSize ?? 24}px</span>
-            </div>
-            <div className="flex items-center gap-2 mb-2">
-              <Label className="text-xs text-muted-foreground w-16 shrink-0">Radius</Label>
-              <Slider min={20} max={300} step={1}
-                value={[(selected as CurvedText).radius ?? 80]}
-                onValueChange={([v]) => { canvasRef.current?.updateCurvedText({ radius: v }); onRefresh(); }}
-                className="flex-1" />
-              <span className="text-xs text-muted-foreground w-8 text-right">{(selected as CurvedText).radius ?? 80}px</span>
-            </div>
-            <div className="flex items-center gap-2 mb-2">
-              <Label className="text-xs text-muted-foreground w-16 shrink-0">Angle</Label>
-              <Slider min={-180} max={180} step={1}
-                value={[(selected as CurvedText).startAngle ?? -90]}
-                onValueChange={([v]) => { canvasRef.current?.updateCurvedText({ startAngle: v }); onRefresh(); }}
-                className="flex-1" />
-              <span className="text-xs text-muted-foreground w-8 text-right">{(selected as CurvedText).startAngle ?? -90}°</span>
-            </div>
-            <div className="flex items-center gap-2 mb-2">
-              <Label className="text-xs text-muted-foreground w-16 shrink-0">Spacing</Label>
-              <Slider min={0} max={40} step={1}
-                value={[(selected as CurvedText).letterSpacing ?? 5]}
-                onValueChange={([v]) => { canvasRef.current?.updateCurvedText({ letterSpacing: v }); onRefresh(); }}
-                className="flex-1" />
-              <span className="text-xs text-muted-foreground w-6 text-right">{(selected as CurvedText).letterSpacing ?? 5}</span>
-            </div>
-            <div className="flex gap-1.5 mb-2">
-              <Button
-                variant={(selected as CurvedText).direction === "cw" ? "secondary" : "outline"}
-                className="flex-1 h-8 text-xs"
-                onClick={() => { canvasRef.current?.updateCurvedText({ direction: "cw" }); onRefresh(); }}
-              >⟳ Clockwise</Button>
-              <Button
-                variant={(selected as CurvedText).direction === "ccw" ? "secondary" : "outline"}
-                className="flex-1 h-8 text-xs"
-                onClick={() => { canvasRef.current?.updateCurvedText({ direction: "ccw" }); onRefresh(); }}
-              >⟲ Counter</Button>
-            </div>
-            <div>
-              <Label className="text-xs text-muted-foreground">Color</Label>
-              <div className="flex gap-2 mt-0.5">
-                <input type="color"
-                  value={typeof (selected as CurvedText).fill === "string" ? (selected as CurvedText).fill as string : "#000000"}
-                  onChange={(e) => { canvasRef.current?.updateCurvedText({ fill: e.target.value }); onRefresh(); }}
-                  className="h-8 w-10 rounded border cursor-pointer" />
-                <Input
-                  value={typeof (selected as CurvedText).fill === "string" ? (selected as CurvedText).fill as string : "#000000"}
-                  onChange={(e) => { canvasRef.current?.updateCurvedText({ fill: e.target.value }); onRefresh(); }}
-                  className="h-8 flex-1 text-xs font-mono" />
-              </div>
-            </div>
-          </div>
-          <Separator />
-          {/* Position / rotation common to all objects */}
-          <div>
-            <SLabel>Opacity</SLabel>
-            <div className="flex items-center gap-2">
-              <Slider min={0} max={1} step={0.01} value={[selected.opacity ?? 1]}
-                onValueChange={([v]) => set({ opacity: v })} className="flex-1" />
-              <span className="text-xs text-muted-foreground w-8 text-right">{Math.round((selected.opacity ?? 1) * 100)}%</span>
-            </div>
-          </div>
-          <div>
-            <SLabel>Rotation</SLabel>
-            <div className="flex items-center gap-2">
-              <Slider min={-180} max={180} step={1} value={[selected.angle ?? 0]}
-                onValueChange={([v]) => set({ angle: v })} className="flex-1" />
-              <span className="text-xs text-muted-foreground w-10 text-right">{Math.round(selected.angle ?? 0)}°</span>
-            </div>
-          </div>
-        </>
-      ) : selected ? (
+      {selected ? (
         <>
           {/* ── Layer Order ─────────────────────────────────────── */}
           <div>
@@ -296,6 +469,7 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                   value={(selected as fabric.IText).text ?? ""}
                   onChange={(e) => {
                     (selected as fabric.IText).set({ text: e.target.value });
+                    canvasRef.current?.constrainSelectedToSafeArea();
                     fc?.renderAll();
                     onRefresh();
                   }}
@@ -376,6 +550,42 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                 </div>
 
                 <div className="flex gap-1 mb-2">
+                  <Button
+                    variant="outline"
+                    className="h-8 text-xs px-2"
+                    onClick={() => {
+                      const txt = ((selected as fabric.IText).text ?? "").toUpperCase();
+                      set({ text: txt });
+                    }}
+                  >
+                    <CaseUpper className="h-3.5 w-3.5 mr-1" />
+                    UPPER
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-8 text-xs px-2"
+                    onClick={() => {
+                      const txt = ((selected as fabric.IText).text ?? "").toLowerCase();
+                      set({ text: txt });
+                    }}
+                  >
+                    <CaseLower className="h-3.5 w-3.5 mr-1" />
+                    lower
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-8 text-xs px-2"
+                    onClick={() => {
+                      const txt = ((selected as fabric.IText).text ?? "").replace(/\b\w/g, (c) => c.toUpperCase());
+                      set({ text: txt });
+                    }}
+                  >
+                    <CaseSensitive className="h-3.5 w-3.5 mr-1" />
+                    Capitalize
+                  </Button>
+                </div>
+
+                <div className="flex gap-1 mb-2">
                   {(["left", "center", "right"] as const).map((align) => {
                     const Icon = align === "left" ? AlignLeft : align === "center" ? AlignCenter : AlignRight;
                     return (
@@ -402,13 +612,216 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                       className="h-8 flex-1 text-xs font-mono" />
                   </div>
                 </div>
+
+                <div>
+                  <Label className="text-xs text-muted-foreground">Background</Label>
+                  <div className="flex gap-2 mt-0.5">
+                    <input type="color"
+                      value={(selected as any).backgroundColor as string ?? "#ffffff"}
+                      onChange={(e) => set({ backgroundColor: e.target.value })}
+                      className="h-8 w-10 rounded border cursor-pointer" />
+                    <Input
+                      value={(selected as any).backgroundColor as string ?? "#ffffff"}
+                      onChange={(e) => set({ backgroundColor: e.target.value })}
+                      className="h-8 flex-1 text-xs font-mono" />
+                  </div>
+                </div>
+
+                <div>
+                  <Label className="text-xs text-muted-foreground">Background Padding</Label>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <Slider
+                      min={0} max={30} step={1}
+                      value={[((selected as any).backgroundPadding as number) ?? 0]}
+                      onValueChange={(v) => set({ backgroundPadding: v[0] })}
+                      className="flex-1" />
+                    <span className="text-xs font-mono w-10 text-right">
+                      {((selected as any).backgroundPadding as number) ?? 0}px
+                    </span>
+                  </div>
+                </div>
+
+                <Separator className="my-3" />
+
+                <div>
+                  <SLabel>Text Effects</SLabel>
+                  <div className="grid grid-cols-2 gap-1.5 mb-2">
+                    {TEXT_EFFECT_PRESETS.map((preset) => (
+                      <Button
+                        key={preset.id}
+                        variant="outline"
+                        className="h-8 text-xs"
+                        onClick={() => applyTextEffect(preset.config)}
+                      >
+                        {preset.label}
+                      </Button>
+                    ))}
+                  </div>
+
+                  <div className="space-y-2 border rounded-md p-2 mb-2">
+                    <Label className="text-xs text-muted-foreground">Outline</Label>
+                    <div className="flex gap-2">
+                      <input
+                        type="color"
+                        value={textEffect?.stroke ?? "#000000"}
+                        onChange={(e) => updateTextEffect({ stroke: e.target.value })}
+                        className="h-8 w-10 rounded border cursor-pointer"
+                      />
+                      <Input
+                        value={textEffect?.stroke ?? "#000000"}
+                        onChange={(e) => updateTextEffect({ stroke: e.target.value })}
+                        className="h-8 flex-1 text-xs font-mono"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Slider
+                        min={0}
+                        max={10}
+                        step={0.1}
+                        value={[textEffect?.strokeWidth ?? 0]}
+                        onValueChange={([v]) => updateTextEffect({ strokeWidth: v })}
+                        className="flex-1"
+                      />
+                      <span className="text-xs font-mono w-10 text-right">
+                        {(textEffect?.strokeWidth ?? 0).toFixed(1)}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2 border rounded-md p-2 mb-2">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs text-muted-foreground">Shadow / Glow</Label>
+                      <Button
+                        variant={textEffect?.shadowEnabled ? "secondary" : "outline"}
+                        className="h-7 text-[10px] px-2"
+                        onClick={() => updateTextEffect({ shadowEnabled: !(textEffect?.shadowEnabled ?? false) })}
+                      >
+                        {textEffect?.shadowEnabled ? "On" : "Off"}
+                      </Button>
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="color"
+                        value={textEffect?.shadowColor ?? "#000000"}
+                        onChange={(e) => updateTextEffect({ shadowColor: e.target.value })}
+                        className="h-8 w-10 rounded border cursor-pointer"
+                      />
+                      <Input
+                        value={textEffect?.shadowColor ?? "#000000"}
+                        onChange={(e) => updateTextEffect({ shadowColor: normalizeColorToHex(e.target.value, "#000000") })}
+                        className="h-8 flex-1 text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs text-muted-foreground">Opacity</Label>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <Slider
+                          min={0}
+                          max={1}
+                          step={0.01}
+                          value={[textEffect?.shadowOpacity ?? 0.35]}
+                          onValueChange={([v]) => updateTextEffect({ shadowOpacity: v })}
+                          className="flex-1"
+                        />
+                        <span className="text-xs font-mono w-10 text-right">
+                          {Math.round((textEffect?.shadowOpacity ?? 0.35) * 100)}%
+                        </span>
+                      </div>
+                    </div>
+                    <div>
+                      <Label className="text-xs text-muted-foreground">Blur</Label>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <Slider
+                          min={0}
+                          max={40}
+                          step={1}
+                          value={[textEffect?.shadowBlur ?? 0]}
+                          onValueChange={([v]) => updateTextEffect({ shadowBlur: v })}
+                          className="flex-1"
+                        />
+                        <span className="text-xs font-mono w-10 text-right">
+                          {Math.round(textEffect?.shadowBlur ?? 0)}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <Label className="text-xs text-muted-foreground">Offset X</Label>
+                        <Input
+                          type="number"
+                          step={1}
+                          value={textEffect?.shadowOffsetX ?? 0}
+                          onChange={(e) => updateTextEffect({ shadowOffsetX: Number(e.target.value) || 0 })}
+                          className="h-8 text-xs mt-0.5"
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-xs text-muted-foreground">Offset Y</Label>
+                        <Input
+                          type="number"
+                          step={1}
+                          value={textEffect?.shadowOffsetY ?? 0}
+                          onChange={(e) => updateTextEffect({ shadowOffsetY: Number(e.target.value) || 0 })}
+                          className="h-8 text-xs mt-0.5"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label className="text-xs text-muted-foreground">Save Custom Preset</Label>
+                    <div className="flex gap-1.5">
+                      <Input
+                        value={customEffectName}
+                        onChange={(e) => setCustomEffectName(e.target.value)}
+                        placeholder="Preset name"
+                        className="h-8 text-xs"
+                      />
+                      <Button variant="outline" className="h-8 text-xs" onClick={saveCurrentTextEffect}>
+                        Save
+                      </Button>
+                    </div>
+
+                    {customTextEffects.length > 0 ? (
+                      <div className="space-y-1.5">
+                        {customTextEffects.map((preset) => (
+                          <div
+                            key={preset.id}
+                            className="flex items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-accent/60"
+                          >
+                            <Button
+                              variant="outline"
+                              className="h-7 text-[10px] px-2 flex-1 justify-start"
+                              onClick={() => applyTextEffect(preset.config)}
+                            >
+                              {preset.label}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7"
+                              onClick={() => deleteCustomTextEffect(preset.id)}
+                              title="Delete preset"
+                            >
+                              <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-[10px] text-muted-foreground italic">
+                        No custom text effect presets yet.
+                      </p>
+                    )}
+                  </div>
+                </div>
               </div>
               <Separator />
             </>
           )}
 
           {/* ── Fill / Stroke for shapes ─────────────────────────── */}
-          {!isText && !isCurvedText && selected.type !== "image" && (
+          {!isText && selected.type !== "image" && (
             <>
               <div>
                 <SLabel>Fill</SLabel>

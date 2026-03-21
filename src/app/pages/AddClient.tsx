@@ -15,6 +15,7 @@ import {
   SelectValue,
 } from "../components/ui/select";
 import { Card, CardContent } from "../components/ui/card";
+import { STATE_DISTRICTS } from "../../lib/districts";
 
 const INDIAN_STATES = [
   "ANDAMAN & NICOBAR ISLANDS",
@@ -71,12 +72,17 @@ const emptyForm = {
   state: "",
   district: "",
   schoollogUniqueId: "",
+  busStop: "",
+  route: "",
 };
 
 export function AddClient() {
   const navigate = useNavigate();
   const [form, setForm] = useState(emptyForm);
+  const [districtSearch, setDistrictSearch] = useState("");
   const [errors, setErrors] = useState<Partial<typeof emptyForm>>({});
+  const [isLoading, setIsLoading] = useState(false);
+  const [submitError, setSubmitError] = useState("");
 
   const set = (field: keyof typeof emptyForm) => (
     e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>
@@ -89,15 +95,33 @@ export function AddClient() {
     if (!form.contact.trim()) e.contact = "Contact is required";
     if (!form.deliveryMode) e.deliveryMode = "Select a delivery mode";
     if (!form.type) e.type = "Select a type";
+    if (!form.state) e.state = "State is required";
+    if (!form.district) e.district = "District is required";
+    if (form.deliveryMode === "Bus") {
+      if (!form.busStop.trim()) e.busStop = "Bus stop is required";
+      if (!form.route.trim()) e.route = "Route is required";
+    }
     setErrors(e);
     return Object.keys(e).length === 0;
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!validate()) return;
-    addClient(form);
-    navigate("/clients");
+    
+    setIsLoading(true);
+    setSubmitError("");
+    
+    try {
+      await addClient(form);
+      navigate("/clients");
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Failed to create client";
+      setSubmitError(errorMessage);
+      console.error("Error creating client:", error);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -164,7 +188,11 @@ export function AddClient() {
                 <Label>Delivery Mode <span className="text-destructive">*</span></Label>
                 <RadioGroup
                   value={form.deliveryMode}
-                  onValueChange={(v) => setForm((f) => ({ ...f, deliveryMode: v }))}
+                  onValueChange={(v) => setForm((f) => ({
+                    ...f,
+                    deliveryMode: v,
+                    ...(v !== "Bus" && { busStop: "", route: "" })
+                  }))}
                   className="flex gap-6"
                 >
                   <div className="flex items-center gap-2">
@@ -202,6 +230,38 @@ export function AddClient() {
               </div>
             </div>
 
+            {/* Row 4.5: Bus Delivery Conditional Fields */}
+            <div
+              className={`transition-all duration-300 ease-in-out overflow-hidden ${
+                form.deliveryMode === "Bus"
+                  ? "max-h-96 opacity-100 mb-6"
+                  : "max-h-0 opacity-0 mb-0"
+              }`}
+            >
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5 pt-4 border-t border-border">
+                <div className="space-y-2">
+                  <Label htmlFor="busStop">Bus Stop <span className="text-destructive">*</span></Label>
+                  <Input
+                    id="busStop"
+                    placeholder="Enter Bus Stop"
+                    value={form.busStop}
+                    onChange={set("busStop")}
+                  />
+                  {errors.busStop && <p className="text-xs text-destructive">{errors.busStop}</p>}
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="route">Route <span className="text-destructive">*</span></Label>
+                  <Input
+                    id="route"
+                    placeholder="Enter Route"
+                    value={form.route}
+                    onChange={set("route")}
+                  />
+                  {errors.route && <p className="text-xs text-destructive">{errors.route}</p>}
+                </div>
+              </div>
+            </div>
+
             {/* Row 5: Address (full width) */}
             <div className="space-y-2">
               <Label htmlFor="address">Address</Label>
@@ -232,8 +292,32 @@ export function AddClient() {
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="district">District</Label>
-                <Input id="district" placeholder="District" value={form.district} onChange={set("district")} />
+                <Label htmlFor="district">Select District</Label>
+                <Select
+                  value={form.district}
+                  onValueChange={(v) => setForm((f) => ({ ...f, district: v }))}
+                  disabled={!form.state}
+                  required
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Choose District" />
+                  </SelectTrigger>
+                  <SelectContent className="max-h-60">
+                    <div className="px-2 py-1">
+                      <Input
+                        placeholder="Search district..."
+                        value={districtSearch}
+                        onChange={e => setDistrictSearch(e.target.value)}
+                        className="mb-2"
+                        disabled={!form.state}
+                      />
+                    </div>
+                    {form.state && (STATE_DISTRICTS[form.state]?.filter((d: string) => d.toLowerCase().includes(districtSearch.toLowerCase())) || []).map((d: string) => (
+                      <SelectItem key={d} value={d}>{d}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {errors.district && <div className="text-red-500 text-xs mt-1">{errors.district}</div>}
               </div>
             </div>
 
@@ -245,12 +329,19 @@ export function AddClient() {
               </div>
             </div>
 
+            {/* Error Message */}
+            {submitError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
+                {submitError}
+              </div>
+            )}
+
             {/* Actions */}
             <div className="flex gap-3 pt-2">
-              <Button type="submit" className="px-10">
-                Submit
+              <Button type="submit" className="px-10" disabled={isLoading}>
+                {isLoading ? "Creating..." : "Submit"}
               </Button>
-              <Button type="button" variant="outline" className="px-10" onClick={() => navigate("/clients")}>
+              <Button type="button" variant="outline" className="px-10" onClick={() => navigate("/clients")} disabled={isLoading}>
                 Cancel
               </Button>
             </div>

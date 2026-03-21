@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { Link } from "react-router";
 import {
   Users,
@@ -19,8 +19,10 @@ import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
 import { Can } from "../../lib/rbac";
 import { Permission } from "../../lib/rbac";
-import { loadClients } from "../../lib/clientStore";
-import { loadProjects } from "../../lib/projectStore";
+import { type Client } from "../../lib/clientStore";
+import { type Project } from "../../lib/projectStore";
+import { fetchClients, fetchProjects } from "../../lib/apiService";
+import { fetchTemplateOrders } from "../../lib/orderApi";
 import {
   AreaChart,
   Area,
@@ -87,14 +89,24 @@ const pctChange = (current: number, previous: number): { change: string; trend: 
   };
 };
 
-const readOpenComplaints = (): number => {
-  try {
-    const raw = localStorage.getItem("vendor_complaints");
-    const list = raw ? (JSON.parse(raw) as Array<{ status?: string }>) : [];
-    return list.filter((c) => !["closed", "resolved"].includes((c.status ?? "").toLowerCase())).length;
-  } catch {
-    return 0;
-  }
+const mapApiProjectToUi = (p: any): Project => {
+  const populatedClient = typeof p.clientId === "object" && p.clientId !== null ? p.clientId : null;
+  const stage = String(p.stage || p.status || "draft");
+
+  return {
+    id: String(p._id || p.id),
+    name: String(p.name || "Untitled Project"),
+    client: String(p.client || populatedClient?.clientName || "Unknown Client"),
+    clientId: String(populatedClient?._id || p.clientId || ""),
+    stage,
+    priority: (p.priority || "medium") as Project["priority"],
+    dueDate: String(p.dueDate || ""),
+    assignee: String(p.assignee || ""),
+    amount: Number(p.amount || 0),
+    description: String(p.description || ""),
+    workflowType: (p.workflowType || "variable_data") as Project["workflowType"],
+    createdAt: String(p.createdAt || new Date().toISOString()),
+  };
 };
 
 const quickActions = [
@@ -105,8 +117,48 @@ const quickActions = [
 ];
 
 export function Dashboard() {
-  const clients = loadClients();
-  const projects = loadProjects();
+  const [clients, setClients] = useState<Client[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [printingOrdersCount, setPrintingOrdersCount] = useState(0);
+
+  useEffect(() => {
+    let mounted = true;
+
+    Promise.all([
+      fetchClients(),
+      fetchProjects(),
+      fetchTemplateOrders().catch(() => []),
+    ])
+      .then(([apiClients, apiProjects, templateOrders]) => {
+        if (!mounted) return;
+
+        const mappedClients = Array.isArray(apiClients)
+          ? apiClients.map((c: any) => ({ ...c, id: String(c._id || c.id) }))
+          : [];
+
+        const mappedProjects = Array.isArray(apiProjects)
+          ? apiProjects.map(mapApiProjectToUi)
+          : [];
+
+        const activePrinting = Array.isArray(templateOrders)
+          ? templateOrders.filter((o) => o.status === "processing").length
+          : 0;
+
+        setClients(mappedClients);
+        setProjects(mappedProjects);
+        setPrintingOrdersCount(activePrinting);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setClients([]);
+        setProjects([]);
+        setPrintingOrdersCount(0);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const stats = useMemo<DashboardStat[]>(() => {
     const now = Date.now();
@@ -136,11 +188,12 @@ export function Dashboard() {
     }).length;
 
     const pendingApprovals = projects.filter((p) => p.stage === "proof-sent").length;
-    const printingOrders = projects.filter((p) => p.stage === "printing").length;
+    const printingOrders = printingOrdersCount;
     const paymentsDue = projects
       .filter((p) => p.stage !== "delivered")
       .reduce((sum, p) => sum + (Number.isFinite(p.amount) ? p.amount : 0), 0);
-    const openComplaints = readOpenComplaints();
+    // Complaints are not yet backed by API in this project.
+    const openComplaints = 0;
 
     const clientTrend = pctChange(clientsRecent, clientsPrev);
     const projectTrend = pctChange(projectRecent, projectPrev);
@@ -207,7 +260,7 @@ export function Dashboard() {
         href: "/complaints",
       },
     ];
-  }, [clients, projects]);
+  }, [clients, printingOrdersCount, projects]);
 
   const revenueData = useMemo(() => {
     const months = Array.from({ length: 6 }, (_, i) => {

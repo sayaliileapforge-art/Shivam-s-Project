@@ -1,52 +1,79 @@
 /**
- * ContextToolbar — floats below the main toolbar when an element is selected.
- * Shows context-sensitive controls matching the reference screenshot:
- *   fill color · font family · font size · bold · italic · underline ·
- *   text align · line height · letter spacing · text case ·
- *   corner radius (rect) · opacity · flip H/V · delete
+ * ContextToolbar - floats below the main toolbar when an element is selected.
  */
+import type { ReactElement, ReactNode, RefObject } from "react";
 import * as fabric from "fabric";
 import {
-  Bold, Italic, Underline,
-  AlignLeft, AlignCenter, AlignRight, AlignJustify,
-  FlipHorizontal2, FlipVertical2,
-  Trash2, Type, Minus, Plus, CaseSensitive, CaseUpper, CaseLower,
-  MoveHorizontal, Rows3,
+  AlignCenter,
+  AlignJustify,
+  AlignLeft,
+  AlignRight,
+  Bold,
+  CaseLower,
+  CaseSensitive,
+  CaseUpper,
+  FlipHorizontal2,
+  FlipVertical2,
+  Italic,
+  Minus,
+  MoveHorizontal,
+  Plus,
+  Rows3,
+  Trash2,
+  Type,
+  Underline,
 } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../ui/select";
 import { Separator } from "../ui/separator";
 import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
-} from "../ui/select";
-import {
-  Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
 } from "../ui/tooltip";
 import type { FabricCanvasHandle } from "./FabricCanvas";
 
 const FONT_FAMILIES = [
-  "Inter", "Poppins", "Roboto", "Montserrat", "Lato",
-  "Open Sans", "Georgia", "Times New Roman", "Courier New", "Arial",
+  "Inter",
+  "Poppins",
+  "Roboto",
+  "Montserrat",
+  "Lato",
+  "Open Sans",
+  "Georgia",
+  "Times New Roman",
+  "Courier New",
+  "Arial",
 ];
 
 interface Props {
   selected: fabric.FabricObject | null;
-  canvasRef: React.RefObject<FabricCanvasHandle | null>;
+  canvasRef: RefObject<FabricCanvasHandle | null>;
   onRefresh: () => void;
   onDelete: () => void;
 }
 
-function Tip({ label, children }: { label: string; children: React.ReactNode }) {
+function Tip({ label, children }: { label: string; children: ReactNode }) {
   return (
     <Tooltip>
-      <TooltipTrigger asChild>{children as React.ReactElement}</TooltipTrigger>
-      <TooltipContent side="bottom" className="text-xs">{label}</TooltipContent>
+      <TooltipTrigger asChild>{children as ReactElement}</TooltipTrigger>
+      <TooltipContent side="bottom" className="text-xs">
+        {label}
+      </TooltipContent>
     </Tooltip>
   );
 }
 
 function VSep() {
-  return <Separator orientation="vertical" className="h-5 mx-0.5" />;
+  return <Separator orientation="vertical" className="mx-0.5 h-5" />;
 }
 
 export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Props) {
@@ -57,40 +84,50 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
 
   const isText = selected instanceof fabric.IText || selected instanceof fabric.Textbox;
   const isRect = selected.type === "rect";
-  const t = selected as fabric.IText;
-  const r = selected as fabric.Rect;
+  const isImage = selected.type === "image";
+  const textObj = selected as fabric.IText;
+  const rectObj = selected as fabric.Rect;
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const set = (props: Record<string, any>) => {
+  // Central update helper so every mutation path applies the same clamp+refresh flow.
+  const applyProps = (props: Record<string, unknown>) => {
     selected.set(props);
     selected.setCoords();
+    canvasRef.current?.constrainSelectedToSafeArea();
+    fc.fire("object:modified", { target: selected });
     fc.renderAll();
     onRefresh();
   };
 
-  const fontSize  = isText ? (t.fontSize ?? 16) : 0;
-  const fontFam   = isText ? (t.fontFamily ?? "Inter") : "";
+  const applyText = (nextText: string) => {
+    textObj.set({ text: nextText });
+    (textObj as any).initDimensions?.();
+    textObj.setCoords();
+    canvasRef.current?.constrainSelectedToSafeArea();
+    fc.fire("object:modified", { target: textObj });
+    fc.renderAll();
+    onRefresh();
+  };
+
+  const fontSize = isText ? (textObj.fontSize ?? 16) : 0;
+  const fontFamily = isText ? (textObj.fontFamily ?? "Inter") : "Inter";
   const fillColor = (selected.fill as string) ?? "#000000";
-  const isImage   = selected.type === "image";
 
   return (
     <TooltipProvider delayDuration={300}>
-      <div className="flex items-center gap-1 px-3 py-1.5 border-b bg-card shrink-0 overflow-x-auto">
-
-        {/* ── Fill colour ─────────────────────────────────────────── */}
+      <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b bg-card px-3 py-1.5">
         {!isImage && (
           <>
             <Tip label="Fill color">
-              <label className="flex items-center gap-1 cursor-pointer">
+              <label className="flex cursor-pointer items-center gap-1">
                 <span
-                  className="h-6 w-6 rounded-full border-2 border-white shadow ring-1 ring-border"
+                  className="h-6 w-6 rounded-full border-2 border-white ring-1 ring-border"
                   style={{ background: typeof selected.fill === "string" ? selected.fill : "#6366f1" }}
                 />
                 <input
                   type="color"
                   className="sr-only"
                   value={fillColor}
-                  onChange={(e) => set({ fill: e.target.value })}
+                  onChange={(e) => applyProps({ fill: e.target.value })}
                 />
               </label>
             </Tip>
@@ -98,106 +135,131 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
           </>
         )}
 
-        {/* ── Text-only controls ───────────────────────────────────── */}
         {isText && (
           <>
-            {/* Font family */}
-            <Select value={fontFam} onValueChange={(v) => set({ fontFamily: v })}>
-              <SelectTrigger className="h-7 text-xs w-[110px] shrink-0">
+            <Select value={fontFamily} onValueChange={(v) => applyProps({ fontFamily: v })}>
+              <SelectTrigger className="h-7 w-[120px] shrink-0 text-xs">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {FONT_FAMILIES.map((f) => (
-                  <SelectItem key={f} value={f} className="text-xs">{f}</SelectItem>
+                {FONT_FAMILIES.map((family) => (
+                  <SelectItem key={family} value={family} className="text-xs">
+                    {family}
+                  </SelectItem>
                 ))}
               </SelectContent>
             </Select>
 
             <VSep />
 
-            {/* Font size */}
             <Tip label="Decrease font size">
-              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0"
-                onClick={() => set({ fontSize: Math.max(6, fontSize - 1) })}>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() => applyProps({ fontSize: Math.max(6, fontSize - 1) })}
+              >
                 <Minus className="h-3 w-3" />
               </Button>
             </Tip>
+
             <Input
-              type="number" min={6} max={300}
+              type="number"
+              min={6}
+              max={300}
               value={fontSize}
-              onChange={(e) => set({ fontSize: parseInt(e.target.value) || 6 })}
-              className="h-7 w-12 text-xs text-center px-1 shrink-0"
+              onChange={(e) => applyProps({ fontSize: Math.max(6, parseInt(e.target.value, 10) || 6) })}
+              className="h-7 w-14 shrink-0 px-1 text-center text-xs"
             />
+
             <Tip label="Increase font size">
-              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0"
-                onClick={() => set({ fontSize: Math.min(300, fontSize + 1) })}>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() => applyProps({ fontSize: Math.min(300, fontSize + 1) })}
+              >
                 <Plus className="h-3 w-3" />
               </Button>
             </Tip>
 
             <VSep />
 
-            {/* Text colour */}
             <Tip label="Text color">
-              <label className="flex items-center gap-1 cursor-pointer">
-                <div className="relative flex items-end">
+              <label className="flex cursor-pointer items-center gap-1">
+                <div className="relative flex h-7 w-7 items-center justify-center rounded border">
                   <Type className="h-4 w-4" />
                   <span
-                    className="absolute -bottom-0.5 left-0 right-0 h-1 rounded-full"
-                    style={{ background: (t.fill as string) ?? "#000000" }}
+                    className="absolute bottom-0 left-0 right-0 h-1 rounded-full"
+                    style={{ background: (textObj.fill as string) ?? "#000000" }}
                   />
                 </div>
                 <input
                   type="color"
                   className="sr-only"
-                  value={(t.fill as string) ?? "#000000"}
-                  onChange={(e) => set({ fill: e.target.value })}
+                  value={(textObj.fill as string) ?? "#000000"}
+                  onChange={(e) => applyProps({ fill: e.target.value })}
                 />
               </label>
             </Tip>
 
             <VSep />
 
-            {/* Bold / Italic / Underline */}
             <Tip label="Bold">
               <Button
-                variant={t.fontWeight === "bold" ? "secondary" : "ghost"}
-                size="icon" className="h-7 w-7 shrink-0"
-                onClick={() => set({ fontWeight: t.fontWeight === "bold" ? "normal" : "bold" })}>
+                variant={textObj.fontWeight === "bold" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() => applyProps({ fontWeight: textObj.fontWeight === "bold" ? "normal" : "bold" })}
+              >
                 <Bold className="h-3.5 w-3.5" />
               </Button>
             </Tip>
+
             <Tip label="Italic">
               <Button
-                variant={t.fontStyle === "italic" ? "secondary" : "ghost"}
-                size="icon" className="h-7 w-7 shrink-0"
-                onClick={() => set({ fontStyle: t.fontStyle === "italic" ? "normal" : "italic" })}>
+                variant={textObj.fontStyle === "italic" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() =>
+                  applyProps({ fontStyle: textObj.fontStyle === "italic" ? "normal" : "italic" })
+                }
+              >
                 <Italic className="h-3.5 w-3.5" />
               </Button>
             </Tip>
+
             <Tip label="Underline">
               <Button
-                variant={t.underline ? "secondary" : "ghost"}
-                size="icon" className="h-7 w-7 shrink-0"
-                onClick={() => set({ underline: !t.underline })}>
+                variant={textObj.underline ? "secondary" : "ghost"}
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() => applyProps({ underline: !textObj.underline })}
+              >
                 <Underline className="h-3.5 w-3.5" />
               </Button>
             </Tip>
 
             <VSep />
 
-            {/* Text alignment */}
             {(["left", "center", "right", "justify"] as const).map((align) => {
               const Icon =
-                align === "left" ? AlignLeft :
-                align === "center" ? AlignCenter :
-                align === "right" ? AlignRight : AlignJustify;
+                align === "left"
+                  ? AlignLeft
+                  : align === "center"
+                    ? AlignCenter
+                    : align === "right"
+                      ? AlignRight
+                      : AlignJustify;
+
               return (
                 <Tip key={align} label={`Align ${align}`}>
                   <Button
-                    variant={t.textAlign === align ? "secondary" : "ghost"}
-                    size="icon" className="h-7 w-7 shrink-0"
-                    onClick={() => set({ textAlign: align })}>
+                    variant={textObj.textAlign === align ? "secondary" : "ghost"}
+                    size="icon"
+                    className="h-7 w-7 shrink-0"
+                    onClick={() => applyProps({ textAlign: align })}
+                  >
                     <Icon className="h-3.5 w-3.5" />
                   </Button>
                 </Tip>
@@ -206,53 +268,67 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
 
             <VSep />
 
-            {/* Line height */}
             <Tip label="Line height">
               <div className="flex items-center gap-0.5">
-                <Rows3 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                <Rows3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <Input
-                  type="number" min={0.5} max={5} step={0.1}
-                  value={+(t.lineHeight ?? 1.16).toFixed(2)}
-                  onChange={(e) => set({ lineHeight: parseFloat(e.target.value) || 1 })}
-                  className="h-7 w-14 text-xs text-center px-1 shrink-0"
+                  type="number"
+                  min={0.5}
+                  max={5}
+                  step={0.1}
+                  value={+(textObj.lineHeight ?? 1.16).toFixed(2)}
+                  onChange={(e) => applyProps({ lineHeight: parseFloat(e.target.value) || 1 })}
+                  className="h-7 w-14 shrink-0 px-1 text-center text-xs"
                 />
               </div>
             </Tip>
 
-            {/* Letter spacing */}
-            <Tip label="Letter spacing (EM×1000)">
+            <Tip label="Letter spacing (EM x 1000)">
               <div className="flex items-center gap-0.5">
-                <MoveHorizontal className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                <MoveHorizontal className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <Input
-                  type="number" min={-500} max={2000} step={10}
-                  value={t.charSpacing ?? 0}
-                  onChange={(e) => set({ charSpacing: parseInt(e.target.value) || 0 })}
-                  className="h-7 w-16 text-xs text-center px-1 shrink-0"
+                  type="number"
+                  min={-500}
+                  max={2000}
+                  step={10}
+                  value={textObj.charSpacing ?? 0}
+                  onChange={(e) => applyProps({ charSpacing: parseInt(e.target.value, 10) || 0 })}
+                  className="h-7 w-16 shrink-0 px-1 text-center text-xs"
                 />
               </div>
             </Tip>
 
             <VSep />
 
-            {/* Text case */}
             <Tip label="UPPERCASE">
-              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0 font-bold text-[10px]"
-                onClick={() => { t.set({ text: (t.text ?? "").toUpperCase() }); fc.renderAll(); onRefresh(); }}>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() => applyText((textObj.text ?? "").toUpperCase())}
+              >
                 <CaseUpper className="h-3.5 w-3.5" />
               </Button>
             </Tip>
+
             <Tip label="lowercase">
-              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0 text-[10px]"
-                onClick={() => { t.set({ text: (t.text ?? "").toLowerCase() }); fc.renderAll(); onRefresh(); }}>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() => applyText((textObj.text ?? "").toLowerCase())}
+              >
                 <CaseLower className="h-3.5 w-3.5" />
               </Button>
             </Tip>
+
             <Tip label="Capitalize">
-              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0 text-[10px]"
-                onClick={() => {
-                  const cap = (t.text ?? "").replace(/\b\w/g, (c) => c.toUpperCase());
-                  t.set({ text: cap }); fc.renderAll(); onRefresh();
-                }}>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 shrink-0"
+                onClick={() => applyText((textObj.text ?? "").replace(/\b\w/g, (c) => c.toUpperCase()))}
+              >
                 <CaseSensitive className="h-3.5 w-3.5" />
               </Button>
             </Tip>
@@ -261,20 +337,22 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
           </>
         )}
 
-        {/* ── Rect corner radius ───────────────────────────────────── */}
         {isRect && (
           <>
             <Tip label="Corner radius">
               <div className="flex items-center gap-0.5">
-                <span className="text-[10px] text-muted-foreground shrink-0">R</span>
+                <span className="shrink-0 text-[10px] text-muted-foreground">R</span>
                 <Input
-                  type="number" min={0} max={200} step={1}
-                  value={r.rx ?? 0}
+                  type="number"
+                  min={0}
+                  max={200}
+                  step={1}
+                  value={rectObj.rx ?? 0}
                   onChange={(e) => {
-                    const v = parseInt(e.target.value) || 0;
-                    set({ rx: v, ry: v });
+                    const v = parseInt(e.target.value, 10) || 0;
+                    applyProps({ rx: v, ry: v });
                   }}
-                  className="h-7 w-14 text-xs text-center px-1 shrink-0"
+                  className="h-7 w-14 shrink-0 px-1 text-center text-xs"
                 />
               </div>
             </Tip>
@@ -282,67 +360,80 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
           </>
         )}
 
-        {/* ── Stroke colour (non-image, non-text shapes) ──────────── */}
         {!isText && !isImage && (
           <>
             <Tip label="Stroke color">
-              <label className="flex items-center gap-1 cursor-pointer">
+              <label className="flex cursor-pointer items-center gap-1">
                 <span
-                  className="h-6 w-6 rounded border-2 border-white shadow ring-1 ring-border"
+                  className="h-6 w-6 rounded border-2 border-white ring-1 ring-border"
                   style={{ background: (selected.stroke as string) ?? "#000000" }}
                 />
                 <input
                   type="color"
                   className="sr-only"
                   value={(selected.stroke as string) ?? "#000000"}
-                  onChange={(e) => set({ stroke: e.target.value })}
+                  onChange={(e) => applyProps({ stroke: e.target.value })}
                 />
               </label>
             </Tip>
+
             <Tip label="Stroke width">
               <Input
-                type="number" min={0} max={40} step={0.5}
+                type="number"
+                min={0}
+                max={40}
+                step={0.5}
                 value={(selected as fabric.Rect).strokeWidth ?? 0}
-                onChange={(e) => set({ strokeWidth: parseFloat(e.target.value) || 0 })}
-                className="h-7 w-14 text-xs text-center px-1 shrink-0"
+                onChange={(e) => applyProps({ strokeWidth: parseFloat(e.target.value) || 0 })}
+                className="h-7 w-14 shrink-0 px-1 text-center text-xs"
               />
             </Tip>
+
             <VSep />
           </>
         )}
 
-        {/* ── Opacity ─────────────────────────────────────────────── */}
         <Tip label="Opacity %">
           <div className="flex items-center gap-0.5">
-            <span className="text-[10px] text-muted-foreground shrink-0">α</span>
+            <span className="shrink-0 text-[10px] text-muted-foreground">a</span>
             <Input
-              type="number" min={0} max={100} step={1}
+              type="number"
+              min={0}
+              max={100}
+              step={1}
               value={Math.round((selected.opacity ?? 1) * 100)}
-              onChange={(e) => set({ opacity: (parseInt(e.target.value) || 0) / 100 })}
-              className="h-7 w-14 text-xs text-center px-1 shrink-0"
+              onChange={(e) => applyProps({ opacity: (parseInt(e.target.value, 10) || 0) / 100 })}
+              className="h-7 w-14 shrink-0 px-1 text-center text-xs"
             />
           </div>
         </Tip>
 
         <VSep />
 
-        {/* ── Flip ────────────────────────────────────────────────── */}
         <Tip label="Flip horizontal">
-          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0"
-            onClick={() => set({ flipX: !selected.flipX })}>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 shrink-0"
+            onClick={() => applyProps({ flipX: !selected.flipX })}
+          >
             <FlipHorizontal2 className="h-3.5 w-3.5" />
           </Button>
         </Tip>
+
         <Tip label="Flip vertical">
-          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0"
-            onClick={() => set({ flipY: !selected.flipY })}>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 shrink-0"
+            onClick={() => applyProps({ flipY: !selected.flipY })}
+          >
             <FlipVertical2 className="h-3.5 w-3.5" />
           </Button>
         </Tip>
 
         <VSep />
 
-        {/* ── Delete ──────────────────────────────────────────────── */}
         <Tip label="Delete (Del)">
           <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={onDelete}>
             <Trash2 className="h-3.5 w-3.5 text-destructive" />

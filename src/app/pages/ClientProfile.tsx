@@ -36,6 +36,7 @@ import { Can } from "../../lib/rbac";
 import { Permission } from "../../lib/rbac";
 import { loadClients, updateClient, addTransaction, loadTransactions, type Client } from "../../lib/clientStore";
 import { loadProjects, addProject, type Project } from "../../lib/projectStore";
+import { STATE_DISTRICTS } from "../../lib/districts";
 
 const INDIAN_STATES = [
   "ANDAMAN & NICOBAR ISLANDS","ANDHRA PRADESH","ARUNACHAL PRADESH","ASSAM","BIHAR",
@@ -57,6 +58,7 @@ const emptyWalletForm = {
 
 const emptyProjectForm = {
   name: "",
+  workflowType: "variable_data" as "variable_data" | "direct_print",
   stage: "draft",
   priority: "medium" as Project["priority"],
   dueDate: "",
@@ -86,6 +88,7 @@ export function ClientProfile() {
   const [projectForm, setProjectForm] = useState(emptyProjectForm);
   const [projectErrors, setProjectErrors] = useState<Partial<typeof emptyProjectForm>>({});
   const [clientVersion, setClientVersion] = useState(0); // used to force re-read after save
+  const [districtSearch, setDistrictSearch] = useState("");
 
   const allClients = loadClients();
   const found = allClients.find((c) => c.id === id);
@@ -131,6 +134,8 @@ export function ClientProfile() {
     state: clientData.state,
     district: clientData.district,
     schoollogUniqueId: clientData.schoollogUniqueId,
+    busStop: clientData.busStop || "",
+    route: clientData.route || "",
   });
 
   const setField = (field: keyof typeof editForm) =>
@@ -192,6 +197,7 @@ export function ClientProfile() {
       assignee: projectForm.assignee,
       amount: Number(projectForm.amount),
       description: projectForm.description,
+      workflowType: projectForm.workflowType,
     });
     setProjectForm(emptyProjectForm);
     setProjectErrors({});
@@ -295,7 +301,15 @@ export function ClientProfile() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-3">
                     <Label>Delivery Mode</Label>
-                    <RadioGroup value={editForm.deliveryMode} onValueChange={(v) => setEditForm((f) => ({ ...f, deliveryMode: v }))} className="flex gap-6">
+                    <RadioGroup 
+                      value={editForm.deliveryMode} 
+                      onValueChange={(v) => setEditForm((f) => ({
+                        ...f,
+                        deliveryMode: v,
+                        ...(v !== "Bus" && { busStop: "", route: "" })
+                      }))} 
+                      className="flex gap-6"
+                    >
                       <div className="flex items-center gap-2">
                         <RadioGroupItem value="Bus" id="edit-bus" />
                         <Label htmlFor="edit-bus" className="font-normal cursor-pointer">Bus</Label>
@@ -324,6 +338,35 @@ export function ClientProfile() {
                     </RadioGroup>
                   </div>
                 </div>
+                {/* Bus Delivery Conditional Fields */}
+                <div
+                  className={`transition-all duration-300 ease-in-out overflow-hidden ${
+                    editForm.deliveryMode === "Bus"
+                      ? "max-h-96 opacity-100 mb-4"
+                      : "max-h-0 opacity-0 mb-0"
+                  }`}
+                >
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t border-border">
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-busStop">Bus Stop</Label>
+                      <Input
+                        id="edit-busStop"
+                        placeholder="Enter Bus Stop"
+                        value={editForm.busStop}
+                        onChange={setField("busStop")}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-route">Route</Label>
+                      <Input
+                        id="edit-route"
+                        placeholder="Enter Route"
+                        value={editForm.route}
+                        onChange={setField("route")}
+                      />
+                    </div>
+                  </div>
+                </div>
                 {/* Address */}
                 <div className="space-y-2">
                   <Label>Address</Label>
@@ -341,7 +384,7 @@ export function ClientProfile() {
                   </div>
                   <div className="space-y-2">
                     <Label>State</Label>
-                    <Select value={editForm.state} onValueChange={(v) => setEditForm((f) => ({ ...f, state: v }))}>
+                    <Select value={editForm.state} onValueChange={(v) => setEditForm((f) => ({ ...f, state: v, district: "" }))}>
                       <SelectTrigger><SelectValue placeholder="Select State" /></SelectTrigger>
                       <SelectContent className="max-h-60">
                         {INDIAN_STATES.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
@@ -349,8 +392,31 @@ export function ClientProfile() {
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <Label>District</Label>
-                    <Input placeholder="District" value={editForm.district} onChange={setField("district")} />
+                    <Label htmlFor="district">Select District</Label>
+                    <Select
+                      value={editForm.district}
+                      onValueChange={(v) => setEditForm((f) => ({ ...f, district: v }))}
+                      disabled={!editForm.state}
+                      required
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Choose District" />
+                      </SelectTrigger>
+                      <SelectContent className="max-h-60">
+                        <div className="px-2 py-1">
+                          <Input
+                            placeholder="Search district..."
+                            value={districtSearch}
+                            onChange={e => setDistrictSearch(e.target.value)}
+                            className="mb-2"
+                            disabled={!editForm.state}
+                          />
+                        </div>
+                        {editForm.state && (STATE_DISTRICTS[editForm.state]?.filter((d: string) => d.toLowerCase().includes(districtSearch.toLowerCase())) || []).map((d: string) => (
+                          <SelectItem key={d} value={d}>{d}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
                 </div>
                 {/* Schoollog ID */}
@@ -574,6 +640,16 @@ export function ClientProfile() {
                         <Label>Project Name <span className="text-destructive">*</span></Label>
                         <Input placeholder="Project name" value={projectForm.name} onChange={(e) => setProjectForm((f) => ({ ...f, name: e.target.value }))} />
                         {projectErrors.name && <p className="text-xs text-destructive">{projectErrors.name}</p>}
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Workflow Type <span className="text-destructive">*</span></Label>
+                        <Select value={projectForm.workflowType} onValueChange={(v) => setProjectForm((f) => ({ ...f, workflowType: v as "variable_data" | "direct_print" }))}>
+                          <SelectTrigger><SelectValue placeholder="Select workflow type" /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="variable_data">Variable Data Printing</SelectItem>
+                            <SelectItem value="direct_print">Direct Print Order</SelectItem>
+                          </SelectContent>
+                        </Select>
                       </div>
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-2">

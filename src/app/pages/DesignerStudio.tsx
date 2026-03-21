@@ -1,14 +1,16 @@
-﻿import { useState, useRef, useEffect, useCallback } from "react";
+﻿import { useState, useRef, useEffect, useCallback, type DragEvent } from "react";
+import { useNavigate } from "react-router";
 import * as fabric from "fabric";
 import jsPDF from "jspdf";
 import {
+  ArrowLeft,
   MousePointer2, ZoomIn, ZoomOut, Hand, Layers, Square, Circle as CircleIcon,
   Type, ImagePlus, Pen, QrCode, Barcode, Grid3x3, Triangle, Minus,
   AlignStartVertical, AlignCenterVertical, AlignEndVertical,
   AlignStartHorizontal, AlignCenterHorizontal, AlignEndHorizontal,
   Undo2, Redo2, Copy, Trash2, Download, FolderOpen, Plus, X, Eye,
   ChevronDown, ChevronLeft, ChevronRight, Save, Globe, Pencil,
-  FileImage, Palette, SlidersHorizontal, RefreshCcw,
+  FileImage, Palette, SlidersHorizontal, LayoutGrid, Rows3,
 } from "lucide-react";
 import { Button } from "../components/ui/button";
 import {
@@ -37,6 +39,7 @@ import { PropertiesPanel, type CustomFont } from "../components/designer/Propert
 import { BackgroundPanel } from "../components/designer/BackgroundPanel";
 import { MaskPanel } from "../components/designer/MaskPanel";
 import { ContextToolbar } from "../components/designer/ContextToolbar";
+import { ShapesGallery } from "../components/designer/ShapesGallery";
 import { HRuler, VRuler, RULER_THICKNESS } from "../components/designer/Ruler";
 import {
   loadDesignerConfig, DEFAULT_CONFIG, DESIGNER_SAVE_KEY, DESIGNER_CONTEXT_KEY,
@@ -46,6 +49,8 @@ import {
   loadProjects, loadProjectTemplates, addProjectTemplate,
   updateProjectTemplate, type Project,
 } from "../../lib/projectStore";
+import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
+import { type ShapeItem } from "../../lib/shapesGallery";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -58,6 +63,152 @@ type ToolId =
   | "qrcode" | "barcode" | "alignment";
 
 const EMPTY_CANVAS_JSON = { objects: [] as object[] };
+const DESIGNER_IMPORT_MODE_KEY = "vendor_designer_import_mode";
+
+function PagePreviewItem({
+  page,
+  index,
+  isActive,
+  activeLiveThumb,
+  thumbZoom,
+  sourceCanvasWidth,
+  sourceCanvasHeight,
+  onOpen,
+  onDuplicate,
+  onDelete,
+  onDragStart,
+  onDragOver,
+  onDrop,
+}: {
+  page: DesignPage;
+  index: number;
+  isActive: boolean;
+  activeLiveThumb: string;
+  thumbZoom: number;
+  sourceCanvasWidth: number;
+  sourceCanvasHeight: number;
+  onOpen: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+  onDragStart: () => void;
+  onDragOver: (event: DragEvent<HTMLDivElement>) => void;
+  onDrop: () => void;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [isVisible, setIsVisible] = useState(false);
+  const [thumbUrl, setThumbUrl] = useState<string>("");
+
+  useEffect(() => {
+    const node = hostRef.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "200px" }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!isVisible) return;
+    if (isActive && activeLiveThumb) {
+      setThumbUrl(activeLiveThumb);
+      return;
+    }
+
+    let cancelled = false;
+    const canvasEl = document.createElement("canvas");
+    const thumbW = Math.max(32, Math.round(sourceCanvasWidth));
+    const thumbH = Math.max(32, Math.round(sourceCanvasHeight));
+    const sc = new fabric.StaticCanvas(canvasEl, {
+      width: thumbW,
+      height: thumbH,
+      renderOnAddRemove: false,
+    });
+
+    sc.loadFromJSON(JSON.stringify(page.canvas ?? EMPTY_CANVAS_JSON)).then(() => {
+      sc.renderAll();
+      if (!cancelled) {
+        setThumbUrl(
+          sc.toDataURL({
+            format: "png",
+            multiplier: 0.22,
+            enableRetinaScaling: false,
+          })
+        );
+      }
+      sc.dispose();
+    });
+
+    return () => {
+      cancelled = true;
+      sc.dispose();
+    };
+  }, [isVisible, page.canvas, isActive, activeLiveThumb, sourceCanvasWidth, sourceCanvasHeight]);
+
+  const scale = thumbZoom / 100;
+  const frameHeightPx = Math.max(56, Math.round(84 * scale));
+
+  return (
+    <div
+      ref={hostRef}
+      draggable
+      onDragStart={onDragStart}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+      className={`group relative rounded-md border transition-all cursor-pointer ${
+        isActive
+          ? "border-primary ring-1 ring-primary/40 bg-primary/5"
+          : "border-border/70 hover:border-primary/40 hover:bg-muted/40"
+      }`}
+      onClick={onOpen}
+    >
+      <div className="px-1.5 pt-1 text-[10px] text-muted-foreground truncate">
+        {index + 1}. {page.name}
+      </div>
+      <div className="p-1.5">
+        <div
+          className="w-full rounded border bg-white overflow-hidden flex items-center justify-center"
+          style={{ height: `${frameHeightPx}px` }}
+        >
+          {thumbUrl ? (
+            <img src={thumbUrl} alt={page.name} className="max-w-full max-h-full object-contain" loading="lazy" />
+          ) : (
+            <div className="w-full h-full bg-muted/40 animate-pulse" />
+          )}
+        </div>
+      </div>
+
+      <div className="absolute right-1 top-1 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            onDuplicate();
+          }}
+          className="h-5 w-5 rounded bg-background/90 border border-border flex items-center justify-center hover:bg-accent"
+          title="Duplicate page"
+        >
+          <Copy className="h-3 w-3" />
+        </button>
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            onDelete();
+          }}
+          className="h-5 w-5 rounded bg-background/90 border border-border flex items-center justify-center hover:bg-destructive/10 hover:text-destructive"
+          title="Delete page"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </div>
+    </div>
+  );
+}
 
 // ─── Layers List ──────────────────────────────────────────────────────────────
 
@@ -168,15 +319,12 @@ function ToolBtn({
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export function DesignerStudio() {
+  const navigate = useNavigate();
   const canvasRef       = useRef<FabricCanvasHandle | null>(null);
   const imageInputRef   = useRef<HTMLInputElement>(null);
   const svgInputRef     = useRef<HTMLInputElement>(null);
   const loadTplInputRef = useRef<HTMLInputElement>(null);
   const canvasScrollRef = useRef<HTMLDivElement>(null);
-  const resizeDragRef   = useRef<{
-    startX: number; startY: number; startW: number; startH: number;
-    pxPerMm: number; type: "corner" | "right" | "bottom";
-  } | null>(null);
 
   // ── Core state ─────────────────────────────────────────────────────────────
   const [config, setConfig] = useState<TemplateConfig>(
@@ -190,7 +338,7 @@ export function DesignerStudio() {
   const [currentBg, setCurrentBg] = useState<string>("#ffffff");
   const [userZoom, setUserZoom] = useState(100);
   const [safeZoneWarn, setSafeZoneWarn] = useState(false);
-  const [rightTab, setRightTab] = useState<"background" | "properties" | "mask" | "layers">("background");
+  const [rightTab, setRightTab] = useState<"background" | "properties" | "mask" | "layers" | "alignment">("background");
 
   // ── Custom fonts ────────────────────────────────────────────────────────────
   const [customFonts, setCustomFonts] = useState<CustomFont[]>([]);
@@ -198,10 +346,15 @@ export function DesignerStudio() {
   // ── Tool state ─────────────────────────────────────────────────────────────
   const [activeTool,      setActiveTool]      = useState<ToolId>("select");
   const [shapesPopupOpen, setShapesPopupOpen] = useState(false);
+  const [galleryOpen,     setGalleryOpen]     = useState(false);
+  const [canUndo,         setCanUndo]         = useState(false);
+  const [canRedo,         setCanRedo]         = useState(false);
 
   // ── Dialogs ────────────────────────────────────────────────────────────────
   const [qrDialogOpen, setQrDialogOpen] = useState(false);
   const [qrText,       setQrText]       = useState("https://example.com");
+  const [barcodeDialogOpen, setBarcodeDialogOpen] = useState(false);
+  const [barcodeText,       setBarcodeText]       = useState("1234567890");
   const [previewOpen,  setPreviewOpen]  = useState(false);
   const [previewUrl,   setPreviewUrl]   = useState("");
 
@@ -211,6 +364,13 @@ export function DesignerStudio() {
   ]);
   const [activePageId,  setActivePageId]  = useState("page-1");
   const [pageCounter,   setPageCounter]   = useState(1);
+  const [pageViewMode, setPageViewMode] = useState<"grid" | "strip">("grid");
+  const [pagePanelCollapsed, setPagePanelCollapsed] = useState(false);
+  const [thumbZoom, setThumbZoom] = useState(100);
+  const [activeLiveThumb, setActiveLiveThumb] = useState("");
+  const [dragPageId, setDragPageId] = useState<string | null>(null);
+  const [pageLoadNonce, setPageLoadNonce] = useState(0);
+  const activeCanvasHashRef = useRef("");
 
   // ── Designer context ───────────────────────────────────────────────────────
   const [designerContext] = useState<DesignerContext | null>(() => {
@@ -220,22 +380,74 @@ export function DesignerStudio() {
 
   // ── Save dialog ────────────────────────────────────────────────────────────
   const [saveDialogOpen,   setSaveDialogOpen]   = useState(false);
-  const [projects]                              = useState<Project[]>(() => loadProjects());
+  const [projects, setProjects]                 = useState<Project[]>([]);
   const [saveProjectId,    setSaveProjectId]    = useState(() => designerContext?.projectId ?? "");
   const [saveTemplateName, setSaveTemplateName] = useState("");
   const [isSaving,         setIsSaving]         = useState(false);
+  const [importMode, setImportMode] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(DESIGNER_IMPORT_MODE_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
   const [saveIsPublic,     setSaveIsPublic]      = useState<boolean>(() => {
     if (designerContext?.templateId) {
       try {
         const t = loadProjectTemplates(designerContext.projectId)
           .find((t) => t.id === designerContext.templateId);
-        return t?.isPublic ?? false;
-      } catch { return false; }
+        return t?.isPublic ?? true;
+      } catch { return true; }
     }
-    return false;
+    return true;
   });
 
-  const refresh = useCallback(() => setTick((t) => t + 1), []);
+  const refresh = useCallback(() => {
+    setTick((t) => t + 1);
+    // Update undo/redo button states
+    setCanUndo(canvasRef.current?.canUndo?.() ?? false);
+    setCanRedo(canvasRef.current?.canRedo?.() ?? false);
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    apiFetchProjects()
+      .then((data) => {
+        if (!mounted || !Array.isArray(data)) return;
+        const mapped: Project[] = data.map((p: any) => {
+          const populatedClient = typeof p.clientId === "object" && p.clientId !== null ? p.clientId : null;
+          const stage = String(p.stage || p.status || "draft");
+          return {
+            id: String(p._id || p.id),
+            name: String(p.name || "Untitled Project"),
+            client: String(p.client || populatedClient?.clientName || "Unknown Client"),
+            clientId: String(populatedClient?._id || p.clientId || ""),
+            stage,
+            priority: (p.priority || "medium") as Project["priority"],
+            dueDate: String(p.dueDate || ""),
+            assignee: String(p.assignee || ""),
+            amount: Number(p.amount || 0),
+            description: String(p.description || ""),
+            workflowType: (p.workflowType || "variable_data") as Project["workflowType"],
+            createdAt: String(p.createdAt || new Date().toISOString()),
+          };
+        });
+
+        setProjects(mapped);
+        if (!designerContext?.projectId && mapped.length > 0) {
+          setSaveProjectId((prev) => prev || mapped[0].id);
+        }
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setProjects(loadProjects());
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, [designerContext?.projectId]);
 
   // ── Canvas pixel dimensions ────────────────────────────────────────────────
   const canvasPxW  = mmToPx(config.canvas.width);
@@ -289,7 +501,13 @@ export function DesignerStudio() {
     } else if (activeTool === "draw") {
       fc.selection = false;
       fc.isDrawingMode = true;
-      if (fc.freeDrawingBrush) { fc.freeDrawingBrush.color = "#000000"; fc.freeDrawingBrush.width = 3; }
+      // Initialize brush with PencilBrush if not already set
+      if (!fc.freeDrawingBrush) {
+        fc.freeDrawingBrush = new fabric.PencilBrush(fc);
+      }
+      // Configure brush properties
+      fc.freeDrawingBrush.color = "#000000";
+      fc.freeDrawingBrush.width = 3;
       fc.defaultCursor = "crosshair";
     } else {
       fc.selection = true;
@@ -351,11 +569,11 @@ export function DesignerStudio() {
         setQrDialogOpen(true); setShapesPopupOpen(false);
         break;
       case "barcode":
-        toast.info("Barcode tool — coming soon"); setShapesPopupOpen(false);
+        setBarcodeDialogOpen(true); setShapesPopupOpen(false);
         break;
       case "shapes":
-        setShapesPopupOpen((v) => !v);
-        setActiveTool("shapes");
+        setGalleryOpen(true);
+        setActiveTool("select");
         break;
       case "zoom":
         setUserZoom((z) => Math.min(300, Math.round(z / 10) * 10 + 20));
@@ -365,6 +583,19 @@ export function DesignerStudio() {
         setShapesPopupOpen(false);
         setActiveTool(id);
     }
+  }, [refresh]);
+
+  // ── Gallery item handler ───────────────────────────────────────────────────
+  const handleGalleryItemSelect = useCallback((item: ShapeItem) => {
+    if (item.type === "shape") {
+      canvasRef.current?.addShapeFromGallery(item.id);
+      refresh();
+    } else if (item.type === "icon" && item.preview) {
+      // For icons, add as SVG
+      canvasRef.current?.addSVG(item.preview);
+      refresh();
+    }
+    setActiveTool("select");
   }, [refresh]);
 
   // ── Page helpers ───────────────────────────────────────────────────────────
@@ -420,6 +651,41 @@ export function DesignerStudio() {
     }
   }, [activePageId, pages]);
 
+  const duplicatePage = useCallback((pageId: string) => {
+    const cur = canvasRef.current?.toJSON() ?? EMPTY_CANVAS_JSON;
+    setPages((prev) => {
+      const synced = prev.map((p) => (p.id === activePageId ? { ...p, canvas: cur } : p));
+      const idx = synced.findIndex((p) => p.id === pageId);
+      if (idx < 0) return synced;
+      const source = synced[idx];
+      const id = `page-${Date.now()}`;
+      const nextCounter = pageCounter + 1;
+      const clone: DesignPage = {
+        id,
+        name: `${source.name} Copy`,
+        canvas: source.canvas,
+      };
+      const next = [...synced.slice(0, idx + 1), clone, ...synced.slice(idx + 1)];
+      setPageCounter(nextCounter);
+      setActivePageId(id);
+      setSelected(null);
+      return next;
+    });
+  }, [activePageId, pageCounter]);
+
+  const reorderPages = useCallback((dragId: string, dropId: string) => {
+    if (dragId === dropId) return;
+    setPages((prev) => {
+      const from = prev.findIndex((p) => p.id === dragId);
+      const to = prev.findIndex((p) => p.id === dropId);
+      if (from < 0 || to < 0) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }, []);
+
   // ── Effects ────────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -436,9 +702,11 @@ export function DesignerStudio() {
           const nextActive = loaded.some((p) => p.id === parsed.activePageId)
             ? parsed.activePageId : loaded[0].id;
           setPages(loaded); setPageCounter(Math.max(loaded.length, 1)); setActivePageId(nextActive);
+          setPageLoadNonce((n) => n + 1);
         } else if (parsed?.canvas) {
           setPages([{ id: "page-1", name: "Page 1", canvas: parsed.canvas }]);
           setActivePageId("page-1"); setPageCounter(1);
+          setPageLoadNonce((n) => n + 1);
         }
         refresh();
       } catch { /* ignore */ }
@@ -454,10 +722,55 @@ export function DesignerStudio() {
     if (!activePage) return;
     const t = setTimeout(() => {
       canvasRef.current?.loadFromJSON(activePage.canvas ?? EMPTY_CANVAS_JSON);
+      canvasRef.current?.resetHistory();
       setSelected(null); refresh();
     }, 80);
     return () => clearTimeout(t);
-  }, [activePageId, pages, refresh]);
+  }, [activePageId, pageLoadNonce, refresh]);
+
+  useEffect(() => {
+    const fc = canvasRef.current?.getCanvas();
+    if (!fc) return;
+
+    let rafId = 0;
+    const syncActive = () => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        const json = canvasRef.current?.toJSON() ?? EMPTY_CANVAS_JSON;
+        const hash = JSON.stringify(json);
+        if (hash !== activeCanvasHashRef.current) {
+          activeCanvasHashRef.current = hash;
+          setPages((prev) => prev.map((p) => (p.id === activePageId ? { ...p, canvas: json } : p)));
+        }
+
+        try {
+          const dataUrl = fc.toDataURL({
+            format: "png",
+            multiplier: 0.22,
+            enableRetinaScaling: false,
+          });
+          setActiveLiveThumb(dataUrl);
+        } catch {
+          // Ignore transient canvas serialization errors while drawing.
+        }
+      });
+    };
+
+    const events = [
+      "object:added",
+      "object:removed",
+      "object:modified",
+      "path:created",
+      "text:changed",
+    ] as const;
+    events.forEach((eventName) => fc.on(eventName, syncActive));
+    syncActive();
+
+    return () => {
+      events.forEach((eventName) => fc.off(eventName, syncActive));
+      cancelAnimationFrame(rafId);
+    };
+  }, [activePageId]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -480,36 +793,6 @@ export function DesignerStudio() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [refresh, handleToolClick]);
-
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      if (!resizeDragRef.current) return;
-      const { startX, startY, startW, startH, pxPerMm, type } = resizeDragRef.current;
-      const dx = e.clientX - startX; const dy = e.clientY - startY;
-      const MIN = 10;
-      setConfig((prev) => ({
-        ...prev,
-        canvas: {
-          ...prev.canvas,
-          width:  type !== "bottom" ? Math.max(MIN, Math.round((startW + dx / pxPerMm) * 10) / 10) : prev.canvas.width,
-          height: type !== "right"  ? Math.max(MIN, Math.round((startH + dy / pxPerMm) * 10) / 10) : prev.canvas.height,
-        },
-      }));
-    };
-    const onUp = () => { resizeDragRef.current = null; };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
-  }, []);
-
-  const handleResizeStart = useCallback((e: React.MouseEvent, type: "corner" | "right" | "bottom") => {
-    e.preventDefault(); e.stopPropagation();
-    resizeDragRef.current = {
-      startX: e.clientX, startY: e.clientY,
-      startW: config.canvas.width, startH: config.canvas.height,
-      pxPerMm: (96 / 25.4) * effectiveScale, type,
-    };
-  }, [config.canvas.width, config.canvas.height, effectiveScale]);
 
   const updateConfig = useCallback((partial: Partial<TemplateConfig>) =>
     setConfig((prev) => ({ ...prev, ...partial })), []);
@@ -536,6 +819,13 @@ export function DesignerStudio() {
 
   // ── Save/export ─────────────────────────────────────────────────────────────
   const handleSaveClick = () => {
+    if (importMode) {
+      setSaveTemplateName((config.templateName || "Template") + " Copy");
+      setSaveProjectId((prev) => prev || projects[0]?.id || "");
+      setSaveDialogOpen(true);
+      return;
+    }
+
     if (designerContext) {
       saveToProject(designerContext.projectId, designerContext.templateId, config.templateName);
     } else {
@@ -554,7 +844,8 @@ export function DesignerStudio() {
     const thumb   = canvasRef.current?.toPNG() ?? undefined;
     setIsSaving(true);
     try {
-      if (existingId) {
+      const hasExisting = Boolean(existingId) && loadProjectTemplates(projectId).some((t) => t.id === existingId);
+      if (existingId && hasExisting) {
         updateProjectTemplate(existingId, {
           templateName: name, templateType: config.templateType,
           canvas: config.canvas, margin: config.margin,
@@ -578,6 +869,8 @@ export function DesignerStudio() {
         }
         toast.success(`Template "${name}" saved`);
       }
+      localStorage.removeItem(DESIGNER_IMPORT_MODE_KEY);
+      setImportMode(false);
       setSaveDialogOpen(false);
     } finally { setIsSaving(false); }
   };
@@ -626,9 +919,11 @@ export function DesignerStudio() {
           const nextActive = loaded.some((p) => p.id === parsed.activePageId)
             ? parsed.activePageId : loaded[0].id;
           setPages(loaded); setPageCounter(Math.max(loaded.length, 1)); setActivePageId(nextActive);
+          setPageLoadNonce((n) => n + 1);
         } else if (parsed.canvas) {
           setPages([{ id: "page-1", name: "Page 1", canvas: parsed.canvas }]);
           setActivePageId("page-1"); setPageCounter(1);
+          setPageLoadNonce((n) => n + 1);
         }
         refresh(); toast.success("Template loaded");
       } catch { toast.error("Invalid template file"); }
@@ -659,10 +954,11 @@ export function DesignerStudio() {
     setRightTab("properties");
   }, [selected]);
 
-  // Auto-switch when layers / background tool is activated from left bar
+  // Auto-switch when layers / background / alignment tool is activated from left bar
   useEffect(() => {
     if (activeTool === "layers")     setRightTab("layers");
     if (activeTool === "background") setRightTab("background");
+    if (activeTool === "alignment")  setRightTab("alignment");
   }, [activeTool]);
 
   const TOOLS: { id: ToolId; icon: React.ElementType; label: string; sep?: boolean }[] = [
@@ -682,10 +978,20 @@ export function DesignerStudio() {
 
   // ─────────────────────────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col h-screen bg-background overflow-hidden">
+    <div className="flex flex-col h-[calc(100vh-4rem)] min-h-[620px] bg-background overflow-hidden">
 
       {/* ══════ TOP ACTION BAR ══════ */}
       <header className="flex items-center gap-2 px-3 h-12 border-b bg-card shrink-0 z-30">
+
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          onClick={() => navigate("/projects")}
+          title="Back to Projects"
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
 
         <div className="flex items-center gap-2 mr-1 shrink-0">
           <div className="w-7 h-7 rounded-lg bg-primary flex items-center justify-center">
@@ -757,6 +1063,7 @@ export function DesignerStudio() {
           onClick={() => {
             setPages([{ id: "page-1", name: "Page 1", canvas: EMPTY_CANVAS_JSON }]);
             setActivePageId("page-1"); setPageCounter(1);
+            setPageLoadNonce((n) => n + 1);
             setConfig(DEFAULT_CONFIG); setSelected(null); refresh();
             toast.success("New design created");
           }}
@@ -816,7 +1123,7 @@ export function DesignerStudio() {
       />
 
       {/* ══════ BODY ══════ */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
 
         {/* ══════ LEFT TOOLBAR ══════ */}
         <aside className="w-14 border-r bg-card flex flex-col items-center py-2 gap-0.5 shrink-0 z-20 relative overflow-visible">
@@ -830,9 +1137,8 @@ export function DesignerStudio() {
                 {([
                   { label: "Rectangle", Icon: Square,      action: () => { canvasRef.current?.addRect();   refresh(); } },
                   { label: "Circle",    Icon: CircleIcon,  action: () => { canvasRef.current?.addCircle(); refresh(); } },
-                  { label: "Triangle",  Icon: Triangle,    action: () => { canvasRef.current?.addRect();   refresh(); toast.info("Rotate in Properties to make triangle"); } },
+                  { label: "Triangle",  Icon: Triangle,    action: () => { canvasRef.current?.addTriangle(); refresh(); } },
                   { label: "Line",      Icon: Minus,       action: () => { canvasRef.current?.addLine();   refresh(); } },
-                  { label: "Arc Text",  Icon: RefreshCcw,  action: () => { canvasRef.current?.addCurvedText(); refresh(); } },
                   { label: "SVG",       Icon: FileImage,   action: () => { svgInputRef.current?.click(); } },
                 ] as { label: string; Icon: React.ElementType; action: () => void }[]).map(({ label, Icon, action }) => (
                   <button
@@ -859,7 +1165,7 @@ export function DesignerStudio() {
         {/* ══════ CENTER CANVAS AREA ══════ */}
         <main
           ref={canvasScrollRef}
-          className={`flex-1 overflow-auto bg-muted/40 flex flex-col ${activeTool === "hand" ? "cursor-grab" : ""}`}
+          className={`min-w-0 flex-1 overflow-auto bg-muted/40 flex flex-col ${activeTool === "hand" ? "cursor-grab" : ""}`}
           onClick={() => shapesPopupOpen && setShapesPopupOpen(false)}
         >
           <div className="shrink-0 px-4 pt-3 pb-1 flex items-center justify-between gap-3 flex-wrap">
@@ -921,51 +1227,12 @@ export function DesignerStudio() {
                   onSelectionChange={(obj) => { setSelected(obj); refresh(); }}
                 />
               </div>
-
-              {/* Resize handles */}
-              <div
-                onMouseDown={(e) => handleResizeStart(e, "right")}
-                style={{
-                  position: "absolute",
-                  top: RULER_THICKNESS + Math.round(displayPxH / 2) - 20,
-                  right: -8, width: 16, height: 40, cursor: "ew-resize", zIndex: 20,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                }}
-                className="opacity-0 group-hover:opacity-100 transition-opacity"
-                title="Drag to resize width"
-              >
-                <div className="w-1.5 h-8 rounded-full bg-primary/80 shadow" />
-              </div>
-
-              <div
-                onMouseDown={(e) => handleResizeStart(e, "bottom")}
-                style={{
-                  position: "absolute",
-                  left: RULER_THICKNESS + Math.round(displayPxW / 2) - 20,
-                  bottom: -8, width: 40, height: 16, cursor: "ns-resize", zIndex: 20,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                }}
-                className="opacity-0 group-hover:opacity-100 transition-opacity"
-                title="Drag to resize height"
-              >
-                <div className="h-1.5 w-8 rounded-full bg-primary/80 shadow" />
-              </div>
-
-              <div
-                onMouseDown={(e) => handleResizeStart(e, "corner")}
-                style={{
-                  position: "absolute", bottom: -8, right: -8,
-                  width: 16, height: 16, cursor: "nwse-resize", zIndex: 21,
-                }}
-                className="opacity-0 group-hover:opacity-100 transition-opacity rounded-full bg-primary shadow-md"
-                title="Drag to resize canvas"
-              />
             </div>
           </div>
         </main>
 
         {/* ══════ RIGHT PROPERTIES PANEL ══════ */}
-        <aside className="w-64 border-l bg-card flex flex-col shrink-0 overflow-hidden">
+        <aside className="w-[300px] min-w-[300px] max-w-[300px] border-l bg-card flex flex-col shrink-0 overflow-hidden">
           <Tabs value={rightTab} onValueChange={(v) => setRightTab(v as typeof rightTab)} className="flex flex-col flex-1 min-h-0 overflow-hidden">
             <TabsList className="grid grid-cols-4 m-2 mb-0 shrink-0 h-8">
               <TabsTrigger value="background" className="text-[10px] gap-0.5 px-1">
@@ -987,7 +1254,23 @@ export function DesignerStudio() {
                 <BackgroundPanel
                   currentBg={currentBg}
                   onSetColor={(color) => { setCurrentBg(color); canvasRef.current?.setBackgroundColor(color); }}
-                  onSetImage={(dataUrl) => { setCurrentBg("image"); canvasRef.current?.setBackgroundImage(dataUrl); }}
+                  onSetImage={(dataUrl, fitMode) => { 
+                    setCurrentBg("image"); 
+                    canvasRef.current?.setBackgroundImage(dataUrl, fitMode); 
+                  }}
+                  onSetSVG={(svgString, fitMode) => { 
+                    setCurrentBg("svg"); 
+                    canvasRef.current?.setBackgroundSVG(svgString, fitMode); 
+                  }}
+                  onSetBackgroundFitMode={(fitMode) => {
+                    canvasRef.current?.setBackgroundFitMode(fitMode);
+                  }}
+                  onMoveBackground={(offsetX, offsetY) => {
+                    canvasRef.current?.moveBackground(offsetX, offsetY);
+                  }}
+                  onResetBackgroundPosition={() => {
+                    canvasRef.current?.resetBackgroundPosition();
+                  }}
                   onClearBackground={() => { setCurrentBg("none"); canvasRef.current?.clearBackground(); }}
                 />
               </TabsContent>
@@ -1033,39 +1316,117 @@ export function DesignerStudio() {
           </Tabs>
 
           {/* Pages manager at bottom of right panel */}
-          <div className="border-t p-2 shrink-0">
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Pages</span>
-              <Button variant="ghost" size="icon" className="h-6 w-6" title="Add page" onClick={addPage}>
-                <Plus className="h-3 w-3" />
-              </Button>
+          <div className="border-t p-2 min-h-0">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Pages</span>
+                <span className="text-[10px] text-muted-foreground/70">({pages.length})</span>
+              </div>
+              <div className="flex items-center gap-0.5">
+                <Button
+                  variant={pageViewMode === "grid" ? "secondary" : "ghost"}
+                  size="icon"
+                  className="h-6 w-6"
+                  title="Grid view"
+                  onClick={() => setPageViewMode("grid")}
+                >
+                  <LayoutGrid className="h-3 w-3" />
+                </Button>
+                <Button
+                  variant={pageViewMode === "strip" ? "secondary" : "ghost"}
+                  size="icon"
+                  className="h-6 w-6"
+                  title="Strip view"
+                  onClick={() => setPageViewMode("strip")}
+                >
+                  <Rows3 className="h-3 w-3" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6"
+                  title="Collapse previews"
+                  onClick={() => setPagePanelCollapsed((v) => !v)}
+                >
+                  {pagePanelCollapsed ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                </Button>
+                <Button variant="ghost" size="icon" className="h-6 w-6" title="Add page" onClick={addPage}>
+                  <Plus className="h-3 w-3" />
+                </Button>
+              </div>
             </div>
-            <ScrollArea className="max-h-28">
-              <ul className="space-y-0.5">
-                {pages.map((page) => (
-                  <li key={page.id} className="flex items-center gap-1">
-                    <button
-                      onClick={() => switchPage(page.id)}
-                      className={`flex-1 text-left px-2 py-1 rounded text-xs truncate transition-colors ${
-                        page.id === activePageId
-                          ? "bg-primary/10 text-primary font-medium"
-                          : "hover:bg-muted text-muted-foreground"
-                      }`}
-                    >
-                      {page.name}
-                    </button>
-                    {pages.length > 1 && (
-                      <button
-                        onClick={() => removePage(page.id)}
-                        className="h-5 w-5 flex items-center justify-center rounded hover:bg-destructive/10 hover:text-destructive transition-colors"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </ScrollArea>
+
+            {!pagePanelCollapsed && (
+              <>
+                <div className="mb-2 px-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] text-muted-foreground">Thumb</span>
+                    <Slider
+                      value={[thumbZoom]}
+                      min={70}
+                      max={140}
+                      step={5}
+                      onValueChange={([v]) => setThumbZoom(v)}
+                      className="flex-1"
+                    />
+                  </div>
+                </div>
+
+                {pageViewMode === "grid" ? (
+                  <div className="h-56 overflow-y-auto overscroll-contain pr-1">
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {pages.map((page, index) => (
+                        <PagePreviewItem
+                          key={page.id}
+                          page={page}
+                          index={index}
+                          isActive={page.id === activePageId}
+                          activeLiveThumb={activeLiveThumb}
+                          thumbZoom={thumbZoom}
+                          sourceCanvasWidth={displayPxW}
+                          sourceCanvasHeight={displayPxH}
+                          onOpen={() => switchPage(page.id)}
+                          onDuplicate={() => duplicatePage(page.id)}
+                          onDelete={() => pages.length > 1 && removePage(page.id)}
+                          onDragStart={() => setDragPageId(page.id)}
+                          onDragOver={(event) => event.preventDefault()}
+                          onDrop={() => {
+                            if (dragPageId) reorderPages(dragPageId, page.id);
+                            setDragPageId(null);
+                          }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="h-56 w-full overflow-y-auto overscroll-contain pr-1 scroll-smooth">
+                    <div className="flex flex-col gap-1.5 pb-1">
+                      {pages.map((page, index) => (
+                        <PagePreviewItem
+                          key={page.id}
+                          page={page}
+                          index={index}
+                          isActive={page.id === activePageId}
+                          activeLiveThumb={activeLiveThumb}
+                          thumbZoom={thumbZoom}
+                          sourceCanvasWidth={displayPxW}
+                          sourceCanvasHeight={displayPxH}
+                          onOpen={() => switchPage(page.id)}
+                          onDuplicate={() => duplicatePage(page.id)}
+                          onDelete={() => pages.length > 1 && removePage(page.id)}
+                          onDragStart={() => setDragPageId(page.id)}
+                          onDragOver={(event) => event.preventDefault()}
+                          onDrop={() => {
+                            if (dragPageId) reorderPages(dragPageId, page.id);
+                            setDragPageId(null);
+                          }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </aside>
       </div>
@@ -1076,8 +1437,13 @@ export function DesignerStudio() {
         <TooltipProvider delayDuration={400}>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon" className="h-8 w-8"
-                onClick={() => { canvasRef.current?.undo(); refresh(); }}>
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="h-8 w-8"
+                disabled={!canUndo}
+                onClick={() => { canvasRef.current?.undo(); refresh(); }}
+              >
                 <Undo2 className="h-4 w-4" />
               </Button>
             </TooltipTrigger>
@@ -1085,12 +1451,17 @@ export function DesignerStudio() {
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon" className="h-8 w-8"
-                onClick={() => { canvasRef.current?.redo(); refresh(); }}>
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="h-8 w-8"
+                disabled={!canRedo}
+                onClick={() => { canvasRef.current?.redo(); refresh(); }}
+              >
                 <Redo2 className="h-4 w-4" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent className="text-xs">Redo (Ctrl+Y)</TooltipContent>
+            <TooltipContent className="text-xs">Redo (Ctrl+Y / Ctrl+Shift+Z)</TooltipContent>
           </Tooltip>
         </TooltipProvider>
 
@@ -1207,6 +1578,41 @@ export function DesignerStudio() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={barcodeDialogOpen} onOpenChange={setBarcodeDialogOpen}>
+        <DialogContent className="sm:max-w-[360px]">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Barcode className="h-4 w-4" /> Add Barcode
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="barcode-text" className="text-xs">Barcode Text</Label>
+              <Input
+                id="barcode-text" value={barcodeText}
+                onChange={(e) => setBarcodeText(e.target.value)}
+                placeholder="1234567890" className="h-8 text-sm"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    canvasRef.current?.addBarcode(barcodeText); refresh();
+                    setBarcodeDialogOpen(false); setActiveTool("select");
+                  }
+                }}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setBarcodeDialogOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={() => {
+              canvasRef.current?.addBarcode(barcodeText); refresh();
+              setBarcodeDialogOpen(false); setActiveTool("select");
+            }}>
+              Add Barcode
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* ══════ PREVIEW DIALOG ══════ */}
       <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
         <DialogContent className="max-w-[90vw]">
@@ -1280,6 +1686,17 @@ export function DesignerStudio() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* ══════ SHAPES GALLERY MODAL ══════ */}
+      <ShapesGallery
+        isOpen={galleryOpen}
+        onClose={() => setGalleryOpen(false)}
+        onSelectItem={handleGalleryItemSelect}
+        onDragStart={(item, e) => {
+          e.dataTransfer.effectAllowed = "copy";
+          e.dataTransfer.setData("application/json", JSON.stringify(item));
+        }}
+      />
     </div>
   );
 }

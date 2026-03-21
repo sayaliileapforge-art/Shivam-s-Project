@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   MessageSquare, Clock, AlertCircle, CheckCircle2, Plus,
   Trash2, Edit, Search, ChevronDown, X,
@@ -21,7 +21,7 @@ import {
   loadTickets, addTicket, updateTicket, deleteTicket, avgResolutionHours,
   type Ticket, type TicketCategory, type TicketPriority, type TicketStatus,
 } from "../../lib/complaintsStore";
-import { loadClients } from "../../lib/clientStore";
+import { loadClients, type Client } from "../../lib/clientStore";
 
 const CATEGORIES: TicketCategory[] = ["billing", "technical", "delivery", "design", "other"];
 const PRIORITIES: TicketPriority[] = ["low", "medium", "high", "urgent"];
@@ -43,6 +43,7 @@ const emptyForm = {
 
 export function Complaints() {
   const [tickets, setTickets] = useState<Ticket[]>(() => loadTickets());
+  const [clients, setClients] = useState<Client[]>([]);
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [viewTicket, setViewTicket] = useState<Ticket | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
@@ -52,7 +53,25 @@ export function Complaints() {
   const [filterStatus, setFilterStatus] = useState<string>("all");
   const [filterPriority, setFilterPriority] = useState<string>("all");
 
-  const clients = loadClients();
+  useEffect(() => {
+    let mounted = true;
+    loadClients()
+      .then((data) => {
+        if (mounted) {
+          setClients(Array.isArray(data) ? data : []);
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setClients([]);
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const refresh = () => setTickets(loadTickets());
 
   const filtered = tickets.filter((t) => {

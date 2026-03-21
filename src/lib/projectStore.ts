@@ -1,4 +1,8 @@
+import { WorkflowType } from "./workflowConstants";
+import { WorkflowData, StatusHistory } from "./workflowUtils";
+
 const STORAGE_KEY = "vendor_projects";
+const WORKFLOW_STORAGE_KEY = "workflow_projects";
 
 export interface Project {
   id: string;
@@ -11,7 +15,44 @@ export interface Project {
   assignee: string;
   amount: number;
   description: string;
+  workflowType?: "variable_data" | "direct_print";
   createdAt: string;
+}
+
+export interface WorkflowProject {
+  id: string;
+  name: string;
+  clientId: string;
+  clientName: string;
+  ownerId: string;
+  ownerName: string;
+  workflowType: WorkflowType;
+  workflowData: WorkflowData;
+  product?: {
+    id: string;
+    name: string;
+    selectedVariableFields?: string[];
+    template?: {
+      id: string;
+      name: string;
+    };
+  };
+  fileData?: {
+    fileName: string;
+    uploadedAt: Date;
+    fileSize: number;
+    fileType: string;
+  };
+  payment?: {
+    totalAmount: number;
+    advanceAmount: number;
+    advancePaymentDate?: Date;
+    remainingAmount: number;
+    remainingPaymentDate?: Date;
+  };
+  metadata?: Record<string, any>;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export function loadProjects(): Project[] {
@@ -41,6 +82,13 @@ export function addProject(data: Omit<Project, "id" | "createdAt">): Project {
 export function updateProjectStage(id: string, stage: string): void {
   const projects = loadProjects().map((p) =>
     p.id === id ? { ...p, stage } : p
+  );
+  saveProjects(projects);
+}
+
+export function updateProject(id: string, data: Partial<Omit<Project, "id" | "createdAt">>): void {
+  const projects = loadProjects().map((p) =>
+    p.id === id ? { ...p, ...data } : p
   );
   saveProjects(projects);
 }
@@ -183,12 +231,17 @@ export interface ProjectTemplate {
 
 const TMPL_KEY = "vendor_project_templates";
 
-export function loadProjectTemplates(projectId: string): ProjectTemplate[] {
+export function loadAllProjectTemplates(): ProjectTemplate[] {
   try {
     const raw = localStorage.getItem(TMPL_KEY);
-    const all: ProjectTemplate[] = raw ? JSON.parse(raw) : [];
-    return all.filter((t) => t.projectId === projectId);
-  } catch { return []; }
+    return raw ? (JSON.parse(raw) as ProjectTemplate[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function loadProjectTemplates(projectId: string): ProjectTemplate[] {
+  return loadAllProjectTemplates().filter((t) => t.projectId === projectId);
 }
 
 export function addProjectTemplate(data: Omit<ProjectTemplate, "id" | "createdAt">): ProjectTemplate {
@@ -196,6 +249,7 @@ export function addProjectTemplate(data: Omit<ProjectTemplate, "id" | "createdAt
   const all: ProjectTemplate[] = raw ? JSON.parse(raw) : [];
   const item: ProjectTemplate = {
     ...data,
+    isPublic: data.isPublic ?? true,
     id: `TMPL-${Date.now()}`,
     createdAt: new Date().toLocaleDateString("en-IN"),
   };
@@ -316,4 +370,130 @@ export function updateDataRecord(id: string, data: Partial<ProjectDataRecord>): 
   const raw = localStorage.getItem(DATA_RECORDS_KEY);
   const all: ProjectDataRecord[] = raw ? JSON.parse(raw) : [];
   localStorage.setItem(DATA_RECORDS_KEY, JSON.stringify(all.map((r) => r.id === id ? { ...r, ...data } : r)));
+}
+
+// ─── Workflow Projects ───────────────────────────────────────────────────────
+
+export function loadWorkflowProjects(): WorkflowProject[] {
+  try {
+    const raw = localStorage.getItem(WORKFLOW_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as WorkflowProject[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveWorkflowProjects(projects: WorkflowProject[]): void {
+  localStorage.setItem(WORKFLOW_STORAGE_KEY, JSON.stringify(projects));
+}
+
+export function createWorkflowProject(
+  data: Omit<
+    WorkflowProject,
+    "id" | "createdAt" | "updatedAt" | "workflowData"
+  > & {
+    workflowData?: Partial<WorkflowData>;
+  }
+): WorkflowProject {
+  const projects = loadWorkflowProjects();
+  const now = new Date();
+
+  const workflowData: WorkflowData = {
+    workflowType: data.workflowType,
+    currentStatus:
+      data.workflowType === WorkflowType.VARIABLE_DATA
+        ? "project_created"
+        : "file_received",
+    statusHistory: [
+      {
+        previousStatus: "",
+        newStatus:
+          data.workflowType === WorkflowType.VARIABLE_DATA
+            ? "project_created"
+            : "file_received",
+        timestamp: now,
+        changedBy: data.ownerId,
+        reason: "Project created",
+      },
+    ],
+    createdAt: now,
+    updatedAt: now,
+    metadata: data.workflowData?.metadata || {},
+  };
+
+  const newProject: WorkflowProject = {
+    ...data,
+    id: `WFP-${Date.now()}`,
+    createdAt: now,
+    updatedAt: now,
+    workflowData,
+  };
+
+  saveWorkflowProjects([...projects, newProject]);
+  return newProject;
+}
+
+export function getWorkflowProject(id: string): WorkflowProject | null {
+  const projects = loadWorkflowProjects();
+  return projects.find((p) => p.id === id) || null;
+}
+
+export function updateWorkflowProject(
+  id: string,
+  updates: Partial<Omit<WorkflowProject, "id" | "createdAt">>
+): void {
+  const projects = loadWorkflowProjects();
+  const updated = projects.map((p) =>
+    p.id === id
+      ? {
+          ...p,
+          ...updates,
+          updatedAt: new Date(),
+        }
+      : p
+  );
+  saveWorkflowProjects(updated);
+}
+
+export function updateWorkflowStatus(
+  projectId: string,
+  newStatus: string,
+  userId: string,
+  reason?: string
+): void {
+  const project = getWorkflowProject(projectId);
+  if (!project) return;
+
+  const historyEntry: StatusHistory = {
+    previousStatus: project.workflowData.currentStatus,
+    newStatus,
+    timestamp: new Date(),
+    changedBy: userId,
+    reason,
+  };
+
+  project.workflowData.statusHistory.push(historyEntry);
+  project.workflowData.currentStatus = newStatus;
+  project.workflowData.updatedAt = new Date();
+
+  if (newStatus === "marked_delivered") {
+    project.workflowData.completedAt = new Date();
+  }
+
+  updateWorkflowProject(projectId, { workflowData: project.workflowData });
+}
+
+export function getWorkflowProjectsByClient(clientId: string): WorkflowProject[] {
+  const projects = loadWorkflowProjects();
+  return projects.filter((p) => p.clientId === clientId);
+}
+
+export function getWorkflowProjectsByOwner(ownerId: string): WorkflowProject[] {
+  const projects = loadWorkflowProjects();
+  return projects.filter((p) => p.ownerId === ownerId);
+}
+
+export function deleteWorkflowProject(id: string): void {
+  const projects = loadWorkflowProjects();
+  saveWorkflowProjects(projects.filter((p) => p.id !== id));
 }

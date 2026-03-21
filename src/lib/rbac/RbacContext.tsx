@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useMemo, useState } from "react";
+import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import type { Permission } from "./permissions";
 import type { Role } from "./roles";
 import {
@@ -44,6 +44,7 @@ interface RbacContextValue {
 //  Context
 // ─────────────────────────────────────────────────────────────
 const RbacContext = createContext<RbacContextValue | null>(null);
+const RBAC_USER_STORAGE_KEY = "rbac-current-user";
 
 // ─────────────────────────────────────────────────────────────
 //  Provider
@@ -55,7 +56,27 @@ interface RbacProviderProps {
 }
 
 export function RbacProvider({ children, initialUser = null }: RbacProviderProps) {
-  const [user, setUser] = useState<RbacUser | null>(initialUser);
+  const [user, setUser] = useState<RbacUser | null>(() => {
+    if (initialUser) return initialUser;
+    try {
+      const raw = localStorage.getItem(RBAC_USER_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as RbacUser) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      if (user) {
+        localStorage.setItem(RBAC_USER_STORAGE_KEY, JSON.stringify(user));
+      } else {
+        localStorage.removeItem(RBAC_USER_STORAGE_KEY);
+      }
+    } catch {
+      // ignore storage write errors
+    }
+  }, [user]);
 
   const value = useMemo<RbacContextValue>(() => {
     const permissions = user ? getPermissionsForRole(user.role) : new Set<Permission>();

@@ -8,10 +8,6 @@ import {
 import * as fabric from "fabric";
 import QRCode from "qrcode";
 import { mmToPx, type TemplateConfig } from "../../../lib/fabricUtils";
-import { CurvedText, type CurvedTextOpts } from "./CurvedTextObject";
-
-// Re-export for consumers
-export type { CurvedTextOpts };
 
 // ─── Public handle ────────────────────────────────────────────────────────────
 
@@ -20,15 +16,18 @@ export interface FabricCanvasHandle {
   addRect: () => void;
   addCircle: () => void;
   addLine: () => void;
+  addTriangle: () => void;
+  addPolygon: (sides?: number) => void;
+  addStar: (points?: number) => void;
+  addHexagon: () => void;
+  addRoundedRect: () => void;
+  addShapeFromGallery: (shapeId: string) => void;
   addImage: (dataUrl: string) => void;
   addQRCode: (text: string) => void;
+  addBarcode: (text: string) => void;
   addDynamicField: (fieldKey: string) => void;
   /** Add a scalable SVG from an SVG string. */
   addSVG: (svgString: string) => void;
-  /** Add a CurvedText arc-text object. */
-  addCurvedText: (opts?: CurvedTextOpts) => void;
-  /** Update properties on the selected CurvedText object. */
-  updateCurvedText: (props: Partial<CurvedTextOpts>) => void;
   /** Apply a PNG image as a transparency mask onto the selected FabricImage. */
   applyPNGMask: (maskDataUrl: string) => void;
   /** Remove the PNG mask and restore the original image. */
@@ -49,7 +48,11 @@ export interface FabricCanvasHandle {
   toPNG: () => string;
   toJPG: () => string;
   setBackgroundColor: (colorOrGradient: string) => void;
-  setBackgroundImage: (dataUrl: string) => void;
+  setBackgroundImage: (dataUrl: string, fitMode?: "cover" | "contain") => void;
+  setBackgroundSVG: (svgString: string, fitMode?: "cover" | "contain") => void;
+  setBackgroundFitMode: (fitMode: "cover" | "contain") => void;
+  moveBackground: (offsetX: number, offsetY: number) => void;
+  resetBackgroundPosition: () => void;
   clearBackground: () => void;
   bringForward: () => void;
   sendBackward: () => void;
@@ -60,6 +63,15 @@ export interface FabricCanvasHandle {
   applyImageMask: (shape: ImageMaskShape, radius?: number) => void;
   setImageBorderRadius: (radius: number) => void;
   autoFitText: () => void;
+  // Layer management methods
+  getLayers: () => Array<{ id: string; name: string; locked: boolean }>;
+  setLayerLocked: (id: string, locked: boolean) => void;
+  deleteLayer: (id: string) => void;
+  // History state query & management
+  canUndo: () => boolean;
+  canRedo: () => boolean;
+  resetHistory: () => void;
+  constrainSelectedToSafeArea: () => void;
 }
 
 export type ImageMaskShape =
@@ -107,16 +119,23 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     const bgStringRef = useRef<string>("#ffffff");
     // Incremented each time setBackgroundColor is called; used to cancel stale async renders
     const bgTokenRef = useRef(0);
+    // Track SVG background for zoom rescaling
+    const bgSVGRef = useRef<fabric.Group | fabric.FabricObject | null>(null);
+    // Track background fit mode: "cover" (fill canvas) or "contain" (fit with aspect ratio)
+    const bgFitModeRef = useRef<"cover" | "contain">("cover");
+    // Track background position offset for contain mode
+    const bgOffsetRef = useRef({ x: 0, y: 0 });
     // Undo/redo history stacks (serialized JSON snapshots)
     const historyRef = useRef<string[]>([]);
     const historyIndexRef = useRef(-1);
     const ignoreSaveRef = useRef(false);
+    // Track layer lock states: Map of object id → locked boolean
+    const layerLockedRef = useRef<Map<string, boolean>>(new Map());
+    // Layer counter for generating unique IDs
+    const layerCounterRef = useRef(0);
 
     const canvasPxW = Math.round(mmToPx(config.canvas.width) * displayScale);
     const canvasPxH = Math.round(mmToPx(config.canvas.height) * displayScale);
-
-    // Ensure CurvedText is registered (idempotent)
-    try { (fabric as any).classRegistry?.setClass(CurvedText, "CurvedText"); } catch { /**/ }
 
     const createImageMaskClipPath = useCallback(
       (
@@ -339,6 +358,51 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       []
     );
 
+    const constrainObjectToSafeArea = useCallback((obj: fabric.FabricObject, fitText = false) => {
+      if (!obj || (obj as unknown as { excludeFromExport?: boolean }).excludeFromExport) return;
+
+      const { margin, canvas } = configRef.current;
+      const ds = displayScaleRef.current;
+      const safeLeft = mmToPx(margin.left) * ds;
+      const safeTop = mmToPx(margin.top) * ds;
+      const safeRight = mmToPx(canvas.width) * ds - mmToPx(margin.right) * ds;
+      const safeBottom = mmToPx(canvas.height) * ds - mmToPx(margin.bottom) * ds;
+      const safeWidth = Math.max(1, safeRight - safeLeft);
+      const safeHeight = Math.max(1, safeBottom - safeTop);
+
+      if (fitText && (obj instanceof fabric.IText || obj instanceof fabric.Textbox)) {
+        let fontSize = Number(obj.fontSize ?? 16);
+        const minFontSize = 6;
+
+        obj.set({ scaleX: 1, scaleY: 1 });
+        obj.setCoords();
+
+        while ((obj.getScaledWidth() > safeWidth || obj.getScaledHeight() > safeHeight) && fontSize > minFontSize) {
+          fontSize -= 1;
+          obj.set({ fontSize });
+          obj.setCoords();
+        }
+      }
+
+      const objLeft = obj.left ?? 0;
+      const objTop = obj.top ?? 0;
+      const objRight = objLeft + obj.getScaledWidth();
+      const objBottom = objTop + obj.getScaledHeight();
+
+      let newLeft = objLeft;
+      let newTop = objTop;
+
+      if (objLeft < safeLeft) newLeft = safeLeft;
+      if (objTop < safeTop) newTop = safeTop;
+      if (objRight > safeRight) newLeft = safeRight - obj.getScaledWidth();
+      if (objBottom > safeBottom) newTop = safeBottom - obj.getScaledHeight();
+
+      if (newLeft !== objLeft || newTop !== objTop) {
+        obj.set({ left: newLeft, top: newTop });
+        obj.setCoords();
+      }
+    }, []);
+
     // ── Init canvas once ────────────────────────────────────────────────────
     useEffect(() => {
       if (!containerRef.current) return;
@@ -357,10 +421,31 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         preserveObjectStacking: true,
       });
 
-      // Enable object controls
-      fc.on("selection:created", (e) => onSelectionChange(e.selected?.[0] ?? null));
-      fc.on("selection:updated", (e) => onSelectionChange(e.selected?.[0] ?? null));
+      // Disable resize controls on all objects
+      fc.on("selection:created", (e) => {
+        if (e.selected) {
+          e.selected.forEach((obj) => {
+            obj.set({ hasControls: false, hasBorders: true, borderColor: "#999" });
+          });
+        }
+        onSelectionChange(e.selected?.[0] ?? null);
+      });
+      fc.on("selection:updated", (e) => {
+        if (e.selected) {
+          e.selected.forEach((obj) => {
+            obj.set({ hasControls: false, hasBorders: true, borderColor: "#999" });
+          });
+        }
+        onSelectionChange(e.selected?.[0] ?? null);
+      });
       fc.on("selection:cleared", () => onSelectionChange(null));
+      
+      // Disable controls on newly added objects
+      fc.on("object:added", (e) => {
+        if (e.target) {
+          e.target.set({ hasControls: false });
+        }
+      });
 
       // Save history snapshot after each modification
       const saveSnapshot = () => {
@@ -369,8 +454,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         // Truncate redo branch
         historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
         historyRef.current.push(json);
-        // Keep at most 50 snapshots
-        if (historyRef.current.length > 50) historyRef.current.shift();
+        // Keep at most 30 snapshots (optimized for performance)
+        if (historyRef.current.length > 30) historyRef.current.shift();
         historyIndexRef.current = historyRef.current.length - 1;
       };
       fc.on("object:added", saveSnapshot);
@@ -380,30 +465,19 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       // ── Clamp objects inside the margin safe-area ──────────────────────
       const clampToMargin = (e: { target?: fabric.FabricObject }) => {
         const obj = e.target;
-        if (!obj || (obj as unknown as { excludeFromExport?: boolean }).excludeFromExport) return;
-        const { margin, canvas } = configRef.current;
-        const ds = displayScaleRef.current;
-        const safeLeft   = mmToPx(margin.left)   * ds;
-        const safeTop    = mmToPx(margin.top)    * ds;
-        const safeRight  = mmToPx(canvas.width)  * ds - mmToPx(margin.right)  * ds;
-        const safeBottom = mmToPx(canvas.height) * ds - mmToPx(margin.bottom) * ds;
-        const objLeft   = (obj.left ?? 0);
-        const objTop    = (obj.top  ?? 0);
-        const objRight  = objLeft + obj.getScaledWidth();
-        const objBottom = objTop  + obj.getScaledHeight();
-        let newLeft = objLeft;
-        let newTop  = objTop;
-        if (objLeft < safeLeft)   newLeft = safeLeft;
-        if (objTop  < safeTop)    newTop  = safeTop;
-        if (objRight  > safeRight)  newLeft = safeRight  - obj.getScaledWidth();
-        if (objBottom > safeBottom) newTop  = safeBottom - obj.getScaledHeight();
-        if (newLeft !== objLeft || newTop !== objTop) {
-          obj.set({ left: newLeft, top: newTop });
-          obj.setCoords();
-        }
+        if (!obj) return;
+        constrainObjectToSafeArea(obj, true);
       };
       fc.on("object:moving",  clampToMargin);
       fc.on("object:scaling", clampToMargin);
+      fc.on("object:rotating", clampToMargin);
+      fc.on("object:modified", clampToMargin);
+      fc.on("text:changed", clampToMargin);
+
+      // Save initial blank canvas snapshot for history
+      const initialSnapshot = JSON.stringify(fc.toObject(["excludeFromExport", "isBgImage", "maskShape", "maskRadius"]));
+      historyRef.current.push(initialSnapshot);
+      historyIndexRef.current = 0;
 
       fabricRef.current = fc;
 
@@ -421,6 +495,110 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       const fc = fabricRef.current;
       if (!fc) return;
       fc.setDimensions({ width: canvasPxW, height: canvasPxH });
+      
+      // Rescale background image to match new canvas size
+      const bgImage = fc.getObjects().find((o) => (o as any).isBgImage) as fabric.FabricImage | undefined;
+      if (bgImage) {
+        const canvasW = fc.getWidth();
+        const canvasH = fc.getHeight();
+        const imgW = bgImage.width ?? 100;
+        const imgH = bgImage.height ?? 100;
+        const imgAspect = imgW / imgH;
+        const canvasAspect = canvasW / canvasH;
+        
+        if (bgFitModeRef.current === "cover") {
+          // Cover mode: fill canvas, crop if necessary
+          let scaleX = 1, scaleY = 1;
+          if (imgAspect > canvasAspect) {
+            // Image wider: scale by height
+            scaleY = canvasH / imgH;
+            scaleX = scaleY;
+          } else {
+            // Image taller: scale by width
+            scaleX = canvasW / imgW;
+            scaleY = scaleX;
+          }
+          const scaledW = imgW * scaleX;
+          const scaledH = imgH * scaleY;
+          bgImage.set({
+            scaleX,
+            scaleY,
+            left: (canvasW - scaledW) / 2,
+            top: (canvasH - scaledH) / 2,
+          });
+        } else {
+          // Contain mode: fit within canvas, no cropping, apply offset
+          let scaleX = 1, scaleY = 1;
+          if (imgAspect > canvasAspect) {
+            // Image wider: scale by width
+            scaleX = canvasW / imgW;
+            scaleY = scaleX;
+          } else {
+            // Image taller: scale by height
+            scaleY = canvasH / imgH;
+            scaleX = scaleY;
+          }
+          const scaledW = imgW * scaleX;
+          const scaledH = imgH * scaleY;
+          const baseX = (canvasW - scaledW) / 2;
+          const baseY = (canvasH - scaledH) / 2;
+          bgImage.set({
+            scaleX,
+            scaleY,
+            left: baseX + bgOffsetRef.current.x,
+            top: baseY + bgOffsetRef.current.y,
+          });
+        }
+      }
+      
+      // Rescale SVG background using cover or contain scaling
+      if (bgSVGRef.current) {
+        const svg = bgSVGRef.current;
+        const canvasW = fc.getWidth();
+        const canvasH = fc.getHeight();
+        const svgW = svg.width ?? 100;
+        const svgH = svg.height ?? 100;
+        const svgAspect = svgW / svgH;
+        const canvasAspect = canvasW / canvasH;
+        
+        let scaleX = 1, scaleY = 1;
+        if (bgFitModeRef.current === "cover") {
+          if (svgAspect > canvasAspect) {
+            scaleY = canvasH / svgH;
+            scaleX = scaleY;
+          } else {
+            scaleX = canvasW / svgW;
+            scaleY = scaleX;
+          }
+          const scaledW = svgW * scaleX;
+          const scaledH = svgH * scaleY;
+          svg.set({
+            scaleX,
+            scaleY,
+            left: (canvasW - scaledW) / 2,
+            top: (canvasH - scaledH) / 2,
+          });
+        } else {
+          if (svgAspect > canvasAspect) {
+            scaleX = canvasW / svgW;
+            scaleY = scaleX;
+          } else {
+            scaleY = canvasH / svgH;
+            scaleX = scaleY;
+          }
+          const scaledW = svgW * scaleX;
+          const scaledH = svgH * scaleY;
+          const baseX = (canvasW - scaledW) / 2;
+          const baseY = (canvasH - scaledH) / 2;
+          svg.set({
+            scaleX,
+            scaleY,
+            left: baseX + bgOffsetRef.current.x,
+            top: baseY + bgOffsetRef.current.y,
+          });
+        }
+      }
+      
       fc.renderAll();
     }, [canvasPxW, canvasPxH]);
 
@@ -497,6 +675,154 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       drawMargins();
     }, [drawMargins]);
 
+    // ── Drag-Drop Support for Gallery Items ────────────────────────────────
+    useEffect(() => {
+      const container = containerRef.current;
+      if (!container) return;
+
+      const handleDragOver = (e: DragEvent) => {
+        e.preventDefault();
+        e.dataTransfer!.dropEffect = "copy";
+        container.style.opacity = "0.8";
+        container.style.outline = "2px dashed #3b82f6";
+        container.style.outlineOffset = "-2px";
+      };
+
+      const handleDragLeave = (e: DragEvent) => {
+        if (e.target === container) {
+          container.style.opacity = "1";
+          container.style.outline = "none";
+        }
+      };
+
+      const handleDrop = (e: DragEvent) => {
+        e.preventDefault();
+        container.style.opacity = "1";
+        container.style.outline = "none";
+
+        const fc = fabricRef.current;
+        if (!fc) return;
+
+        try {
+          const data = e.dataTransfer!.getData("application/json");
+          const item = JSON.parse(data);
+
+          if (item.id && (item.type === "shape" || item.type === "icon")) {
+            // Get drop position relative to canvas
+            const rect = (e.target as HTMLElement)?.getBoundingClientRect?.();
+            const canvasLeft = rect?.left || 0;
+            const canvasTop = rect?.top || 0;
+            const x = (e.clientX || 0) - canvasLeft;
+            const y = (e.clientY || 0) - canvasTop;
+
+            const uid = `layer-${++layerCounterRef.current}`;
+
+            // Add shape at drop location
+            if (item.type === "shape") {
+              const methodMap: Record<string, () => void> = {
+                "shape-rectangle": () => {
+                  const r = new fabric.Rect({
+                    left: x,
+                    top: y,
+                    width: 120,
+                    height: 80,
+                    fill: "rgba(99,102,241,0.15)",
+                    stroke: "#6366f1",
+                    strokeWidth: 1.5,
+                    rx: 4,
+                    ry: 4,
+                    hasControls: false,
+                  });
+                  (r as any).__uid = uid;
+                  (r as any).__layerName = "Rectangle";
+                  fc.add(r);
+                  fc.setActiveObject(r);
+                },
+                "shape-circle": () => {
+                  const c = new fabric.Circle({
+                    left: x,
+                    top: y,
+                    radius: 50,
+                    fill: "rgba(34,197,94,0.15)",
+                    stroke: "#22c55e",
+                    strokeWidth: 1.5,
+                    hasControls: false,
+                  });
+                  (c as any).__uid = uid;
+                  (c as any).__layerName = "Circle";
+                  fc.add(c);
+                  fc.setActiveObject(c);
+                },
+                "shape-triangle": () => {
+                  const t = new fabric.Triangle({
+                    left: x,
+                    top: y,
+                    width: 100,
+                    height: 100,
+                    fill: "rgba(168,85,247,0.15)",
+                    stroke: "#a855f7",
+                    strokeWidth: 1.5,
+                    hasControls: false,
+                  });
+                  (t as any).__uid = uid;
+                  (t as any).__layerName = "Triangle";
+                  fc.add(t);
+                  fc.setActiveObject(t);
+                },
+                "shape-line": () => {
+                  const l = new fabric.Line([x, y, x + 80, y], {
+                    stroke: "#6b7280",
+                    strokeWidth: 2,
+                    hasControls: false,
+                  });
+                  (l as any).__uid = uid;
+                  (l as any).__layerName = "Line";
+                  fc.add(l);
+                  fc.setActiveObject(l);
+                },
+              };
+              const method = methodMap[item.id];
+              if (method) method();
+            } else if (item.type === "icon" && item.preview) {
+              // Add icon as SVG
+              (fabric as any).loadSVGFromString(item.preview).then((result: any) => {
+                const objs = (result.objects ?? []).filter(Boolean);
+                if (!objs.length) return;
+                const element =
+                  objs.length === 1
+                    ? objs[0]
+                    : new fabric.Group(objs, { left: 0, top: 0, ...result.options });
+                (element as any).__uid = uid;
+                (element as any).__layerName = item.label || "Icon";
+                element.set({
+                  left: x,
+                  top: y,
+                  hasControls: false,
+                });
+                element.setCoords();
+                fc.add(element);
+                fc.setActiveObject(element);
+                fc.renderAll();
+              });
+            }
+            fc.renderAll();
+          }
+        } catch {
+          // Invalid data, ignore
+        }
+      };
+
+      container.addEventListener("dragover", handleDragOver);
+      container.addEventListener("dragleave", handleDragLeave);
+      container.addEventListener("drop", handleDrop);
+
+      return () => {
+        container.removeEventListener("dragover", handleDragOver);
+        container.removeEventListener("dragleave", handleDragLeave);
+        container.removeEventListener("drop", handleDrop);
+      };
+    }, []);
+
     // ── Imperative API ──────────────────────────────────────────────────────
     useImperativeHandle(ref, () => ({
       addText() {
@@ -506,13 +832,19 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const ds = displayScaleRef.current;
         const sl = mmToPx(margin.left) * ds;
         const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
         const t = new fabric.IText("Double-click to edit", {
           left: sl,
           top: st,
           fontFamily: "Inter, sans-serif",
           fontSize: 16,
           fill: "#1f2937",
+          hasControls: false,
+          backgroundColor: "transparent",
+          backgroundPadding: 0,
         });
+        (t as any).__uid = uid;
+        (t as any).__layerName = "Text";
         fc.add(t);
         fc.setActiveObject(t);
         fc.renderAll();
@@ -525,6 +857,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const ds = displayScaleRef.current;
         const sl = mmToPx(margin.left) * ds;
         const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
         const r = new fabric.Rect({
           left: sl,
           top: st,
@@ -535,7 +868,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           strokeWidth: 1.5,
           rx: 4,
           ry: 4,
+          hasControls: false,
         });
+        (r as any).__uid = uid;
+        (r as any).__layerName = "Rectangle";
         fc.add(r);
         fc.setActiveObject(r);
         fc.renderAll();
@@ -548,6 +884,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const ds = displayScaleRef.current;
         const sl = mmToPx(margin.left) * ds;
         const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
         const c = new fabric.Circle({
           left: sl,
           top: st,
@@ -555,7 +892,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           fill: "rgba(34,197,94,0.15)",
           stroke: "#22c55e",
           strokeWidth: 1.5,
+          hasControls: false,
         });
+        (c as any).__uid = uid;
+        (c as any).__layerName = "Circle";
         fc.add(c);
         fc.setActiveObject(c);
         fc.renderAll();
@@ -568,18 +908,201 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const ds = displayScaleRef.current;
         const sl = mmToPx(margin.left) * ds;
         const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
         const l = new fabric.Line([sl, st + 20, sl + 80, st + 20], {
           stroke: "#6b7280",
           strokeWidth: 2,
+          hasControls: false,
         });
+        (l as any).__uid = uid;
+        (l as any).__layerName = "Line";
         fc.add(l);
         fc.setActiveObject(l);
         fc.renderAll();
       },
 
+      addTriangle() {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const { margin } = configRef.current;
+        const ds = displayScaleRef.current;
+        const sl = mmToPx(margin.left) * ds;
+        const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
+        const t = new fabric.Triangle({
+          left: sl,
+          top: st,
+          width: 100,
+          height: 100,
+          fill: "rgba(168,85,247,0.15)",
+          stroke: "#a855f7",
+          strokeWidth: 1.5,
+          hasControls: false,
+        });
+        (t as any).__uid = uid;
+        (t as any).__layerName = "Triangle";
+        fc.add(t);
+        fc.setActiveObject(t);
+        fc.renderAll();
+      },
+
+      addPolygon(sides: number = 5) {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const { margin } = configRef.current;
+        const ds = displayScaleRef.current;
+        const sl = mmToPx(margin.left) * ds;
+        const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
+        
+        // Create polygon points (regular n-sided polygon)
+        const points: Array<{ x: number; y: number }> = [];
+        const radius = 50;
+        for (let i = 0; i < sides; i++) {
+          const angle = (i / sides) * Math.PI * 2 - Math.PI / 2;
+          points.push({
+            x: radius + radius * Math.cos(angle),
+            y: radius + radius * Math.sin(angle),
+          });
+        }
+
+        const p = new fabric.Polygon(points, {
+          left: sl,
+          top: st,
+          fill: "rgba(59,130,246,0.15)",
+          stroke: "#3b82f6",
+          strokeWidth: 1.5,
+          hasControls: false,
+        });
+        (p as any).__uid = uid;
+        (p as any).__layerName = `Polygon (${sides}-sided)`;
+        fc.add(p);
+        fc.setActiveObject(p);
+        fc.renderAll();
+      },
+
+      addStar(points: number = 5) {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const { margin } = configRef.current;
+        const ds = displayScaleRef.current;
+        const sl = mmToPx(margin.left) * ds;
+        const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
+        
+        // Create star points
+        const starPoints: Array<{ x: number; y: number }> = [];
+        const outerRadius = 60;
+        const innerRadius = 25;
+        for (let i = 0; i < points * 2; i++) {
+          const radius = i % 2 === 0 ? outerRadius : innerRadius;
+          const angle = (i / (points * 2)) * Math.PI * 2 - Math.PI / 2;
+          starPoints.push({
+            x: outerRadius + radius * Math.cos(angle),
+            y: outerRadius + radius * Math.sin(angle),
+          });
+        }
+
+        const s = new fabric.Polygon(starPoints, {
+          left: sl,
+          top: st,
+          fill: "rgba(251,146,60,0.15)",
+          stroke: "#fb923c",
+          strokeWidth: 1.5,
+          hasControls: false,
+        });
+        (s as any).__uid = uid;
+        (s as any).__layerName = "Star";
+        fc.add(s);
+        fc.setActiveObject(s);
+        fc.renderAll();
+      },
+
+      addHexagon() {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const { margin } = configRef.current;
+        const ds = displayScaleRef.current;
+        const sl = mmToPx(margin.left) * ds;
+        const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
+        
+        // 6-sided polygon (hexagon)
+        const hexPoints: Array<{ x: number; y: number }> = [];
+        const radius = 50;
+        for (let i = 0; i < 6; i++) {
+          const angle = (i / 6) * Math.PI * 2;
+          hexPoints.push({
+            x: radius + radius * Math.cos(angle),
+            y: radius + radius * Math.sin(angle),
+          });
+        }
+
+        const h = new fabric.Polygon(hexPoints, {
+          left: sl,
+          top: st,
+          fill: "rgba(236,72,153,0.15)",
+          stroke: "#ec4899",
+          strokeWidth: 1.5,
+          hasControls: false,
+        });
+        (h as any).__uid = uid;
+        (h as any).__layerName = "Hexagon";
+        fc.add(h);
+        fc.setActiveObject(h);
+        fc.renderAll();
+      },
+
+      addRoundedRect() {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const { margin } = configRef.current;
+        const ds = displayScaleRef.current;
+        const sl = mmToPx(margin.left) * ds;
+        const st = mmToPx(margin.top)  * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
+        const rr = new fabric.Rect({
+          left: sl,
+          top: st,
+          width: 140,
+          height: 90,
+          fill: "rgba(14,165,233,0.15)",
+          stroke: "#0ea5e9",
+          strokeWidth: 1.5,
+          rx: 20,
+          ry: 20,
+          hasControls: false,
+        });
+        (rr as any).__uid = uid;
+        (rr as any).__layerName = "Rounded Rectangle";
+        fc.add(rr);
+        fc.setActiveObject(rr);
+        fc.renderAll();
+      },
+
+      addShapeFromGallery(shapeId: string) {
+        // Route to appropriate shape method based on gallery item ID
+        const methodMap: Record<string, () => void> = {
+          "shape-rectangle": () => this.addRect(),
+          "shape-circle": () => this.addCircle(),
+          "shape-triangle": () => this.addTriangle(),
+          "shape-line": () => this.addLine(),
+          "shape-polygon": () => this.addPolygon(),
+          "shape-star": () => this.addStar(),
+          "shape-hexagon": () => this.addHexagon(),
+          "shape-rounded-rect": () => this.addRoundedRect(),
+        };
+
+        const method = methodMap[shapeId];
+        if (method) {
+          method();
+        }
+      },
+
       addQRCode(text: string) {
         const fc = fabricRef.current;
         if (!fc) return;
+        const uid = `layer-${++layerCounterRef.current}`;
         QRCode.toDataURL(text || "https://example.com", { margin: 1, width: 200 })
           .then((url) => {
             fabric.FabricImage.fromURL(url).then((img) => {
@@ -588,7 +1111,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
               img.scaleToHeight(size);
               const { margin: qrMargin } = configRef.current;
               const qrDs = displayScaleRef.current;
-              img.set({ left: mmToPx(qrMargin.left) * qrDs, top: mmToPx(qrMargin.top) * qrDs });
+              (img as any).__uid = uid;
+              (img as any).__layerName = "QR Code";
+              img.set({ left: mmToPx(qrMargin.left) * qrDs, top: mmToPx(qrMargin.top) * qrDs, hasControls: false });
               fc.add(img);
               fc.setActiveObject(img);
               fc.renderAll();
@@ -597,9 +1122,57 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           .catch(() => {});
       },
 
+      addBarcode(text: string) {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const uid = `layer-${++layerCounterRef.current}`;
+        const val = text || "1234567890";
+        
+        // Generate barcode on canvas
+        const c = document.createElement("canvas");
+        c.width = 200;
+        c.height = 60;
+        const ctx = c.getContext("2d")!;
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, 200, 60);
+        ctx.fillStyle = "#000";
+        
+        // Simple visual barcode: alternate bar widths based on char codes
+        let x = 4;
+        const chars = val.split("");
+        const slotW = Math.floor(192 / Math.max(chars.length * 3, 1));
+        chars.forEach((ch) => {
+          const code = ch.charCodeAt(0);
+          [1, 0, 1].forEach((on) => {
+            const w = slotW * (on ? ((code & 1) ? 2 : 1) : 1);
+            if (on) ctx.fillRect(x, 4, w, 44);
+            x += w + 1;
+          });
+        });
+        
+        // Label
+        ctx.font = "9px monospace";
+        ctx.fillText(val.slice(0, 28), 4, 58);
+        const dataUrl = c.toDataURL("image/png");
+        
+        fabric.FabricImage.fromURL(dataUrl).then((img) => {
+          const size = Math.min(fc.getWidth(), fc.getHeight()) * 0.2;
+          img.scaleToWidth(size);
+          const { margin: bMargin } = configRef.current;
+          const bDs = displayScaleRef.current;
+          (img as any).__uid = uid;
+          (img as any).__layerName = "Barcode";
+          img.set({ left: mmToPx(bMargin.left) * bDs, top: mmToPx(bMargin.top) * bDs, hasControls: false });
+          fc.add(img);
+          fc.setActiveObject(img);
+          fc.renderAll();
+        }).catch(() => {});
+      },
+
       addDynamicField(fieldKey: string) {
         const fc = fabricRef.current;
         if (!fc) return;
+        const uid = `layer-${++layerCounterRef.current}`;
         const label = `{{${fieldKey}}}`;
         const { margin: dfMargin } = configRef.current;
         const dfDs = displayScaleRef.current;
@@ -610,7 +1183,12 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           fontSize: 14,
           fill: "#7c3aed",
           fontStyle: "italic",
+          hasControls: false,
+          backgroundColor: "transparent",
+          backgroundPadding: 0,
         });
+        (t as any).__uid = uid;
+        (t as any).__layerName = `Field: ${fieldKey}`;
         fc.add(t);
         fc.setActiveObject(t);
         fc.renderAll();
@@ -619,6 +1197,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       addImage(dataUrl: string) {
         const fc = fabricRef.current;
         if (!fc) return;
+        const uid = `layer-${++layerCounterRef.current}`;
         fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" }).then(
           (img) => {
             // Scale down if larger than canvas
@@ -631,7 +1210,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             }
             const { margin: imgMargin } = configRef.current;
             const imgDs = displayScaleRef.current;
-            img.set({ left: mmToPx(imgMargin.left) * imgDs, top: mmToPx(imgMargin.top) * imgDs, maskShape: "none", maskRadius: 24, _originalSrc: dataUrl } as any);
+            (img as any).__uid = uid;
+            (img as any).__layerName = "Image";
+            img.set({ left: mmToPx(imgMargin.left) * imgDs, top: mmToPx(imgMargin.top) * imgDs, maskShape: "none", maskRadius: 24, _originalSrc: dataUrl, hasControls: false } as any);
             fc.add(img);
             fc.setActiveObject(img);
             fc.renderAll();
@@ -669,6 +1250,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const snapshot = historyRef.current[historyIndexRef.current];
         ignoreSaveRef.current = true;
         fc.loadFromJSON(snapshot).then(() => {
+          // Disable controls on all loaded objects
+          fc.getObjects().forEach((obj) => {
+            obj.set({ hasControls: false });
+          });
           fc.renderAll();
           ignoreSaveRef.current = false;
           onSelectionChange(null);
@@ -682,6 +1267,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const snapshot = historyRef.current[historyIndexRef.current];
         ignoreSaveRef.current = true;
         fc.loadFromJSON(snapshot).then(() => {
+          // Disable controls on all loaded objects
+          fc.getObjects().forEach((obj) => {
+            obj.set({ hasControls: false });
+          });
           fc.renderAll();
           ignoreSaveRef.current = false;
           onSelectionChange(null);
@@ -696,6 +1285,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const fc = fabricRef.current;
         if (!fc) return;
         fc.loadFromJSON(JSON.stringify(json)).then(() => {
+          // Disable controls on all loaded objects
+          fc.getObjects().forEach((obj) => {
+            obj.set({ hasControls: false });
+          });
           fc.renderAll();
           drawMargins();
           // Restore bgString and notify parent
@@ -755,26 +1348,95 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           .forEach((o) => fc.remove(o));
         // Handle CSS gradient strings by drawing onto an off-screen canvas
         if (colorOrGradient.startsWith("linear-gradient") || colorOrGradient.startsWith("radial-gradient")) {
+          const splitTopLevelComma = (input: string): string[] => {
+            const out: string[] = [];
+            let depth = 0;
+            let current = "";
+            for (const ch of input) {
+              if (ch === "(") depth += 1;
+              if (ch === ")") depth = Math.max(0, depth - 1);
+              if (ch === "," && depth === 0) {
+                out.push(current.trim());
+                current = "";
+                continue;
+              }
+              current += ch;
+            }
+            if (current.trim()) out.push(current.trim());
+            return out;
+          };
+
+          const parseGradientCss = (input: string): {
+            kind: "linear" | "radial";
+            angle: number;
+            stops: Array<{ color: string; offset: number }>;
+          } | null => {
+            const raw = input.trim();
+            const linear = raw.match(/^linear-gradient\((.*)\)$/i);
+            const radial = raw.match(/^radial-gradient\((.*)\)$/i);
+            if (!linear && !radial) return null;
+
+            const kind: "linear" | "radial" = linear ? "linear" : "radial";
+            const inner = (linear?.[1] ?? radial?.[1] ?? "").trim();
+            const args = splitTopLevelComma(inner);
+            if (args.length < 2) return null;
+
+            let angle = 90;
+            let stopArgs = args;
+            if (kind === "linear") {
+              if (/deg$/i.test(args[0])) {
+                const parsed = Number.parseFloat(args[0]);
+                angle = Number.isFinite(parsed) ? parsed : 90;
+                stopArgs = args.slice(1);
+              }
+            } else if (/\bat\b|circle|ellipse/i.test(args[0])) {
+              stopArgs = args.slice(1);
+            }
+            if (stopArgs.length < 2) return null;
+
+            const stops = stopArgs
+              .map((part, idx) => {
+                const m = part.match(/(.+?)\s+([-\d.]+)%$/);
+                const color = (m ? m[1] : part).trim();
+                const offset = m
+                  ? Number.parseFloat(m[2]) / 100
+                  : idx / Math.max(stopArgs.length - 1, 1);
+                return {
+                  color,
+                  offset: Math.max(0, Math.min(1, Number.isFinite(offset) ? offset : 0)),
+                };
+              })
+              .sort((a, b) => a.offset - b.offset);
+
+            return { kind, angle, stops };
+          };
+
           const offscreen = document.createElement("canvas");
           offscreen.width = fc.getWidth();
           offscreen.height = fc.getHeight();
           const ctx = offscreen.getContext("2d")!;
-          // Parse the gradient direction + stops to build CanvasGradient
-          const match = colorOrGradient.match(/linear-gradient\(([^,]+),\s*([^,]+),\s*([^)]+)\)/);
-          if (match) {
-            const angle = match[1].includes("deg")
-              ? parseFloat(match[1])
-              : 135;
-            const rad = (angle * Math.PI) / 180;
-            const w = offscreen.width, h = offscreen.height;
-            const x1 = w / 2 - (Math.cos(rad) * w) / 2;
-            const y1 = h / 2 - (Math.sin(rad) * h) / 2;
-            const x2 = w / 2 + (Math.cos(rad) * w) / 2;
-            const y2 = h / 2 + (Math.sin(rad) * h) / 2;
-            const grad = ctx.createLinearGradient(x1, y1, x2, y2);
-            grad.addColorStop(0, match[2].trim());
-            grad.addColorStop(1, match[3].trim());
-            ctx.fillStyle = grad;
+          const parsed = parseGradientCss(colorOrGradient);
+          if (parsed) {
+            const w = offscreen.width;
+            const h = offscreen.height;
+
+            if (parsed.kind === "linear") {
+              const rad = (parsed.angle * Math.PI) / 180;
+              const x1 = w / 2 - (Math.cos(rad) * w) / 2;
+              const y1 = h / 2 - (Math.sin(rad) * h) / 2;
+              const x2 = w / 2 + (Math.cos(rad) * w) / 2;
+              const y2 = h / 2 + (Math.sin(rad) * h) / 2;
+              const grad = ctx.createLinearGradient(x1, y1, x2, y2);
+              parsed.stops.forEach((stop) => grad.addColorStop(stop.offset, stop.color));
+              ctx.fillStyle = grad;
+            } else {
+              const cx = w / 2;
+              const cy = h / 2;
+              const r = Math.max(w, h) / 2;
+              const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+              parsed.stops.forEach((stop) => grad.addColorStop(stop.offset, stop.color));
+              ctx.fillStyle = grad;
+            }
           } else {
             ctx.fillStyle = "#ffffff";
           }
@@ -802,17 +1464,66 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         }
       },
 
-      setBackgroundImage(dataUrl: string) {
+      setBackgroundImage(dataUrl: string, fitMode: "cover" | "contain" = "cover") {
         const fc = fabricRef.current;
         if (!fc) return;
         bgStringRef.current = "image";
+        bgFitModeRef.current = fitMode;
+        bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset
         const existing = fc.getObjects().find((o) => (o as any).isBgImage);
         if (existing) fc.remove(existing);
+        bgSVGRef.current = null; // Clear SVG background
         fc.backgroundColor = "transparent";
         fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" }).then((img) => {
-          img.set({ left: 0, top: 0, selectable: false, evented: false, isBgImage: true } as any);
-          img.scaleToWidth(fc.getWidth());
-          img.scaleToHeight(fc.getHeight());
+          const canvasW = fc.getWidth();
+          const canvasH = fc.getHeight();
+          const imgW = img.width ?? 100;
+          const imgH = img.height ?? 100;
+          const imgAspect = imgW / imgH;
+          const canvasAspect = canvasW / canvasH;
+          
+          let scaleX = 1, scaleY = 1;
+          if (fitMode === "cover") {
+            // Cover mode: fill canvas, crop if necessary
+            if (imgAspect > canvasAspect) {
+              scaleY = canvasH / imgH;
+              scaleX = scaleY;
+            } else {
+              scaleX = canvasW / imgW;
+              scaleY = scaleX;
+            }
+            const scaledW = imgW * scaleX;
+            const scaledH = imgH * scaleY;
+            img.set({
+              scaleX,
+              scaleY,
+              left: (canvasW - scaledW) / 2,
+              top: (canvasH - scaledH) / 2,
+              selectable: false,
+              evented: false,
+              isBgImage: true,
+            } as any);
+          } else {
+            // Contain mode: fit within canvas, no cropping
+            if (imgAspect > canvasAspect) {
+              scaleX = canvasW / imgW;
+              scaleY = scaleX;
+            } else {
+              scaleY = canvasH / imgH;
+              scaleX = scaleY;
+            }
+            const scaledW = imgW * scaleX;
+            const scaledH = imgH * scaleY;
+            img.set({
+              scaleX,
+              scaleY,
+              left: (canvasW - scaledW) / 2,
+              top: (canvasH - scaledH) / 2,
+              selectable: false,
+              evented: false,
+              isBgImage: true,
+            } as any);
+          }
           fc.add(img);
           fc.sendObjectToBack(img);
           if (marginGroupRef.current) fc.sendObjectToBack(marginGroupRef.current);
@@ -820,11 +1531,154 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         });
       },
 
+      setBackgroundSVG(svgString: string, fitMode: "cover" | "contain" = "cover") {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        bgStringRef.current = "svg";
+        bgFitModeRef.current = fitMode;
+        bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset
+        
+        // Remove existing background (image or SVG)
+        const existingBg = fc.getObjects().find((o) => (o as any).isBgImage);
+        if (existingBg) fc.remove(existingBg);
+        bgSVGRef.current = null;
+        
+        fc.backgroundColor = "transparent";
+        
+        // Load SVG and apply appropriate scaling
+        (fabric as any).loadSVGFromString(svgString)
+          .then((result: any) => {
+            const objs: fabric.FabricObject[] = (result.objects ?? []).filter(Boolean);
+            if (!objs.length) return;
+            
+            const svgElement: fabric.FabricObject =
+              objs.length === 1
+                ? objs[0]
+                : new fabric.Group(objs, { left: 0, top: 0, ...result.options });
+            
+            // Get SVG dimensions
+            const svgW = svgElement.width ?? 100;
+            const svgH = svgElement.height ?? 100;
+            const canvasW = fc.getWidth();
+            const canvasH = fc.getHeight();
+            const svgAspect = svgW / svgH;
+            const canvasAspect = canvasW / canvasH;
+            
+            let scaleX = 1, scaleY = 1;
+            if (fitMode === "cover") {
+              // Cover mode: fill canvas, crop if necessary
+              if (svgAspect > canvasAspect) {
+                scaleY = canvasH / svgH;
+                scaleX = scaleY;
+              } else {
+                scaleX = canvasW / svgW;
+                scaleY = scaleX;
+              }
+            } else {
+              // Contain mode: fit within canvas, no cropping
+              if (svgAspect > canvasAspect) {
+                scaleX = canvasW / svgW;
+                scaleY = scaleX;
+              } else {
+                scaleY = canvasH / svgH;
+                scaleX = scaleY;
+              }
+            }
+            
+            // Center the SVG
+            const scaledW = svgW * scaleX;
+            const scaledH = svgH * scaleY;
+            const offsetX = (canvasW - scaledW) / 2;
+            const offsetY = (canvasH - scaledH) / 2;
+            
+            svgElement.set({
+              scaleX,
+              scaleY,
+              left: offsetX,
+              top: offsetY,
+              selectable: false,
+              evented: false,
+              isBgImage: true, // Mark as background for layer management
+            } as any);
+            
+            svgElement.setCoords();
+            fc.add(svgElement);
+            fc.sendObjectToBack(svgElement);
+            if (marginGroupRef.current) fc.sendObjectToBack(marginGroupRef.current);
+            
+            // Store reference for zoom rescaling
+            bgSVGRef.current = svgElement;
+            
+            fc.renderAll();
+          })
+          .catch(() => {/* SVG parse failed – silently ignore */});
+      },
+
+      setBackgroundFitMode(fitMode: "cover" | "contain") {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        bgFitModeRef.current = fitMode;
+        bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset when changing mode
+        // Trigger resize effect to reapply scaling
+        const curW = fc.getWidth();
+        const curH = fc.getHeight();
+        fc.setDimensions({ width: curW, height: curH });
+        fc.renderAll();
+      },
+
+      moveBackground(offsetX: number, offsetY: number) {
+        bgOffsetRef.current.x += offsetX;
+        bgOffsetRef.current.y += offsetY;
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const bg = fc.getObjects().find((o) => (o as any).isBgImage);
+        if (!bg) return;
+        
+        const canvasW = fc.getWidth();
+        const canvasH = fc.getHeight();
+        const bgW = bg.getScaledWidth();
+        const bgH = bg.getScaledHeight();
+        const baseX = (canvasW - bgW) / 2;
+        const baseY = (canvasH - bgH) / 2;
+        
+        // Clamp offset to prevent excessive dragging
+        const maxOffsetX = (bgW - canvasW) / 2;
+        const maxOffsetY = (bgH - canvasH) / 2;
+        bgOffsetRef.current.x = Math.max(-maxOffsetX, Math.min(maxOffsetX, bgOffsetRef.current.x));
+        bgOffsetRef.current.y = Math.max(-maxOffsetY, Math.min(maxOffsetY, bgOffsetRef.current.y));
+        
+        bg.set({
+          left: baseX + bgOffsetRef.current.x,
+          top: baseY + bgOffsetRef.current.y,
+        });
+        fc.renderAll();
+      },
+
+      resetBackgroundPosition() {
+        bgOffsetRef.current = { x: 0, y: 0 };
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const bg = fc.getObjects().find((o) => (o as any).isBgImage);
+        if (!bg) return;
+        
+        const canvasW = fc.getWidth();
+        const canvasH = fc.getHeight();
+        const bgW = bg.getScaledWidth();
+        const bgH = bg.getScaledHeight();
+        
+        bg.set({
+          left: (canvasW - bgW) / 2,
+          top: (canvasH - bgH) / 2,
+        });
+        fc.renderAll();
+      },
+
       clearBackground() {
         const fc = fabricRef.current;
         if (!fc) return;
         bgStringRef.current = "";
         ++bgTokenRef.current; // cancel any in-flight gradient renders
+        bgSVGRef.current = null;
         fc.getObjects()
           .filter((o) => (o as any).isBgImage)
           .forEach((o) => fc.remove(o));
@@ -869,19 +1723,44 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const fc = fabricRef.current;
         const obj = fc?.getActiveObject();
         if (!fc || !obj) return;
-        const cW = fc.getWidth();
-        const cH = fc.getHeight();
+        const { margin, canvas } = configRef.current;
+        const ds = displayScaleRef.current;
+        const safeLeft = mmToPx(margin.left) * ds;
+        const safeTop = mmToPx(margin.top) * ds;
+        const safeRight = mmToPx(canvas.width) * ds - mmToPx(margin.right) * ds;
+        const safeBottom = mmToPx(canvas.height) * ds - mmToPx(margin.bottom) * ds;
+        const safeW = Math.max(1, safeRight - safeLeft);
+        const safeH = Math.max(1, safeBottom - safeTop);
+
+        if (obj instanceof fabric.IText || obj instanceof fabric.Textbox) {
+          // Recompute text dimensions before aligning to avoid stale bounds.
+          (obj as any).initDimensions?.();
+        }
         const oW = obj.getScaledWidth();
         const oH = obj.getScaledHeight();
         switch (alignment) {
-          case 'top':    obj.set({ top: 0 }); break;
-          case 'middle': obj.set({ top: (cH - oH) / 2 }); break;
-          case 'bottom': obj.set({ top: cH - oH }); break;
-          case 'left':   obj.set({ left: 0 }); break;
-          case 'center': obj.set({ left: (cW - oW) / 2 }); break;
-          case 'right':  obj.set({ left: cW - oW }); break;
+          case 'top':
+            obj.set({ top: safeTop });
+            break;
+          case 'middle':
+            obj.set({ top: safeTop + (safeH - oH) / 2 });
+            break;
+          case 'bottom':
+            obj.set({ top: safeBottom - oH });
+            break;
+          case 'left':
+            obj.set({ left: safeLeft });
+            break;
+          case 'center':
+            obj.set({ left: safeLeft + (safeW - oW) / 2 });
+            break;
+          case 'right':
+            obj.set({ left: safeRight - oW });
+            break;
         }
         obj.setCoords();
+        constrainObjectToSafeArea(obj, true);
+        fc.fire("object:modified", { target: obj });
         fc.renderAll();
       },
 
@@ -990,6 +1869,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       addSVG(svgString: string) {
         const fc = fabricRef.current;
         if (!fc) return;
+        const uid = `layer-${++layerCounterRef.current}`;
         // fabric.loadSVGFromString returns Promise<{objects, options}> in Fabric v6
         (fabric as any).loadSVGFromString(svgString)
           .then((result: any) => {
@@ -1011,9 +1891,12 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             }
             const { margin } = configRef.current;
             const ds = displayScaleRef.current;
+            (element as any).__uid = uid;
+            (element as any).__layerName = "SVG";
             element.set({
               left: mmToPx(margin.left) * ds,
               top:  mmToPx(margin.top)  * ds,
+              hasControls: false,
             });
             element.setCoords();
             fc.add(element);
@@ -1021,42 +1904,6 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             fc.renderAll();
           })
           .catch(() => {/* SVG parse failed – silently ignore */});
-      },
-
-      // ── Curved / Arc Text ───────────────────────────────────────────────
-      addCurvedText(opts: CurvedTextOpts = {}) {
-        const fc = fabricRef.current;
-        if (!fc) return;
-        const ds  = displayScaleRef.current;
-        const { margin } = configRef.current;
-        const ct = new CurvedText({
-          text: "Curved Text",
-          radius: 80 * ds,
-          fontSize: 18 * ds,
-          fill: "#1f2937",
-          ...opts,
-        });
-        ct.refreshSize();
-        ct.set({
-          left: mmToPx(margin.left) * ds + ct.width / 2,
-          top:  mmToPx(margin.top)  * ds + ct.height / 2,
-        });
-        fc.add(ct);
-        fc.setActiveObject(ct);
-        fc.renderAll();
-      },
-
-      updateCurvedText(props: Partial<CurvedTextOpts>) {
-        const fc = fabricRef.current;
-        const active = fc?.getActiveObject();
-        if (!fc || !active || (active as any).type !== "CurvedText") return;
-        const ct = active as CurvedText;
-        Object.assign(ct, props);
-        if ("radius" in props || "fontSize" in props) ct.refreshSize();
-        ct.set("dirty", true);
-        ct.setCoords();
-        fc.fire("object:modified", { target: ct });
-        fc.requestRenderAll();
       },
 
       // ── PNG Mask (transparency-based masking) ───────────────────────────
@@ -1250,6 +2097,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           angle:      tb.angle,
           opacity:    tb.opacity,
           underline:  tb.underline,
+          backgroundColor: (tb as any).backgroundColor ?? "transparent",
+          backgroundPadding: (tb as any).backgroundPadding ?? 0,
         });
         ignoreSaveRef.current = true;
         fc.remove(active);
@@ -1330,6 +2179,77 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         refreshDims();
         fc.fire("object:modified", { target: tb });
         fc.renderAll();
+      },
+
+      // ── Layer Management ────────────────────────────────────────────────
+      getLayers() {
+        const fc = fabricRef.current;
+        if (!fc) return [];
+        
+        return fc.getObjects()
+          .filter((obj) => !(obj as any).excludeFromExport && !(obj as any).isBgImage)
+          .map((obj, index) => ({
+            id: (obj as any).__uid || String(index),
+            name: (obj as any).__layerName || `Layer ${index + 1}`,
+            locked: layerLockedRef.current.get((obj as any).__uid) || false,
+          }))
+          .reverse(); // Reverse to show top layer first
+      },
+
+      setLayerLocked(id: string, locked: boolean) {
+        layerLockedRef.current.set(id, locked);
+        const fc = fabricRef.current;
+        if (!fc) return;
+        
+        // Find object with matching uid
+        const obj = fc.getObjects().find((o) => (o as any).__uid === id);
+        if (!obj) return;
+        
+        obj.set({
+          selectable: !locked,
+          evented: !locked,
+        });
+        fc.renderAll();
+      },
+
+      deleteLayer(id: string) {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        
+        const obj = fc.getObjects().find((o) => (o as any).__uid === id);
+        if (!obj) return;
+        
+        ignoreSaveRef.current = true;
+        fc.remove(obj);
+        ignoreSaveRef.current = false;
+        
+        layerLockedRef.current.delete(id);
+        fc.renderAll();
+      },
+
+      canUndo() {
+        return historyIndexRef.current > 0;
+      },
+
+      canRedo() {
+        return historyIndexRef.current < historyRef.current.length - 1;
+      },
+
+      resetHistory() {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const snapshot = JSON.stringify(fc.toObject(["excludeFromExport", "isBgImage", "maskShape", "maskRadius"]));
+        historyRef.current = [snapshot];
+        historyIndexRef.current = 0;
+      },
+
+      constrainSelectedToSafeArea() {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const active = fc.getActiveObject();
+        if (!active) return;
+        constrainObjectToSafeArea(active, true);
+        fc.requestRenderAll();
       },
     }));
 

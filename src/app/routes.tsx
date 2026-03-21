@@ -19,10 +19,21 @@ import { RoleManagement } from "./pages/RoleManagement";
 import { Settings } from "./pages/Settings";
 import { ProjectTask } from "./pages/ProjectTask";
 import { Unauthorized } from "./pages/Unauthorized";
+import { VariableDataWorkflow } from "./pages/VariableDataWorkflow";
+import { DirectPrintWorkflow } from "./pages/DirectPrintWorkflow";
+import { Login } from "./pages/Login";
+import { ProductTemplateSelection } from "./pages/ProductTemplateSelection";
+import { TemplateOrderPage } from "./pages/TemplateOrderPage";
+import { TemplateGallery } from "./pages/TemplateGallery";
+import DataMigration from "./pages/DataMigration";
 import { RouteGuard } from "../lib/rbac";
 import { Permission } from "../lib/rbac";
 
 export const router = createBrowserRouter([
+  {
+    path: "/login",
+    Component: Login,
+  },
   {
     path: "/",
     Component: Layout,
@@ -70,6 +81,22 @@ export const router = createBrowserRouter([
           </RouteGuard>
         ),
       },
+      {
+        path: "products/:productId/templates",
+        element: (
+          <RouteGuard anyOf={[Permission.PRODUCTS__VIEW, Permission.PRODUCTS__MANAGE_CATALOG]}>
+            <ProductTemplateSelection />
+          </RouteGuard>
+        ),
+      },
+      {
+        path: "products/:productId/order",
+        element: (
+          <RouteGuard anyOf={[Permission.ORDERS__VIEW, Permission.ORDERS__MANAGE, Permission.PRODUCTS__VIEW]}>
+            <TemplateOrderPage />
+          </RouteGuard>
+        ),
+      },
 
       // Projects
       {
@@ -109,6 +136,26 @@ export const router = createBrowserRouter([
         ),
       },
 
+      // Variable Data Printing Workflow
+      {
+        path: "workflows/variable-data",
+        element: (
+          <RouteGuard anyOf={[Permission.ORDERS__VIEW, Permission.ORDERS__MANAGE]}>
+            <VariableDataWorkflow />
+          </RouteGuard>
+        ),
+      },
+
+      // Direct Print Order Workflow
+      {
+        path: "workflows/direct-print",
+        element: (
+          <RouteGuard anyOf={[Permission.ORDERS__VIEW, Permission.ORDERS__MANAGE]}>
+            <DirectPrintWorkflow />
+          </RouteGuard>
+        ),
+      },
+
       // Production
       {
         path: "production",
@@ -125,6 +172,16 @@ export const router = createBrowserRouter([
         element: (
           <RouteGuard anyOf={[Permission.DESIGN__ACCESS_STUDIO, Permission.DESIGN__CREATE_EDIT_TEMPLATES]}>
             <DesignerStudio />
+          </RouteGuard>
+        ),
+      },
+
+      // Public Template Gallery
+      {
+        path: "template-gallery",
+        element: (
+          <RouteGuard anyOf={[Permission.DESIGN__ACCESS_STUDIO, Permission.DESIGN__CREATE_EDIT_TEMPLATES]}>
+            <TemplateGallery />
           </RouteGuard>
         ),
       },
@@ -205,6 +262,12 @@ export const router = createBrowserRouter([
             <Settings />
           </RouteGuard>
         ),
+      },
+
+      // Data Migration — move data to MongoDB
+      {
+        path: "migrate-data",
+        Component: DataMigration,
       },
 
       // Unauthorized fallback

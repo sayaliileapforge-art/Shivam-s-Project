@@ -1,6 +1,9 @@
+import { createClient as apiCreateClient, fetchClients as apiFetchClients, updateClient as apiUpdateClient, deleteClient as apiDeleteClient } from './apiService';
+
 const STORAGE_KEY = "vendor_clients";
 
 export interface Client {
+  _id?: string;
   id: string;
   clientName: string;
   email: string;
@@ -17,6 +20,8 @@ export interface Client {
   state: string;
   district: string;
   schoollogUniqueId: string;
+  busStop: string;
+  route: string;
   status: "active" | "inactive" | "blocked";
   createdAt: string;
   salesPerson?: string;
@@ -24,39 +29,76 @@ export interface Client {
   balance?: number;
 }
 
-export function loadClients(): Client[] {
+export async function loadClients(): Promise<Client[]> {
+  const localFallback = (): Client[] => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as Client[]) : [];
+    } catch {
+      return [];
+    }
+  };
+
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as Client[]) : [];
-  } catch {
-    return [];
+    const data = await apiFetchClients();
+    if (data && Array.isArray(data)) {
+      return data.map((c: any) => ({
+        ...c,
+        id: c._id || c.id,
+      }));
+    }
+    // API returned null — backend is offline, fall back to localStorage
+    return localFallback();
+  } catch (error) {
+    console.error('Failed to load clients from API:', error);
+    return localFallback();
   }
 }
 
-export function saveClients(clients: Client[]): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(clients));
+export async function addClient(data: Omit<Client, "id" | "status" | "createdAt" | "_id">): Promise<Client> {
+  try {
+    const clientData = {
+      ...data,
+      status: "active",
+      createdAt: new Date().toISOString(),
+    };
+    const result = await apiCreateClient(clientData);
+    if (result) {
+      return {
+        ...result,
+        id: result._id || result.id,
+      };
+    }
+    throw new Error('Failed to create client');
+  } catch (error) {
+    console.error('Error creating client:', error);
+    throw error;
+  }
 }
 
-export function addClient(data: Omit<Client, "id" | "status" | "createdAt">): Client {
-  const clients = loadClients();
-  const newClient: Client = {
-    ...data,
-    id: `CLT-${Date.now()}`,
-    status: "active",
-    createdAt: new Date().toLocaleDateString("en-IN"),
-  };
-  saveClients([...clients, newClient]);
-  return newClient;
+export async function updateClient(id: string, data: Partial<Client>): Promise<Client> {
+  try {
+    const result = await apiUpdateClient(id, data);
+    if (result) {
+      return {
+        ...result,
+        id: result._id || result.id,
+      };
+    }
+    throw new Error('Failed to update client');
+  } catch (error) {
+    console.error('Error updating client:', error);
+    throw error;
+  }
 }
 
-export function deleteClient(id: string): void {
-  const clients = loadClients().filter((c) => c.id !== id);
-  saveClients(clients);
-}
-
-export function updateClient(id: string, data: Partial<Client>): void {
-  const clients = loadClients().map((c) => (c.id === id ? { ...c, ...data } : c));
-  saveClients(clients);
+export async function deleteClient(id: string): Promise<boolean> {
+  try {
+    return await apiDeleteClient(id);
+  } catch (error) {
+    console.error('Error deleting client:', error);
+    throw error;
+  }
 }
 
 export interface WalletTransaction {

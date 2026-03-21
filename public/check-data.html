@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Check</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .section { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        h2 { color: #333; margin-top: 0; }
+        pre { background: #f9f9f9; padding: 10px; overflow-x: auto; border-left: 3px solid #007bff; }
+        .count { font-weight: bold; color: #007bff; }
+        .empty { color: #999; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Local Data Check</h1>
+        <p>This page shows all data stored in your browser's localStorage. This data is <strong>NOT yet saved to MongoDB</strong>.</p>
+
+        <div class="section">
+            <h2>Projects</h2>
+            <div id="projects"></div>
+        </div>
+
+        <div class="section">
+            <h2>Clients</h2>
+            <div id="clients"></div>
+        </div>
+
+        <div class="section">
+            <h2>Products</h2>
+            <div id="products"></div>
+        </div>
+
+        <div class="section">
+            <h2>Staff</h2>
+            <div id="staff"></div>
+        </div>
+    </div>
+
+    <script>
+        function displayData(key, containerId) {
+            const data = localStorage.getItem(key);
+            const container = document.getElementById(containerId);
+            
+            if (!data) {
+                container.innerHTML = '<p class="empty">No data found</p>';
+                return;
+            }
+            
+            try {
+                const parsed = JSON.parse(data);
+                const count = Array.isArray(parsed) ? parsed.length : Object.keys(parsed).length;
+                container.innerHTML = `
+                    <p>Found <span class="count">${count} items</span></p>
+                    <pre>${JSON.stringify(parsed, null, 2)}</pre>
+                `;
+            } catch (e) {
+                container.innerHTML = `<p class="empty">Error parsing data: ${e.message}</p>`;
+            }
+        }
+
+        displayData('vendor_projects', 'projects');
+        displayData('vendor_clients', 'clients');
+        displayData('vendor_products', 'products');
+        displayData('staff_list', 'staff');
+    </script>
+</body>
+</html>

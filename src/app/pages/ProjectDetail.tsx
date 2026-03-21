@@ -30,7 +30,6 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "../components/ui/table";
 import {
-  loadProjects, updateProjectStage, saveProjects,
   loadProjectProducts, addProjectProduct, deleteProjectProduct,
   loadProjectTasks, addProjectTask, updateProjectTask, deleteProjectTask,
   loadProjectFiles, addProjectFile, deleteProjectFile,
@@ -40,6 +39,11 @@ import {
   type ProjectProduct, type ProjectTask, type ProjectFile, type ProjectTemplate,
   type DataCategory, type ProjectDataField, type ProjectDataGroup, type ProjectDataRecord,
 } from "../../lib/projectStore";
+import {
+  fetchProjectById as apiFetchProjectById,
+  updateProject as apiUpdateProject,
+  deleteProject as apiDeleteProject,
+} from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 
@@ -84,10 +88,32 @@ const emptyProductForm = { productName: "", spec: "", quantity: "1", unitPrice: 
 const emptyTaskForm = { title: "", assignee: "", dueDate: "", status: "pending" as ProjectTask["status"] };
 const emptyFileForm = { name: "", category: "other" as ProjectFile["category"] };
 
+const mapApiProjectToUi = (p: any) => {
+  const populatedClient = typeof p.clientId === "object" && p.clientId !== null ? p.clientId : null;
+  const stage = String(p.stage || p.status || "draft");
+
+  return {
+    id: String(p._id || p.id),
+    name: String(p.name || "Untitled Project"),
+    client: String(p.client || populatedClient?.clientName || "Unknown Client"),
+    clientId: String(populatedClient?._id || p.clientId || ""),
+    stage,
+    priority: (p.priority || "medium") as "urgent" | "high" | "medium" | "low",
+    dueDate: String(p.dueDate || ""),
+    assignee: String(p.assignee || ""),
+    amount: Number(p.amount || 0),
+    description: String(p.description || ""),
+    workflowType: (p.workflowType || "variable_data") as "variable_data" | "direct_print",
+    createdAt: String(p.createdAt || new Date().toISOString()),
+  };
+};
+
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [version, setVersion] = useState(0);
+  const [project, setProject] = useState<ReturnType<typeof mapApiProjectToUi> | null>(null);
+  const [projectLoading, setProjectLoading] = useState(true);
   void version;
 
   // dialogs
@@ -168,8 +194,33 @@ export function ProjectDetail() {
   const updateTemplateCanvas = (key: keyof typeof emptyTemplateForm.canvas, val: number) =>
     setTemplateForm((f) => ({ ...f, canvas: { ...f.canvas, [key]: val } }));
 
+  useEffect(() => {
+    let mounted = true;
+    if (!id) {
+      setProject(null);
+      setProjectLoading(false);
+      return;
+    }
+
+    setProjectLoading(true);
+    apiFetchProjectById(id)
+      .then((data) => {
+        if (!mounted) return;
+        setProject(data ? mapApiProjectToUi(data) : null);
+        setProjectLoading(false);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setProject(null);
+        setProjectLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, [id, version]);
+
   // Load data
-  const project = loadProjects().find((p) => p.id === id);
   const products = id ? loadProjectProducts(id) : [];
   const tasks = id ? loadProjectTasks(id) : [];
   const files = id ? loadProjectFiles(id) : [];
@@ -193,6 +244,7 @@ export function ProjectDetail() {
       canvas: templateForm.canvas,
       margin: templateForm.margin,
       applicableFor: templateForm.applicableFor,
+      isPublic: true,
     });
     setTemplateForm(emptyTemplateForm);
     setTemplateErrors({});
@@ -659,19 +711,30 @@ export function ProjectDetail() {
     setIsDeleteAllOpen(false);
   };
 
-  const handleStageChange = (stage: string) => {
+  const handleStageChange = async (stage: string) => {
     if (!id) return;
-    updateProjectStage(id, stage);
-    refresh();
+    const updated = await apiUpdateProject(id, { stage });
+    if (updated) {
+      refresh();
+    }
   };
 
   // â”€â”€ Stage change direct edit â”€â”€
-  const updateProjectField = (field: string, value: string) => {
+  const updateProjectField = async (field: string, value: string) => {
     if (!id) return;
-    const all = loadProjects().map((p) => p.id === id ? { ...p, [field]: value } : p);
-    saveProjects(all);
-    refresh();
+    const updated = await apiUpdateProject(id, { [field]: value });
+    if (updated) {
+      refresh();
+    }
   };
+
+  if (projectLoading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 space-y-4">
+        <p className="text-muted-foreground text-lg">Loading project...</p>
+      </div>
+    );
+  }
 
   if (!project) {
     return (
@@ -728,8 +791,12 @@ export function ProjectDetail() {
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem className="text-destructive" onClick={() => {
-                saveProjects(loadProjects().filter((p) => p.id !== id));
-                window.location.href = "/projects";
+                if (!id) return;
+                apiDeleteProject(id).then((ok) => {
+                  if (ok) {
+                    navigate("/projects");
+                  }
+                });
               }}>
                 Delete Project
               </DropdownMenuItem>
@@ -1053,23 +1120,33 @@ export function ProjectDetail() {
                   <div className="bg-muted/40 rounded-lg p-6 flex items-center justify-center">
                     <div className="bg-white shadow-md rounded border border-border relative overflow-hidden flex items-center justify-center"
                       style={{ width: Math.min(220, previewTemplate.canvas.width * 0.6), height: Math.min(280, previewTemplate.canvas.height * 0.6) }}>
-                      <div className="absolute inset-0 pointer-events-none">
-                        {(() => {
-                          const m = previewTemplate.margin;
-                          const w = previewTemplate.canvas.width;
-                          const h = previewTemplate.canvas.height;
-                          const s = Math.min(220 / w * 0.6, 280 / h * 0.6);
-                          return (
-                            <>
-                              <div style={{ position:"absolute", left:0, right:0, top: m.top*s, borderTop:"1px dashed #3b82f6" }} />
-                              <div style={{ position:"absolute", left:0, right:0, bottom: m.bottom*s, borderBottom:"1px dashed #3b82f6" }} />
-                              <div style={{ position:"absolute", top:0, bottom:0, left: m.left*s, borderLeft:"1px dashed #3b82f6" }} />
-                              <div style={{ position:"absolute", top:0, bottom:0, right: m.right*s, borderRight:"1px dashed #3b82f6" }} />
-                            </>
-                          );
-                        })()}
-                      </div>
-                      <Layers className="h-8 w-8 text-muted-foreground" />
+                      {previewTemplate.thumbnail ? (
+                        <img
+                          src={previewTemplate.thumbnail}
+                          alt={previewTemplate.templateName}
+                          className="h-full w-full object-contain"
+                        />
+                      ) : (
+                        <>
+                          <div className="absolute inset-0 pointer-events-none">
+                            {(() => {
+                              const m = previewTemplate.margin;
+                              const w = previewTemplate.canvas.width;
+                              const h = previewTemplate.canvas.height;
+                              const s = Math.min(220 / w * 0.6, 280 / h * 0.6);
+                              return (
+                                <>
+                                  <div style={{ position:"absolute", left:0, right:0, top: m.top*s, borderTop:"1px dashed #3b82f6" }} />
+                                  <div style={{ position:"absolute", left:0, right:0, bottom: m.bottom*s, borderBottom:"1px dashed #3b82f6" }} />
+                                  <div style={{ position:"absolute", top:0, bottom:0, left: m.left*s, borderLeft:"1px dashed #3b82f6" }} />
+                                  <div style={{ position:"absolute", top:0, bottom:0, right: m.right*s, borderRight:"1px dashed #3b82f6" }} />
+                                </>
+                              );
+                            })()}
+                          </div>
+                          <Layers className="h-8 w-8 text-muted-foreground" />
+                        </>
+                      )}
                     </div>
                   </div>
                   <div className="space-y-1 text-sm">
