@@ -140,7 +140,7 @@ cd backend && npm run dev
 ### MongoDB Connection
 Edit `backend/.env` to change connection settings:
 ```
-MONGODB_URI=mongodb+srv://aaryaleap_db_user:4seP0xHMZOhgaGRD@cluster0.3zq4ych.mongodb.net/?appName=Cluster0
+MONGODB_URI=mongodb+srv://<username>:<password>@cluster0.xxxxx.mongodb.net/?appName=Cluster0
 PORT=5000
 ```
 
