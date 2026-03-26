@@ -19,6 +19,30 @@ export interface ShapesGalleryProps {
   onClose: () => void;
 }
 
+function normalizePreviewMarkup(preview: string): string {
+  const trimmed = preview.trim();
+  if (!trimmed) return "";
+  if (!/^<svg\b/i.test(trimmed)) return "";
+
+  const withXmlns = /<svg\b[^>]*xmlns=/i.test(trimmed)
+    ? trimmed
+    : trimmed.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+
+  return withXmlns.replace(/<svg\b([^>]*)>/i, (full, attrs) => {
+    let next = String(attrs || "");
+    if (!/\bviewBox\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' viewBox="0 0 24 24"';
+    }
+    if (!/\bwidth\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' width="24"';
+    }
+    if (!/\bheight\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' height="24"';
+    }
+    return `<svg${next}>`;
+  });
+}
+
 /**
  * Gallery Item Component - displays individual shape/icon
  */
@@ -43,8 +67,8 @@ function GalleryItemCard({
       {item.preview ? (
         <div className="w-8 h-8 mb-1 text-muted-foreground group-hover:text-foreground transition-colors flex items-center justify-center">
           <div
-            dangerouslySetInnerHTML={{ __html: item.preview }}
-            className="w-full h-full"
+            className="w-full h-full [&>svg]:w-full [&>svg]:h-full [&>svg]:block [&>svg]:overflow-visible [&>svg]:[color:currentColor] [&>svg_*]:stroke-current"
+            dangerouslySetInnerHTML={{ __html: normalizePreviewMarkup(item.preview) }}
           />
         </div>
       ) : (
@@ -232,8 +256,8 @@ export function ShapesGallery({
                         {item.preview ? (
                           <div className="w-6 h-6 text-muted-foreground group-hover:text-foreground flex-shrink-0">
                             <div
-                              dangerouslySetInnerHTML={{ __html: item.preview }}
-                              className="w-full h-full"
+                              className="w-full h-full [&>svg]:w-full [&>svg]:h-full [&>svg]:block [&>svg]:overflow-visible [&>svg]:[color:currentColor] [&>svg_*]:stroke-current"
+                              dangerouslySetInnerHTML={{ __html: normalizePreviewMarkup(item.preview) }}
                             />
                           </div>
                         ) : (

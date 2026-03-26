@@ -17,36 +17,23 @@ import {
 } from "./ui/table";
 import type { ProjectDataField, ProjectDataRecord } from "../../lib/projectStore";
 import type { DataCategory } from "../../lib/projectStore";
-
-// ─── Fixed import fields (same as Data Processing module) ────────────────────
-
-interface SystemField { key: string; label: string; required: boolean }
-
-const SYSTEM_FIELDS: SystemField[] = [
-  { key: "Name",         label: "Name",         required: true  },
-  { key: "fatherName",   label: "Father Name",  required: true  },
-  { key: "motherName",   label: "Mother Name",  required: false },
-  { key: "phone",        label: "Phone",        required: true  },
-  { key: "motherPhone",  label: "Mother Phone", required: true  },
-  { key: "guardianName", label: "Guardian Name",required: true  },
-  { key: "rollNo",       label: "Roll No",      required: true  },
-  { key: "group",        label: "Group",        required: false },
-];
+import {
+  CORE_IMPORT_FIELDS,
+  SKIP_MAPPING_VALUE,
+  autoMap,
+  buildProjectFields,
+  getDuplicateMappedColumns,
+  getSelectableHeaders,
+  getVisiblePreviewFields,
+  isMappedColumn,
+  isSkippedColumn,
+  mapRowToRecord,
+  normalizeMapping,
+  validateMapping,
+  type ImportSystemField,
+} from "../../lib/importMapping";
 
 type Step = "upload" | "mapping" | "preview" | "done";
-
-function normalise(s: string) { return s.toLowerCase().replace(/[\s_-]/g, ""); }
-
-function autoMap(headers: string[]): Record<string, string> {
-  const m: Record<string, string> = {};
-  for (const f of SYSTEM_FIELDS) {
-    const h = headers.find(
-      (h) => normalise(h) === normalise(f.key) || normalise(h) === normalise(f.label)
-    );
-    if (h) m[f.key] = h;
-  }
-  return m;
-}
 
 function validPhone(v?: string | number) {
   return !!v && /^\+?\d{7,15}$/.test(String(v).replace(/[\s\-()]/g, ""));
@@ -141,7 +128,8 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
         setFilename(file.name);
         setHeaders(detectedHeaders);
         setRows(stringRows);
-        setMapping(autoMap(detectedHeaders));
+        const allFields = buildProjectFields(detectedHeaders);
+        setMapping(autoMap(detectedHeaders, allFields));
         setStep("mapping");
       } catch {
         setErrors(["Failed to parse the file. Make sure it is a valid Excel or CSV."]);
@@ -152,6 +140,7 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
 
   // ── Derived ──────────────────────────────────────────────────────────────
   const previewRows = rows.slice(0, 10);
+  const projectFields = useMemo<ImportSystemField[]>(() => buildProjectFields(headers), [headers]);
 
   const mappedRecords = useMemo<ProjectDataRecord[]>(() => {
     return rows.map((row, i) => {
@@ -160,44 +149,47 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
         projectId,
         category,
       };
-      for (const f of SYSTEM_FIELDS) {
-        const col = mapping[f.key];
-        if (col) rec[f.key] = row[col] ?? "";
-      }
+      Object.assign(rec, mapRowToRecord(row, projectFields, mapping));
       return rec;
     });
-  }, [rows, mapping, projectId, category]);
+  }, [rows, mapping, projectId, category, projectFields]);
 
   const duplicateCount = useMemo(() => {
     const seenPhone = new Set<string>();
+    const seenAdmission = new Set<string>();
     const seenRoll  = new Set<string>();
     let dupes = 0;
     for (const rec of mappedRecords) {
-      const p = String(rec.phone   ?? "").trim();
+      const p = String(rec.fatherMobile ?? "").trim();
+      const a = String(rec.admissionNo ?? "").trim();
       const r = String(rec.rollNo  ?? "").trim();
       if (p && seenPhone.has(p)) { dupes++; continue; }
+      if (a && seenAdmission.has(a)) { dupes++; continue; }
       if (r && seenRoll.has(r))  { dupes++; continue; }
       if (p) seenPhone.add(p);
+      if (a) seenAdmission.add(a);
       if (r) seenRoll.add(r);
     }
     return dupes;
   }, [mappedRecords]);
 
-  const unmappedRequired = SYSTEM_FIELDS.filter((f) => f.required && !mapping[f.key]);
-  const mappedCount      = SYSTEM_FIELDS.filter((f) => mapping[f.key]).length;
+  const unmappedRequired = projectFields.filter((f) => f.required && !isMappedColumn(mapping[f.key]));
+  const duplicateMappedColumns = getDuplicateMappedColumns(mapping);
+  const mappedCount      = projectFields.filter((f) => isMappedColumn(mapping[f.key])).length;
+  const visiblePreviewFields = useMemo(
+    () => getVisiblePreviewFields(projectFields, mappedRecords as Array<Record<string, unknown>>, mapping),
+    [projectFields, mappedRecords, mapping]
+  );
   const sampleValue      = (col: string) => rows[0]?.[col] ?? "–";
 
   // ── Validation ────────────────────────────────────────────────────────────
   const validate = (): string[] => {
-    const errs: string[] = [];
-    for (const f of SYSTEM_FIELDS.filter((f) => f.required)) {
-      if (!mapping[f.key]) errs.push(`Required field "${f.label}" is not mapped.`);
-    }
+    const errs = validateMapping(projectFields, mapping);
     if (errs.length) return errs;
     let badPhones = 0;
     for (const rec of mappedRecords) {
-      if (rec.phone      && !validPhone(rec.phone as string | number))      badPhones++;
-      if (rec.motherPhone && !validPhone(rec.motherPhone as string | number)) badPhones++;
+      if (rec.fatherMobile && !validPhone(rec.fatherMobile as string | number)) badPhones++;
+      if (rec.fatherWhatsapp && !validPhone(rec.fatherWhatsapp as string | number)) badPhones++;
     }
     if (badPhones) errs.push(`${badPhones} record(s) have invalid phone numbers.`);
     return errs;
@@ -207,8 +199,8 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
   const handleImport = () => {
     const errs = validate();
     if (errs.length) { setErrors(errs); return; }
-    const fields: ProjectDataField[] = SYSTEM_FIELDS
-      .filter((f) => mapping[f.key])
+    const fields: ProjectDataField[] = projectFields
+      .filter((f) => f.key !== "other" && isMappedColumn(mapping[f.key]))
       .map((f) => ({ key: f.key, label: f.label }));
     onComplete(fields, mappedRecords);
     setImportDone({ count: mappedRecords.length, dupes: duplicateCount });
@@ -225,8 +217,8 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
   // ── Download template ─────────────────────────────────────────────────────
   const downloadTemplate = () => {
     const ws = XLSX.utils.aoa_to_sheet([
-      SYSTEM_FIELDS.map((f) => f.key),
-      SYSTEM_FIELDS.map((f) => (f.required ? "REQUIRED" : "optional")),
+      CORE_IMPORT_FIELDS.map((f) => f.label),
+      CORE_IMPORT_FIELDS.map((f) => (f.required ? "REQUIRED" : "optional")),
     ]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Template");
@@ -331,7 +323,7 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
             <CardHeader>
               <div className="flex items-center justify-between">
                 <CardTitle className="text-base">Column Mapping</CardTitle>
-                <Badge variant="outline">{mappedCount} / {SYSTEM_FIELDS.length} fields mapped</Badge>
+                <Badge variant="outline">{mappedCount} / {projectFields.length} fields mapped</Badge>
               </div>
             </CardHeader>
             <CardContent className="p-0">
@@ -345,9 +337,15 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {SYSTEM_FIELDS.map((field) => {
+                  {projectFields.map((field) => {
                     const selected = mapping[field.key];
                     const sample   = selected ? sampleValue(selected) : null;
+                    const selectableHeaders = getSelectableHeaders(headers, mapping, field.key);
+                    const admissionMapped = isMappedColumn(mapping.admissionNo);
+                    const rollMapped = isMappedColumn(mapping.rollNo);
+                    const fieldLocked =
+                      (field.key === "rollNo" && admissionMapped && !isMappedColumn(mapping.rollNo))
+                      || (field.key === "admissionNo" && rollMapped && !isMappedColumn(mapping.admissionNo));
                     return (
                       <TableRow key={field.key}>
                         <TableCell className="font-medium">
@@ -357,11 +355,26 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
                         <TableCell className="min-w-[200px]">
                           <Select
                             value={mapping[field.key] ?? "__none__"}
+                            disabled={fieldLocked}
                             onValueChange={(v) =>
                               setMapping((prev) => {
                                 const next = { ...prev };
-                                if (v === "__none__") delete next[field.key]; else next[field.key] = v;
-                                return next;
+                                if (v === SKIP_MAPPING_VALUE) {
+                                  next[field.key] = SKIP_MAPPING_VALUE;
+                                } else if (v === "__none__") {
+                                  delete next[field.key];
+                                } else {
+                                  next[field.key] = v;
+                                }
+
+                                if (field.key === "admissionNo" && isMappedColumn(next.admissionNo)) {
+                                  delete next.rollNo;
+                                }
+                                if (field.key === "rollNo" && isMappedColumn(next.rollNo)) {
+                                  delete next.admissionNo;
+                                }
+
+                                return normalizeMapping(next, projectFields);
                               })
                             }
                           >
@@ -370,20 +383,31 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
                             </SelectTrigger>
                             <SelectContent>
                               <SelectItem value="__none__" className="text-muted-foreground text-xs">
-                                — not mapped —
+                                — Select column —
                               </SelectItem>
-                              {headers.map((h) => (
+                              <SelectItem value={SKIP_MAPPING_VALUE} className="text-muted-foreground text-xs">
+                                — Skip this field —
+                              </SelectItem>
+                              {selectableHeaders.map((h) => (
                                 <SelectItem key={h} value={h} className="text-sm">{h}</SelectItem>
                               ))}
                             </SelectContent>
                           </Select>
                         </TableCell>
                         <TableCell className="text-sm text-muted-foreground">
-                          {sample ?? <span className="italic">No mapping</span>}
+                          {selected && isMappedColumn(selected)
+                            ? sample
+                            : selected && isSkippedColumn(selected)
+                              ? <span className="italic">Skipped</span>
+                              : <span className="italic">No mapping</span>}
                         </TableCell>
                         <TableCell className="text-center">
-                          {selected ? (
+                          {selected && isMappedColumn(selected) ? (
                             <CheckCircle className="h-4 w-4 text-success mx-auto" />
+                          ) : selected && isSkippedColumn(selected) ? (
+                            <span className="text-xs text-muted-foreground">skipped</span>
+                          ) : fieldLocked ? (
+                            <span className="text-xs text-muted-foreground">auto</span>
                           ) : field.required ? (
                             <AlertCircle className="h-4 w-4 text-destructive mx-auto" />
                           ) : (
@@ -404,12 +428,23 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
             </p>
           )}
 
+          {duplicateMappedColumns.length > 0 && (
+            <Card className="border-warning/60 bg-warning/5">
+              <CardContent className="p-4 flex items-center gap-2">
+                <AlertTriangle className="h-5 w-5 text-warning shrink-0" />
+                <p className="text-sm text-warning">
+                  <strong>Duplicate column selections found:</strong> {duplicateMappedColumns.join(", ")}.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
           {duplicateCount > 0 && (
             <Card className="border-warning/60 bg-warning/5">
               <CardContent className="p-4 flex items-center gap-2">
                 <AlertTriangle className="h-5 w-5 text-warning shrink-0" />
                 <p className="text-sm text-warning">
-                  <strong>{duplicateCount} duplicate(s)</strong> detected by phone / Roll No.
+                  <strong>{duplicateCount} duplicate(s)</strong> detected by father mobile / admission / roll.
                   They will still be imported but flagged.
                 </p>
               </CardContent>
@@ -422,7 +457,7 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
             </Button>
             <Button
               className="gap-2"
-              disabled={unmappedRequired.length > 0}
+              disabled={unmappedRequired.length > 0 || duplicateMappedColumns.length > 0}
               onClick={() => { setErrors([]); setStep("preview"); }}
             >
               Preview Data <ArrowRight className="h-4 w-4" />
@@ -449,7 +484,7 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
                   <TableHeader>
                     <TableRow>
                       <TableHead className="w-10">#</TableHead>
-                      {SYSTEM_FIELDS.filter((f) => mapping[f.key]).map((f) => (
+                      {visiblePreviewFields.map((f) => (
                         <TableHead key={f.key}>
                           {f.label}
                           {f.required && <span className="text-destructive ml-1">*</span>}
@@ -461,9 +496,9 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
                     {previewRows.map((row, idx) => (
                       <TableRow key={idx}>
                         <TableCell className="text-muted-foreground text-xs">{idx + 1}</TableCell>
-                        {SYSTEM_FIELDS.filter((f) => mapping[f.key]).map((f) => {
+                        {visiblePreviewFields.map((f) => {
                           const val     = row[mapping[f.key]] ?? "";
-                          const invalid = (f.key === "phone" || f.key === "motherPhone") && val && !validPhone(val);
+                          const invalid = (f.key === "fatherMobile" || f.key === "fatherWhatsapp") && val && !validPhone(val);
                           return (
                             <TableCell key={f.key}>
                               <span className={invalid ? "text-destructive" : ""}>{val || "–"}</span>
@@ -484,6 +519,7 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
                 <AlertTriangle className="h-5 w-5 text-warning shrink-0" />
                 <p className="text-sm text-warning">
                   <strong>{duplicateCount} duplicate(s)</strong> detected by phone / Roll No.
+                  <strong>{duplicateCount} duplicate(s)</strong> detected by father mobile / admission / roll.
                 </p>
               </CardContent>
             </Card>

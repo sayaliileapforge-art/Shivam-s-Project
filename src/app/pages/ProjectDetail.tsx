@@ -34,7 +34,7 @@ import {
   loadProjectTasks, addProjectTask, updateProjectTask, deleteProjectTask,
   loadProjectFiles, addProjectFile, deleteProjectFile,
   loadProjectTemplates, addProjectTemplate, deleteProjectTemplate, updateProjectTemplate,
-  loadDataFields, saveDataFields, loadDataGroups, addDataGroup, deleteDataGroup,
+  loadDataFields, saveDataFields, loadDataGroups, addDataGroup, deleteDataGroup, updateDataGroup,
   loadDataRecords, saveDataRecords, deleteDataRecord, updateDataRecord,
   type ProjectProduct, type ProjectTask, type ProjectFile, type ProjectTemplate,
   type DataCategory, type ProjectDataField, type ProjectDataGroup, type ProjectDataRecord,
@@ -43,6 +43,7 @@ import {
   fetchProjectById as apiFetchProjectById,
   updateProject as apiUpdateProject,
   deleteProject as apiDeleteProject,
+  resolveProfileImageUrl,
 } from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
@@ -108,6 +109,48 @@ const mapApiProjectToUi = (p: any) => {
   };
 };
 
+const getRecordPhoto = (rec: ProjectDataRecord): string => {
+  const candidate =
+    rec.profilePic
+    ?? rec.profilepic
+    ?? rec.link
+    ?? rec.photoUrl
+    ?? rec.photo_url
+    ?? rec.imageUrl
+    ?? rec.image_url
+    ?? rec.photo
+    ?? rec.Photo
+    ?? rec.image
+    ?? rec.Image
+    ?? rec.avatar
+    ?? rec.Avatar
+    ?? rec.picture
+    ?? rec.Picture;
+  return typeof candidate === "string" ? candidate : "";
+};
+
+function isPhotoFieldKey(key: string): boolean {
+  const normalized = String(key || "").toLowerCase().replace(/[\s_-]/g, "");
+  return [
+    "photo",
+    "photourl",
+    "photopath",
+    "image",
+    "imageurl",
+    "avatar",
+    "picture",
+    "profileimage",
+    "studentphoto",
+  ].includes(normalized);
+}
+
+function getRecordPhotoUrl(rec: ProjectDataRecord): string {
+  const value = getRecordPhoto(rec);
+  return resolveProfileImageUrl(value);
+}
+const DEFAULT_AVATAR =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Ccircle cx='18' cy='18' r='18' fill='%23e2e8f0'/%3E%3Ccircle cx='18' cy='14' r='6' fill='%2394a3b8'/%3E%3Cellipse cx='18' cy='30' rx='10' ry='7' fill='%2394a3b8'/%3E%3C/svg%3E";
+
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -160,6 +203,7 @@ export function ProjectDetail() {
   const [editFieldsDraft, setEditFieldsDraft] = useState<ProjectDataField[]>([]);
   const [isAddGroupOpen, setIsAddGroupOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
+  const [newGroupTemplateId, setNewGroupTemplateId] = useState("");
 
   // Reload data from localStorage whenever project id or category changes
   useEffect(() => {
@@ -235,8 +279,24 @@ export function ProjectDetail() {
     setTemplateErrors(e);
     return Object.keys(e).length === 0;
   };
+
+  const createBlankTemplateThumbnail = (widthMm: number, heightMm: number) => {
+    const pxPerMm = 96 / 25.4;
+    const widthPx = Math.max(1, Math.round(widthMm * pxPerMm));
+    const heightPx = Math.max(1, Math.round(heightMm * pxPerMm));
+    const c = document.createElement("canvas");
+    c.width = widthPx;
+    c.height = heightPx;
+    const ctx = c.getContext("2d");
+    if (!ctx) return "";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, widthPx, heightPx);
+    return c.toDataURL("image/png");
+  };
+
   const handleCreateTemplate = () => {
     if (!validateTemplate() || !id) return;
+    const thumb = createBlankTemplateThumbnail(templateForm.canvas.width, templateForm.canvas.height);
     addProjectTemplate({
       projectId: id,
       templateName: templateForm.templateName,
@@ -244,6 +304,7 @@ export function ProjectDetail() {
       canvas: templateForm.canvas,
       margin: templateForm.margin,
       applicableFor: templateForm.applicableFor,
+      thumbnail: thumb,
       isPublic: true,
     });
     setTemplateForm(emptyTemplateForm);
@@ -434,10 +495,23 @@ export function ProjectDetail() {
 
   const handleAddGroup = () => {
     if (!id || !newGroupName.trim()) return;
-    const g = addDataGroup({ projectId: id, name: newGroupName.trim(), category: dataCategory });
+    const g = addDataGroup({
+      projectId: id,
+      name: newGroupName.trim(),
+      category: dataCategory,
+      templateId: newGroupTemplateId || undefined,
+    });
     setDataGroups((prev) => [...prev, g]);
     setNewGroupName("");
+    setNewGroupTemplateId("");
     setIsAddGroupOpen(false);
+  };
+
+  const handleGroupTemplateChange = (groupId: string, templateId: string) => {
+    updateDataGroup(groupId, { templateId: templateId || undefined });
+    setDataGroups((prev) =>
+      prev.map((g) => g.id === groupId ? { ...g, templateId: templateId || undefined } : g)
+    );
   };
 
   // â”€â”€ Stage update â”€â”€
@@ -464,17 +538,45 @@ export function ProjectDetail() {
     const records = dataSelectedIds.size > 0
       ? filteredRecords.filter((r) => dataSelectedIds.has(r.id))
       : filteredRecords;
-    const withPhotos = records.filter((r) => r.photo);
+    const withPhotos = records.filter((r) => Boolean(getRecordPhotoUrl(r)));
     if (!withPhotos.length) return;
     const zip = new JSZip();
     const folder = zip.folder("photos")!;
-    withPhotos.forEach((r, i) => {
-      const photo = r.photo as string;
-      const ext = photo.startsWith("data:image/png") ? "png" : "jpg";
-      const base64 = photo.split(",")[1];
+    for (let i = 0; i < withPhotos.length; i += 1) {
+      const r = withPhotos[i];
+      const src = getRecordPhotoUrl(r);
+      if (!src) continue;
+
+      let ext = "jpg";
+      let base64 = "";
+
+      if (src.startsWith("data:image/")) {
+        const mime = src.slice(5, src.indexOf(";"));
+        ext = mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : "jpg";
+        base64 = src.split(",")[1] || "";
+      } else {
+        try {
+          const response = await fetch(src);
+          if (!response.ok) continue;
+          const blob = await response.blob();
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.onerror = () => reject(new Error("Image conversion failed"));
+            reader.readAsDataURL(blob);
+          });
+          const mime = dataUrl.slice(5, dataUrl.indexOf(";"));
+          ext = mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : "jpg";
+          base64 = dataUrl.split(",")[1] || "";
+        } catch {
+          continue;
+        }
+      }
+
+      if (!base64) continue;
       const name = String(r["Name"] ?? r["name"] ?? `record_${i + 1}`).replace(/[^a-z0-9]/gi, "_");
       folder.file(`${name}.${ext}`, base64, { base64: true });
-    });
+    }
     const content = await zip.generateAsync({ type: "blob" });
     const url = URL.createObjectURL(content);
     const a = document.createElement("a");
@@ -528,7 +630,7 @@ export function ProjectDetail() {
     const targetIds = dataSelectedIds.size > 0
       ? dataSelectedIds
       : new Set(filteredRecords.map((r) => r.id));
-    const toProcess = dataRecords.filter((r) => targetIds.has(r.id) && r.photo);
+    const toProcess = dataRecords.filter((r) => targetIds.has(r.id) && Boolean(getRecordPhotoUrl(r)));
     if (!toProcess.length) return;
     setAiProcessing("autocrop");
     const doCrop = (dataUrl: string): Promise<string> =>
@@ -550,7 +652,8 @@ export function ProjectDetail() {
     const updated = [...dataRecords];
     for (const rec of toProcess) {
       const i = updated.findIndex((r) => r.id === rec.id);
-      if (i >= 0) updated[i] = { ...updated[i], photo: await doCrop(rec.photo as string) };
+      const source = getRecordPhotoUrl(rec);
+      if (i >= 0 && source) updated[i] = { ...updated[i], photo: await doCrop(source) };
     }
     if (id) saveDataRecords(id, dataCategory, updated);
     setDataRecords(updated);
@@ -562,7 +665,7 @@ export function ProjectDetail() {
     const targetIds = dataSelectedIds.size > 0
       ? dataSelectedIds
       : new Set(filteredRecords.map((r) => r.id));
-    const toProcess = dataRecords.filter((r) => targetIds.has(r.id) && r.photo);
+    const toProcess = dataRecords.filter((r) => targetIds.has(r.id) && Boolean(getRecordPhotoUrl(r)));
     if (!toProcess.length) return;
     setAiProcessing("bgremove");
     const doRemoveBg = (dataUrl: string): Promise<string> =>
@@ -589,7 +692,8 @@ export function ProjectDetail() {
     const updated = [...dataRecords];
     for (const rec of toProcess) {
       const i = updated.findIndex((r) => r.id === rec.id);
-      if (i >= 0) updated[i] = { ...updated[i], photo: await doRemoveBg(rec.photo as string) };
+      const source = getRecordPhotoUrl(rec);
+      if (i >= 0 && source) updated[i] = { ...updated[i], photo: await doRemoveBg(source) };
     }
     if (id) saveDataRecords(id, dataCategory, updated);
     setDataRecords(updated);
@@ -1127,25 +1231,7 @@ export function ProjectDetail() {
                           className="h-full w-full object-contain"
                         />
                       ) : (
-                        <>
-                          <div className="absolute inset-0 pointer-events-none">
-                            {(() => {
-                              const m = previewTemplate.margin;
-                              const w = previewTemplate.canvas.width;
-                              const h = previewTemplate.canvas.height;
-                              const s = Math.min(220 / w * 0.6, 280 / h * 0.6);
-                              return (
-                                <>
-                                  <div style={{ position:"absolute", left:0, right:0, top: m.top*s, borderTop:"1px dashed #3b82f6" }} />
-                                  <div style={{ position:"absolute", left:0, right:0, bottom: m.bottom*s, borderBottom:"1px dashed #3b82f6" }} />
-                                  <div style={{ position:"absolute", top:0, bottom:0, left: m.left*s, borderLeft:"1px dashed #3b82f6" }} />
-                                  <div style={{ position:"absolute", top:0, bottom:0, right: m.right*s, borderRight:"1px dashed #3b82f6" }} />
-                                </>
-                              );
-                            })()}
-                          </div>
-                          <Layers className="h-8 w-8 text-muted-foreground" />
-                        </>
+                        <Layers className="h-8 w-8 text-muted-foreground" />
                       )}
                     </div>
                   </div>
@@ -1200,19 +1286,6 @@ export function ProjectDetail() {
                         ) : (
                           <div className="bg-white shadow rounded relative overflow-hidden flex items-center justify-center"
                             style={{ width: Math.min(80, tmpl.canvas.width), height: Math.min(96, tmpl.canvas.height) }}>
-                            {(() => {
-                              const w = tmpl.canvas.width; const h = tmpl.canvas.height;
-                              const s = Math.min(80 / w, 96 / h);
-                              const m = tmpl.margin;
-                              return (
-                                <div className="absolute inset-0 pointer-events-none">
-                                  <div style={{ position:"absolute",left:0,right:0,top:m.top*s,borderTop:"1px dashed #3b82f6" }} />
-                                  <div style={{ position:"absolute",left:0,right:0,bottom:m.bottom*s,borderBottom:"1px dashed #3b82f6" }} />
-                                  <div style={{ position:"absolute",top:0,bottom:0,left:m.left*s,borderLeft:"1px dashed #3b82f6" }} />
-                                  <div style={{ position:"absolute",top:0,bottom:0,right:m.right*s,borderRight:"1px dashed #3b82f6" }} />
-                                </div>
-                              );
-                            })()}
                             <Layers className="h-4 w-4 text-muted-foreground" />
                           </div>
                         )}
@@ -1235,12 +1308,19 @@ export function ProjectDetail() {
                           variant="outline"
                           className="flex-1 text-xs gap-1 text-primary hover:text-primary"
                           onClick={() => {
+                            const rawMargin = (tmpl as any).margin ?? {};
+                            const normalizedMargin = {
+                              top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
+                              left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
+                              right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
+                              bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
+                            };
                             // Save template config to designer storage key so DesignerStudio picks it up
                             const designerConfig = {
                               templateName: tmpl.templateName,
                               templateType: tmpl.templateType,
                               canvas: tmpl.canvas,
-                              margin: tmpl.margin,
+                              margin: normalizedMargin,
                             };
                             localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
                             // Write context so DesignerStudio can save back to this exact template
@@ -1715,7 +1795,7 @@ export function ProjectDetail() {
                               <DropdownMenuItem onClick={handleDownloadExcel} disabled={!filteredRecords.length}>
                                 <FileDown className="h-4 w-4 mr-2" /> Download Excel
                               </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => void handleDownloadImageZip()} disabled={!filteredRecords.some((r) => r.photo)}>
+                              <DropdownMenuItem onClick={() => void handleDownloadImageZip()} disabled={!filteredRecords.some((r) => Boolean(getRecordPhoto(r)))}>
                                 <Archive className="h-4 w-4 mr-2" /> Download Image Zip
                               </DropdownMenuItem>
                               <DropdownMenuSeparator />
@@ -1781,7 +1861,7 @@ export function ProjectDetail() {
                               <TableHead className="w-12">S.No.</TableHead>
                               <TableHead>Name</TableHead>
                               {dataFields
-                                .filter((f) => f.key !== "Name" && f.key !== "name")
+                                .filter((f) => f.key !== "Name" && f.key !== "name" && !isPhotoFieldKey(f.key))
                                 .slice(0, 8)
                                 .map((f) => (
                                   <TableHead key={f.key}>{f.label}</TableHead>
@@ -1791,6 +1871,8 @@ export function ProjectDetail() {
                           </TableHeader>
                           <TableBody>
                             {filteredRecords.map((rec, idx) => {
+                              const resolvedUrl = getRecordPhotoUrl(rec);
+                              const imageUrl = resolvedUrl || DEFAULT_AVATAR;
                               const nameVal = String(rec["Name"] ?? rec["name"] ?? "—");
                               const isChecked = dataSelectedIds.has(rec.id);
                               return (
@@ -1811,14 +1893,17 @@ export function ProjectDetail() {
                                   </TableCell>
                                   <TableCell className="text-muted-foreground text-xs">{idx + 1}</TableCell>
                                   <TableCell>
-                                    <div className="flex items-center gap-2">
-                                      <div className="h-8 w-8 rounded-full bg-muted flex items-center justify-center shrink-0 overflow-hidden">
-                                        {rec.photo ? (
-                                          <img src={rec.photo as string} alt="" className="h-full w-full object-cover" />
-                                        ) : (
-                                          <UserCircle className="h-5 w-5 text-muted-foreground" />
-                                        )}
-                                      </div>
+                                    <div className="flex items-center gap-2.5">
+                                      <img
+                                        src={imageUrl}
+                                        alt={nameVal}
+                                        className="h-9 w-9 rounded-full object-cover shrink-0"
+                                        onError={(event) => {
+                                          const img = event.currentTarget;
+                                          img.onerror = null;
+                                          img.src = DEFAULT_AVATAR;
+                                        }}
+                                      />
                                       <div>
                                         <p className="text-sm font-medium leading-none">{nameVal}</p>
                                         {rec.groupId && (
@@ -1830,7 +1915,7 @@ export function ProjectDetail() {
                                     </div>
                                   </TableCell>
                                   {dataFields
-                                    .filter((f) => f.key !== "Name" && f.key !== "name")
+                                    .filter((f) => f.key !== "Name" && f.key !== "name" && !isPhotoFieldKey(f.key))
                                     .slice(0, 8)
                                     .map((f) => (
                                       <TableCell key={f.key} className="text-sm">
@@ -1899,37 +1984,81 @@ export function ProjectDetail() {
                       <Plus className="h-3.5 w-3.5" /> Add Group
                     </Button>
                   </div>
+                  {templates.length === 0 && (
+                    <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5 mt-2">
+                      No templates found for this project. Go to the <strong>Templates</strong> tab to create one first.
+                    </p>
+                  )}
                 </CardHeader>
                 <CardContent>
                   {dataGroups.length === 0 ? (
                     <div className="border-2 border-dashed rounded-lg p-10 text-center text-muted-foreground">
                       <Users className="h-8 w-8 mx-auto mb-2 opacity-40" />
-                      <p className="text-sm">No groups yet. Add a group to categorise records.</p>
+                      <p className="text-sm font-medium">No groups yet</p>
+                      <p className="text-xs mt-1">Create a group and assign a template to organise records for printing.</p>
                     </div>
                   ) : (
                     <div className="space-y-2">
-                      {dataGroups.map((g) => (
-                        <div key={g.id} className="flex items-center justify-between px-3 py-2 rounded-lg border bg-muted/30">
-                          <div className="flex items-center gap-2">
-                            <GripVertical className="h-4 w-4 text-muted-foreground" />
-                            <span className="text-sm font-medium">{g.name}</span>
-                            <Badge variant="secondary" className="text-xs">
-                              {dataRecords.filter((r) => r.groupId === g.id).length} records
-                            </Badge>
+                      {dataGroups.map((g) => {
+                        const assignedTemplate = templates.find((t) => t.id === g.templateId);
+                        const recordCount = dataRecords.filter((r) => r.groupId === g.id).length;
+                        return (
+                          <div key={g.id} className="flex items-center gap-3 px-3 py-3 rounded-lg border bg-muted/30">
+                            <GripVertical className="h-4 w-4 text-muted-foreground shrink-0" />
+
+                            {/* Group name + record count */}
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-sm font-medium">{g.name}</span>
+                                <Badge variant="secondary" className="text-xs">
+                                  {recordCount} {recordCount === 1 ? "record" : "records"}
+                                </Badge>
+                              </div>
+
+                              {/* Template selector per group */}
+                              <div className="flex items-center gap-1.5 mt-1.5">
+                                <Layers className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                <Select
+                                  value={g.templateId ?? "__none__"}
+                                  onValueChange={(val) => handleGroupTemplateChange(g.id, val === "__none__" ? "" : val)}
+                                >
+                                  <SelectTrigger className="h-6 text-xs w-48 border-dashed">
+                                    <SelectValue placeholder="Assign template…" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="__none__">No template</SelectItem>
+                                    {templates.map((t) => (
+                                      <SelectItem key={t.id} value={t.id}>
+                                        {t.templateName}
+                                        <span className="ml-1.5 text-muted-foreground text-[10px]">({t.templateType})</span>
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                                {assignedTemplate && (
+                                  <Badge variant="outline" className="text-[10px] h-5 gap-1 border-primary/40 text-primary">
+                                    <Layers className="h-2.5 w-2.5" />
+                                    {assignedTemplate.templateName}
+                                  </Badge>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Delete */}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7 text-destructive hover:text-destructive shrink-0"
+                              onClick={() => {
+                                deleteDataGroup(g.id);
+                                setDataGroups((prev) => prev.filter((x) => x.id !== g.id));
+                              }}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
                           </div>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-destructive hover:text-destructive"
-                            onClick={() => {
-                              deleteDataGroup(g.id);
-                              setDataGroups((prev) => prev.filter((x) => x.id !== g.id));
-                            }}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </CardContent>
@@ -2156,23 +2285,48 @@ export function ProjectDetail() {
           </Dialog>
 
           {/* ── Add Group Dialog ── */}
-          <Dialog open={isAddGroupOpen} onOpenChange={setIsAddGroupOpen}>
-            <DialogContent className="sm:max-w-[360px]">
+          <Dialog open={isAddGroupOpen} onOpenChange={(open) => { setIsAddGroupOpen(open); if (!open) { setNewGroupName(""); setNewGroupTemplateId(""); } }}>
+            <DialogContent className="sm:max-w-[400px]">
               <DialogHeader>
                 <DialogTitle>Add Group</DialogTitle>
               </DialogHeader>
-              <div className="space-y-1.5 py-1">
-                <Label>Group Name</Label>
-                <Input
-                  value={newGroupName}
-                  onChange={(e) => setNewGroupName(e.target.value)}
-                  placeholder="e.g. GOOD, Class A…"
-                  onKeyDown={(e) => { if (e.key === "Enter") handleAddGroup(); }}
-                />
+              <div className="space-y-3 py-1">
+                <div className="space-y-1.5">
+                  <Label>Group Name <span className="text-destructive">*</span></Label>
+                  <Input
+                    value={newGroupName}
+                    onChange={(e) => setNewGroupName(e.target.value)}
+                    placeholder="e.g. Class A, Good Quality…"
+                    onKeyDown={(e) => { if (e.key === "Enter") handleAddGroup(); }}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label>Template</Label>
+                  <Select value={newGroupTemplateId || "__none__"} onValueChange={(val) => setNewGroupTemplateId(val === "__none__" ? "" : val)}>
+                    <SelectTrigger className="h-9">
+                      <SelectValue placeholder={templates.length === 0 ? "No templates available" : "Select a template…"} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">No template</SelectItem>
+                      {templates.map((t) => (
+                        <SelectItem key={t.id} value={t.id}>
+                          <span className="flex items-center gap-2">
+                            <Layers className="h-3.5 w-3.5 text-muted-foreground" />
+                            {t.templateName}
+                            <span className="text-muted-foreground text-xs">({t.templateType})</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {templates.length === 0 && (
+                    <p className="text-xs text-muted-foreground">Create templates in the Templates tab first.</p>
+                  )}
+                </div>
               </div>
               <div className="flex gap-3 pt-1">
                 <Button variant="outline" className="flex-1" onClick={() => setIsAddGroupOpen(false)}>Cancel</Button>
-                <Button className="flex-1" onClick={handleAddGroup}>Add Group</Button>
+                <Button className="flex-1" onClick={handleAddGroup} disabled={!newGroupName.trim()}>Add Group</Button>
               </div>
             </DialogContent>
           </Dialog>

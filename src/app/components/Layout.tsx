@@ -211,39 +211,32 @@ export function Layout() {
         `}</style>
         <div data-sidebar-main="true">
           {/* Top Bar */}
-        <header className="sticky top-0 z-40 flex h-16 items-center gap-4 border-b bg-card px-4 lg:px-6 shadow-sm">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="lg:hidden"
-            onClick={() => setSidebarOpen(true)}
-          >
-            <Menu className="h-5 w-5" />
-          </Button>
+        <header className="sticky top-0 z-40 border-b bg-card px-4 py-3 shadow-sm lg:px-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            {/* Left Section: mobile menu + search */}
+            <div className="flex w-full items-center gap-3 lg:w-auto lg:flex-1">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="shrink-0 lg:hidden"
+                onClick={() => setSidebarOpen(true)}
+              >
+                <Menu className="h-5 w-5" />
+              </Button>
 
-          {/* Search */}
-          <div className="flex-1 max-w-2xl">
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                type="search"
-                placeholder="Search clients, projects, orders..."
-                className="pl-9 bg-muted/50 border-0"
-              />
+              <div className="relative w-full max-w-xl">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  type="search"
+                  placeholder="Search clients, projects, orders..."
+                  className="h-10 border-0 bg-muted/50 pl-9"
+                />
+              </div>
             </div>
-          </div>
 
-          {/* Actions */}
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
-              {darkMode ? (
-                <Sun className="h-5 w-5" />
-              ) : (
-                <Moon className="h-5 w-5" />
-              )}
-            </Button>
-
-            <DropdownMenu>
+            {/* Right Section: notifications + theme + profile */}
+            <div className="flex w-full items-center justify-end gap-2 sm:gap-3 lg:w-auto">
+              <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon" className="relative">
                   <Bell className="h-5 w-5" />
@@ -286,17 +279,25 @@ export function Layout() {
               </DropdownMenuContent>
             </DropdownMenu>
 
+            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+              {darkMode ? (
+                <Sun className="h-5 w-5" />
+              ) : (
+                <Moon className="h-5 w-5" />
+              )}
+            </Button>
+
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" className="gap-2">
+                <Button variant="ghost" className="flex items-center gap-2 rounded-lg px-2 py-1.5 sm:px-3">
                   <Avatar className="h-8 w-8">
                     <AvatarImage src="" />
                     <AvatarFallback className="bg-gradient-to-br from-secondary to-accent text-white text-xs">
                       {avatarInitials}
                     </AvatarFallback>
                   </Avatar>
-                  <span className="hidden md:inline">{displayName}</span>
-                  <ChevronDown className="h-4 w-4 hidden md:inline" />
+                  <span className="hidden text-sm font-medium sm:inline">{displayName}</span>
+                  <ChevronDown className="hidden h-4 w-4 sm:inline" />
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
@@ -329,6 +330,7 @@ export function Layout() {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+          </div>
           </div>
         </header>
 

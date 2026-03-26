@@ -32,6 +32,10 @@ export default defineConfig({
         target: 'http://localhost:5000',
         changeOrigin: true,
       },
+      '/student-photos': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
     },
   },
 })

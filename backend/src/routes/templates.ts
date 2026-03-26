@@ -10,6 +10,10 @@ function isValidObjectId(id: string): boolean {
   return mongoose.Types.ObjectId.isValid(id);
 }
 
+function resolvePreviewImage(payload: Record<string, any>): string {
+  return String(payload.preview_image || payload.previewImageUrl || '').trim();
+}
+
 router.get('/', async (req: Request, res: Response) => {
   try {
     const {
@@ -99,6 +103,7 @@ router.post('/', async (req: Request, res: Response) => {
       productId,
       templateName,
       previewImageUrl,
+      preview_image,
       designFileUrl,
       designData,
       category = 'Other',
@@ -106,8 +111,10 @@ router.post('/', async (req: Request, res: Response) => {
       isActive = true,
     } = req.body;
 
-    if (!productId || !templateName || !previewImageUrl) {
-      res.status(400).json({ success: false, error: 'productId, templateName, and previewImageUrl are required' });
+    const normalizedPreview = resolvePreviewImage({ preview_image, previewImageUrl });
+
+    if (!productId || !templateName || !normalizedPreview) {
+      res.status(400).json({ success: false, error: 'productId, templateName, and preview_image are required' });
       return;
     }
     if (!isValidObjectId(productId)) {
@@ -124,7 +131,8 @@ router.post('/', async (req: Request, res: Response) => {
     const template = new ProductTemplate({
       productId,
       templateName: String(templateName).trim(),
-      previewImageUrl,
+      preview_image: normalizedPreview,
+      previewImageUrl: normalizedPreview,
       designFileUrl,
       designData: designData ?? {},
       category,
@@ -147,11 +155,24 @@ router.put('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const template = await ProductTemplate.findByIdAndUpdate(id, req.body, { new: true });
-    if (!template) {
+    const existingTemplate = await ProductTemplate.findById(id);
+    if (!existingTemplate) {
       res.status(404).json({ success: false, error: 'Template not found' });
       return;
     }
+
+    const normalizedPreview = resolvePreviewImage(req.body as Record<string, any>)
+      || existingTemplate.preview_image
+      || existingTemplate.previewImageUrl
+      || '';
+
+    const updatePayload: Record<string, any> = {
+      ...req.body,
+      preview_image: normalizedPreview || undefined,
+      previewImageUrl: normalizedPreview || undefined,
+    };
+
+    const template = await ProductTemplate.findByIdAndUpdate(id, updatePayload, { new: true });
 
     res.json({ success: true, data: template });
   } catch (error) {

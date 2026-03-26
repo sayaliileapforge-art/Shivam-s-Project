@@ -17,44 +17,23 @@ import {
 } from "../components/ui/table";
 import { saveImportBatch } from "../../lib/importStore";
 import type { ImportedRecord } from "../../lib/importStore";
-
-// ─── System field definitions ─────────────────────────────────────────────────
-interface SystemField {
-  key: string;
-  label: string;
-  required: boolean;
-}
-
-const SYSTEM_FIELDS: SystemField[] = [
-  { key: "name",          label: "Name",          required: true  },
-  { key: "motherName",    label: "Mother Name",    required: false },
-  { key: "fatherName",    label: "Father Name",    required: true  },
-  { key: "motherPhone",   label: "Mother Phone",   required: true  },
-  { key: "guardianName",  label: "Guardian Name",  required: true  },
-  { key: "rollNo",        label: "Roll No",        required: true  },
-  { key: "group",         label: "Group",          required: false },
-  { key: "phone",         label: "Phone",          required: true  },
-];
-
-const REQUIRED_KEYS = new Set(SYSTEM_FIELDS.filter((f) => f.required).map((f) => f.key));
+import {
+  CORE_IMPORT_FIELDS,
+  SKIP_MAPPING_VALUE,
+  autoMap,
+  buildProjectFields,
+  getDuplicateMappedColumns,
+  getSelectableHeaders,
+  getVisiblePreviewFields,
+  isMappedColumn,
+  isSkippedColumn,
+  mapRowToRecord,
+  normalizeMapping,
+  validateMapping,
+  type ImportSystemField,
+} from "../../lib/importMapping";
 
 type Step = "upload" | "mapping" | "preview" | "done";
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function normalise(str: string): string {
-  return str.toLowerCase().replace(/[\s_\-]/g, "");
-}
-
-function autoMap(excelHeaders: string[]): Record<string, string> {
-  const mapping: Record<string, string> = {};
-  for (const field of SYSTEM_FIELDS) {
-    const match = excelHeaders.find(
-      (h) => normalise(h) === normalise(field.key) || normalise(h) === normalise(field.label)
-    );
-    if (match) mapping[field.key] = match;
-  }
-  return mapping;
-}
 
 function isValidPhone(val: string | undefined): boolean {
   if (!val) return false;
@@ -107,7 +86,8 @@ export function DataProcessing() {
         setFilename(file.name);
         setHeaders(detectedHeaders);
         setRows(stringRows);
-        setMapping(autoMap(detectedHeaders));
+        const allFields = buildProjectFields(detectedHeaders);
+        setMapping(autoMap(detectedHeaders, allFields));
         setStep("mapping");
       } catch {
         setErrors(["Failed to parse the file. Make sure it is a valid Excel or CSV."]);
@@ -128,36 +108,28 @@ export function DataProcessing() {
 
   // ── Derived data ──────────────────────────────────────────────────────────
   const previewRows = rows.slice(0, 10);
+  const projectFields = useMemo<ImportSystemField[]>(() => buildProjectFields(headers), [headers]);
 
   // Mapped records (full dataset)
   const mappedRecords = useMemo<ImportedRecord[]>(() => {
     return rows.map((row, i) => {
       const rec: ImportedRecord = { id: `IMP-${Date.now()}-${i}` };
-      for (const field of SYSTEM_FIELDS) {
-        const col = mapping[field.key];
-        if (col) rec[field.key] = row[col] ?? "";
-      }
+      Object.assign(rec, mapRowToRecord(row, projectFields, mapping));
       return rec;
     });
-  }, [rows, mapping]);
+  }, [rows, mapping, projectFields]);
 
   // ── Validation ────────────────────────────────────────────────────────────
   const validate = (): string[] => {
-    const errs: string[] = [];
+    const errs = validateMapping(projectFields, mapping);
 
-    // Check required field mappings
-    for (const field of SYSTEM_FIELDS.filter((f) => f.required)) {
-      if (!mapping[field.key]) {
-        errs.push(`Required field "${field.label}" is not mapped.`);
-      }
-    }
     if (errs.length) return errs;
 
     // Per-record validation
     let invalidPhones = 0;
     for (const rec of mappedRecords) {
-      if (rec.phone && !isValidPhone(rec.phone)) invalidPhones++;
-      if (rec.motherPhone && !isValidPhone(rec.motherPhone)) invalidPhones++;
+      if (rec.fatherMobile && !isValidPhone(rec.fatherMobile)) invalidPhones++;
+      if (rec.fatherWhatsapp && !isValidPhone(rec.fatherWhatsapp)) invalidPhones++;
     }
     if (invalidPhones > 0) errs.push(`${invalidPhones} record(s) have invalid phone numbers.`);
 
@@ -167,24 +139,33 @@ export function DataProcessing() {
   // Duplicate detection (phone OR rollNo)
   const duplicateCount = useMemo(() => {
     const seenPhone = new Set<string>();
+    const seenAdmission = new Set<string>();
     const seenRoll = new Set<string>();
     let dupes = 0;
     for (const rec of mappedRecords) {
-      const p = rec.phone?.trim();
+      const p = rec.fatherMobile?.trim();
+      const a = rec.admissionNo?.trim();
       const r = rec.rollNo?.trim();
       if (p && seenPhone.has(p)) { dupes++; continue; }
+      if (a && seenAdmission.has(a)) { dupes++; continue; }
       if (r && seenRoll.has(r)) { dupes++; continue; }
       if (p) seenPhone.add(p);
+      if (a) seenAdmission.add(a);
       if (r) seenRoll.add(r);
     }
     return dupes;
   }, [mappedRecords]);
 
   // Mapping completeness
-  const unmappedRequired = SYSTEM_FIELDS.filter(
-    (f) => f.required && !mapping[f.key]
+  const unmappedRequired = projectFields.filter(
+    (f) => f.required && !isMappedColumn(mapping[f.key])
   );
-  const mappedCount = SYSTEM_FIELDS.filter((f) => mapping[f.key]).length;
+  const duplicateMappedColumns = getDuplicateMappedColumns(mapping);
+  const visiblePreviewFields = useMemo(
+    () => getVisiblePreviewFields(projectFields, mappedRecords as Array<Record<string, unknown>>, mapping),
+    [projectFields, mappedRecords, mapping]
+  );
+  const mappedColumnCount = projectFields.filter((f) => isMappedColumn(mapping[f.key])).length;
 
   // ── Sample value helper ───────────────────────────────────────────────────
   const sampleValue = (excelCol: string) => rows[0]?.[excelCol] ?? "–";
@@ -221,8 +202,8 @@ export function DataProcessing() {
   // ── Download template ────────────────────────────────────────────────────
   const downloadTemplate = () => {
     const ws = XLSX.utils.aoa_to_sheet([
-      SYSTEM_FIELDS.map((f) => f.key),
-      SYSTEM_FIELDS.map((f) => (f.required ? "REQUIRED" : "optional")),
+      CORE_IMPORT_FIELDS.map((f) => f.label),
+      CORE_IMPORT_FIELDS.map((f) => (f.required ? "REQUIRED" : "optional")),
     ]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Template");
@@ -322,7 +303,7 @@ export function DataProcessing() {
               <div className="flex items-center justify-between">
                 <CardTitle>Column Mapping</CardTitle>
                 <Badge variant="outline">
-                  {mappedCount}/{SYSTEM_FIELDS.length} fields mapped
+                  {mappedColumnCount}/{projectFields.length} fields mapped
                 </Badge>
               </div>
             </CardHeader>
@@ -337,10 +318,16 @@ export function DataProcessing() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {SYSTEM_FIELDS.map((field) => {
+                  {projectFields.map((field) => {
                     const selected = mapping[field.key];
                     const sample = selected ? sampleValue(selected) : null;
                     const isMapped = !!selected;
+                    const selectableHeaders = getSelectableHeaders(headers, mapping, field.key);
+                    const admissionMapped = isMappedColumn(mapping.admissionNo);
+                    const rollMapped = isMappedColumn(mapping.rollNo);
+                    const fieldLocked =
+                      (field.key === "rollNo" && admissionMapped && !isMappedColumn(mapping.rollNo))
+                      || (field.key === "admissionNo" && rollMapped && !isMappedColumn(mapping.admissionNo));
                     return (
                       <TableRow key={field.key}>
                         <TableCell className="font-medium">
@@ -350,12 +337,26 @@ export function DataProcessing() {
                         <TableCell className="min-w-[220px]">
                           <Select
                             value={mapping[field.key] ?? "__none__"}
+                            disabled={fieldLocked}
                             onValueChange={(v) =>
                               setMapping((prev) => {
                                 const next = { ...prev };
-                                if (v === "__none__") { delete next[field.key]; }
-                                else { next[field.key] = v; }
-                                return next;
+                                if (v === SKIP_MAPPING_VALUE) {
+                                  next[field.key] = SKIP_MAPPING_VALUE;
+                                } else if (v === "__none__") {
+                                  delete next[field.key];
+                                } else {
+                                  next[field.key] = v;
+                                }
+
+                                if (field.key === "admissionNo" && isMappedColumn(next.admissionNo)) {
+                                  delete next.rollNo;
+                                }
+                                if (field.key === "rollNo" && isMappedColumn(next.rollNo)) {
+                                  delete next.admissionNo;
+                                }
+
+                                return normalizeMapping(next, projectFields);
                               })
                             }
                           >
@@ -364,9 +365,12 @@ export function DataProcessing() {
                             </SelectTrigger>
                             <SelectContent>
                               <SelectItem value="__none__" className="text-muted-foreground text-xs">
-                                — not mapped —
+                                — Select column —
                               </SelectItem>
-                              {headers.map((h) => (
+                              <SelectItem value={SKIP_MAPPING_VALUE} className="text-muted-foreground text-xs">
+                                — Skip this field —
+                              </SelectItem>
+                              {selectableHeaders.map((h) => (
                                 <SelectItem key={h} value={h} className="text-sm">
                                   {h}
                                 </SelectItem>
@@ -375,11 +379,19 @@ export function DataProcessing() {
                           </Select>
                         </TableCell>
                         <TableCell className="text-sm text-muted-foreground">
-                          {sample ?? <span className="italic">No mapping</span>}
+                          {selected && isMappedColumn(selected)
+                            ? sample
+                            : selected && isSkippedColumn(selected)
+                              ? <span className="italic">Skipped</span>
+                              : <span className="italic">No mapping</span>}
                         </TableCell>
                         <TableCell className="text-center">
-                          {isMapped ? (
+                          {isMapped && isMappedColumn(selected) ? (
                             <CheckCircle className="h-4 w-4 text-success mx-auto" />
+                          ) : selected && isSkippedColumn(selected) ? (
+                            <span className="text-xs text-muted-foreground">skipped</span>
+                          ) : fieldLocked ? (
+                            <span className="text-xs text-muted-foreground">auto</span>
                           ) : field.required ? (
                             <AlertCircle className="h-4 w-4 text-destructive mx-auto" />
                           ) : (
@@ -401,12 +413,23 @@ export function DataProcessing() {
             </p>
           )}
 
+          {duplicateMappedColumns.length > 0 && (
+            <Card className="border-warning/60 bg-warning/5">
+              <CardContent className="p-4 flex items-center gap-2">
+                <AlertTriangle className="h-5 w-5 text-warning shrink-0" />
+                <p className="text-sm text-warning">
+                  <strong>Duplicate column selections found:</strong> {duplicateMappedColumns.join(", ")}.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
           {duplicateCount > 0 && (
             <Card className="border-warning/60 bg-warning/5">
               <CardContent className="p-4 flex items-center gap-2">
                 <AlertTriangle className="h-5 w-5 text-warning shrink-0" />
                 <p className="text-sm text-warning">
-                  <strong>{duplicateCount} duplicate(s)</strong> detected by phone/rollNo.
+                  <strong>{duplicateCount} duplicate(s)</strong> detected by father mobile/admission/roll.
                   They will still be imported but flagged.
                 </p>
               </CardContent>
@@ -419,7 +442,7 @@ export function DataProcessing() {
             </Button>
             <Button
               className="gap-2"
-              disabled={unmappedRequired.length > 0}
+              disabled={unmappedRequired.length > 0 || duplicateMappedColumns.length > 0}
               onClick={() => { setErrors([]); setStep("preview"); }}
             >
               Preview Data <ArrowRight className="h-4 w-4" />
@@ -446,7 +469,7 @@ export function DataProcessing() {
                   <TableHeader>
                     <TableRow>
                       <TableHead className="w-10">#</TableHead>
-                      {SYSTEM_FIELDS.filter((f) => mapping[f.key]).map((f) => (
+                      {visiblePreviewFields.map((f) => (
                         <TableHead key={f.key}>
                           {f.label}
                           {f.required && <span className="text-destructive ml-1">*</span>}
@@ -458,10 +481,10 @@ export function DataProcessing() {
                     {previewRows.map((row, idx) => (
                       <TableRow key={idx}>
                         <TableCell className="text-muted-foreground text-xs">{idx + 1}</TableCell>
-                        {SYSTEM_FIELDS.filter((f) => mapping[f.key]).map((f) => {
+                        {visiblePreviewFields.map((f) => {
                           const val = row[mapping[f.key]] ?? "";
                           const invalid =
-                            (f.key === "phone" || f.key === "motherPhone") &&
+                            (f.key === "fatherMobile" || f.key === "fatherWhatsapp") &&
                             val && !isValidPhone(val);
                           return (
                             <TableCell key={f.key}>
@@ -482,7 +505,7 @@ export function DataProcessing() {
               <CardContent className="p-4 flex items-center gap-2">
                 <AlertTriangle className="h-5 w-5 text-warning shrink-0" />
                 <p className="text-sm text-warning">
-                  <strong>{duplicateCount} duplicate(s)</strong> detected by phone/rollNo.
+                  <strong>{duplicateCount} duplicate(s)</strong> detected by father mobile/admission/roll.
                 </p>
               </CardContent>
             </Card>

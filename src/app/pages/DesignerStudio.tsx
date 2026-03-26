@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   MousePointer2, ZoomIn, ZoomOut, Hand, Layers, Square, Circle as CircleIcon,
   Type, ImagePlus, Pen, QrCode, Barcode, Grid3x3, Triangle, Minus,
+  Variable,
   AlignStartVertical, AlignCenterVertical, AlignEndVertical,
   AlignStartHorizontal, AlignCenterHorizontal, AlignEndHorizontal,
   Undo2, Redo2, Copy, Trash2, Download, FolderOpen, Plus, X, Eye,
@@ -40,6 +41,7 @@ import { BackgroundPanel } from "../components/designer/BackgroundPanel";
 import { MaskPanel } from "../components/designer/MaskPanel";
 import { ContextToolbar } from "../components/designer/ContextToolbar";
 import { ShapesGallery } from "../components/designer/ShapesGallery";
+import { VariableFieldsPanel } from "../components/designer/VariableFieldsPanel";
 import { HRuler, VRuler, RULER_THICKNESS } from "../components/designer/Ruler";
 import {
   loadDesignerConfig, DEFAULT_CONFIG, DESIGNER_SAVE_KEY, DESIGNER_CONTEXT_KEY,
@@ -60,10 +62,35 @@ type ToolId =
   | "select" | "zoom" | "hand"
   | "background" | "layers"
   | "shapes" | "text" | "image" | "draw"
-  | "qrcode" | "barcode" | "alignment";
+  | "qrcode" | "barcode" | "alignment" | "variables";
 
 const EMPTY_CANVAS_JSON = { objects: [] as object[] };
 const DESIGNER_IMPORT_MODE_KEY = "vendor_designer_import_mode";
+
+function resolveTemplateMargin(rawTemplate: any, fallback: TemplateConfig["margin"]): TemplateConfig["margin"] {
+  const rawMargin = rawTemplate?.margin ?? {};
+  const hasStructuredMargin = rawTemplate?.margin && typeof rawTemplate.margin === "object";
+
+  const top = Number(
+    rawMargin.top ?? (hasStructuredMargin ? fallback.top : rawTemplate?.marginTop) ?? fallback.top
+  );
+  const left = Number(
+    rawMargin.left ?? (hasStructuredMargin ? fallback.left : rawTemplate?.marginLeft) ?? fallback.left
+  );
+  const right = Number(
+    rawMargin.right ?? (hasStructuredMargin ? fallback.right : rawTemplate?.marginRight) ?? fallback.right
+  );
+  const bottom = Number(
+    rawMargin.bottom ?? (hasStructuredMargin ? fallback.bottom : rawTemplate?.marginBottom) ?? fallback.bottom
+  );
+
+  return {
+    top: Number.isFinite(top) ? Math.max(0, top) : fallback.top,
+    left: Number.isFinite(left) ? Math.max(0, left) : fallback.left,
+    right: Number.isFinite(right) ? Math.max(0, right) : fallback.right,
+    bottom: Number.isFinite(bottom) ? Math.max(0, bottom) : fallback.bottom,
+  };
+}
 
 function PagePreviewItem({
   page,
@@ -132,16 +159,30 @@ function PagePreviewItem({
     });
 
     sc.loadFromJSON(JSON.stringify(page.canvas ?? EMPTY_CANVAS_JSON)).then(() => {
+      const prevClipPath = (sc as any).clipPath;
+      const prevBg = sc.backgroundColor;
+      if (!prevBg) sc.backgroundColor = "#ffffff";
+      (sc as any).clipPath = undefined;
       sc.renderAll();
       if (!cancelled) {
         setThumbUrl(
           sc.toDataURL({
             format: "png",
-            multiplier: 0.22,
-            enableRetinaScaling: false,
-          })
+            multiplier: 1.5,
+            left: 0,
+            top: 0,
+            width: sc.getWidth(),
+            height: sc.getHeight(),
+            enableRetinaScaling: true,
+            filter: (obj: fabric.FabricObject) => {
+              const anyObj = obj as any;
+              return !anyObj.excludeFromExport && !anyObj.isGuide;
+            },
+          } as any)
         );
       }
+      (sc as any).clipPath = prevClipPath;
+      if (!prevBg) sc.backgroundColor = prevBg;
       sc.dispose();
     });
 
@@ -331,14 +372,14 @@ export function DesignerStudio() {
     () => loadDesignerConfig() ?? DEFAULT_CONFIG
   );
   const [isEditingName, setIsEditingName] = useState(false);
-  const [showMargins,   setShowMargins]   = useState(true);
-  const [showTopLabel,  setShowTopLabel]  = useState(true);
+  const [showTopLabel,  setShowTopLabel]  = useState(false);
+  const [showGuides,    setShowGuides]    = useState(true);
   const [selected, setSelected] = useState<fabric.FabricObject | null>(null);
   const [tick,     setTick]     = useState(0);
   const [currentBg, setCurrentBg] = useState<string>("#ffffff");
   const [userZoom, setUserZoom] = useState(100);
   const [safeZoneWarn, setSafeZoneWarn] = useState(false);
-  const [rightTab, setRightTab] = useState<"background" | "properties" | "mask" | "layers" | "alignment">("background");
+  const [rightTab, setRightTab] = useState<"background" | "properties" | "mask" | "layers" | "alignment" | "variables">("background");
 
   // ── Custom fonts ────────────────────────────────────────────────────────────
   const [customFonts, setCustomFonts] = useState<CustomFont[]>([]);
@@ -452,8 +493,9 @@ export function DesignerStudio() {
   // ── Canvas pixel dimensions ────────────────────────────────────────────────
   const canvasPxW  = mmToPx(config.canvas.width);
   const canvasPxH  = mmToPx(config.canvas.height);
-  const MAX_W = 680; const MAX_H = 640;
-  const fitScale       = Math.min(MAX_W / canvasPxW, MAX_H / canvasPxH, 1);
+  const MAX_W = 1100;
+  const MAX_H = 760;
+  const fitScale       = Math.min(MAX_W / canvasPxW, MAX_H / canvasPxH);
   const effectiveScale = fitScale * (userZoom / 100);
   const displayPxW     = Math.round(canvasPxW * effectiveScale);
   const displayPxH     = Math.round(canvasPxH * effectiveScale);
@@ -579,6 +621,11 @@ export function DesignerStudio() {
         setUserZoom((z) => Math.min(300, Math.round(z / 10) * 10 + 20));
         setShapesPopupOpen(false);
         break;
+      case "variables":
+        setRightTab("variables");
+        setActiveTool("select");
+        setShapesPopupOpen(false);
+        break;
       default:
         setShapesPopupOpen(false);
         setActiveTool(id);
@@ -692,11 +739,43 @@ export function DesignerStudio() {
     if (!designerContext?.templateId) return;
     const tmpl = loadProjectTemplates(designerContext.projectId)
       .find((t) => t.id === designerContext.templateId);
-    if (!tmpl?.canvasJSON) return;
+    if (!tmpl) return;
+
+    const resolvedMargin = resolveTemplateMargin(tmpl as any, DEFAULT_CONFIG.margin);
+
+    // Always apply template-level config so width/height/margins from modal
+    // are reflected even for newly created templates without canvasJSON.
+    setConfig((prev) => ({
+      ...prev,
+      templateName: tmpl.templateName || prev.templateName,
+      templateType: tmpl.templateType || prev.templateType,
+      canvas: tmpl.canvas || prev.canvas,
+      margin: resolvedMargin,
+    }));
+
+    if (!tmpl.canvasJSON) {
+      setPages([{ id: "page-1", name: "Page 1", canvas: EMPTY_CANVAS_JSON }]);
+      setActivePageId("page-1");
+      setPageCounter(1);
+      setPageLoadNonce((n) => n + 1);
+      refresh();
+      return;
+    }
+
     const timer = setTimeout(() => {
       try {
         const parsed = JSON.parse(tmpl.canvasJSON!);
-        if (parsed?.config) setConfig(parsed.config as TemplateConfig);
+        if (parsed?.config) {
+          const parsedConfig = parsed.config as TemplateConfig;
+          setConfig({
+            ...parsedConfig,
+            // Template record values from modal form must win.
+            templateName: tmpl.templateName || parsedConfig.templateName,
+            templateType: tmpl.templateType || parsedConfig.templateType,
+            canvas: tmpl.canvas || parsedConfig.canvas,
+            margin: resolvedMargin,
+          });
+        }
         if (Array.isArray(parsed?.pages)) {
           const loaded = normalizePages(parsed.pages);
           const nextActive = loaded.some((p) => p.id === parsed.activePageId)
@@ -712,6 +791,7 @@ export function DesignerStudio() {
       } catch { /* ignore */ }
     }, 300);
     return () => clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -744,11 +824,29 @@ export function DesignerStudio() {
         }
 
         try {
+          const prevClipPath = (fc as any).clipPath;
+          const prevBg = fc.backgroundColor;
+          if (!prevBg) fc.backgroundColor = "#ffffff";
+          (fc as any).clipPath = undefined;
+          fc.renderAll();
+
           const dataUrl = fc.toDataURL({
             format: "png",
-            multiplier: 0.22,
-            enableRetinaScaling: false,
-          });
+            multiplier: 1,
+            left: 0,
+            top: 0,
+            width: fc.getWidth(),
+            height: fc.getHeight(),
+            enableRetinaScaling: true,
+            filter: (obj: fabric.FabricObject) => {
+              const anyObj = obj as any;
+              return !anyObj.excludeFromExport && !anyObj.isGuide;
+            },
+          } as any);
+
+          (fc as any).clipPath = prevClipPath;
+          if (!prevBg) fc.backgroundColor = prevBg;
+          fc.renderAll();
           setActiveLiveThumb(dataUrl);
         } catch {
           // Ignore transient canvas serialization errors while drawing.
@@ -839,8 +937,11 @@ export function DesignerStudio() {
     if (!projectId) { toast.error("Please select a project"); return; }
     const name    = tName.trim() || config.templateName || "Untitled Template";
     const snap    = buildPagesSnapshot();
+    const elementMetadata = canvasRef.current?.getElementMetadata() ?? [];
     const canJSON = JSON.stringify({ config, pages: snap, activePageId,
-      canvas: snap.find((p) => p.id === activePageId)?.canvas ?? EMPTY_CANVAS_JSON });
+      canvas: snap.find((p) => p.id === activePageId)?.canvas ?? EMPTY_CANVAS_JSON,
+      elementMetadata,
+    });
     const thumb   = canvasRef.current?.toPNG() ?? undefined;
     setIsSaving(true);
     try {
@@ -897,9 +998,11 @@ export function DesignerStudio() {
   };
   const exportJSON = () => {
     const snap = buildPagesSnapshot();
+    const elementMetadata = canvasRef.current?.getElementMetadata() ?? [];
     const blob = new Blob([JSON.stringify({
       config, pages: snap, activePageId,
       canvas: snap.find((p) => p.id === activePageId)?.canvas ?? EMPTY_CANVAS_JSON,
+      elementMetadata,
     }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -959,6 +1062,7 @@ export function DesignerStudio() {
     if (activeTool === "layers")     setRightTab("layers");
     if (activeTool === "background") setRightTab("background");
     if (activeTool === "alignment")  setRightTab("alignment");
+    if (activeTool === "variables")  setRightTab("variables");
   }, [activeTool]);
 
   const TOOLS: { id: ToolId; icon: React.ElementType; label: string; sep?: boolean }[] = [
@@ -974,6 +1078,7 @@ export function DesignerStudio() {
     { id: "qrcode",     icon: QrCode,        label: "QR Code" },
     { id: "barcode",    icon: Barcode,       label: "Barcode" },
     { id: "alignment",  icon: Grid3x3,       label: "Alignment / Grid" },
+    { id: "variables",  icon: Variable,      label: "Dynamic Variable Fields" },
   ];
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1171,16 +1276,19 @@ export function DesignerStudio() {
           <div className="shrink-0 px-4 pt-3 pb-1 flex items-center justify-between gap-3 flex-wrap">
             <div className="flex flex-col gap-1.5">
               <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input type="checkbox" checked={showMargins}
-                  onChange={(e) => setShowMargins(e.target.checked)}
-                  className="w-3.5 h-3.5 accent-primary" />
-                <span className="text-xs text-muted-foreground">Show Guides</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input type="checkbox" checked={showTopLabel}
                   onChange={(e) => setShowTopLabel(e.target.checked)}
                   className="w-3.5 h-3.5 accent-primary" />
                 <span className="text-xs text-muted-foreground">Show "TOP" Indicator</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showGuides}
+                  onChange={(e) => setShowGuides(e.target.checked)}
+                  className="w-3.5 h-3.5 accent-primary"
+                />
+                <span className="text-xs text-muted-foreground">Show Guides</span>
               </label>
             </div>
 
@@ -1218,14 +1326,30 @@ export function DesignerStudio() {
 
               <div style={{ display: "flex" }}>
                 <VRuler canvasPxH={displayPxH} canvasMmH={config.canvas.height} scale={rulerScale} />
-                <FabricCanvas
-                  ref={canvasRef}
-                  config={config}
-                  showMargins={showMargins}
-                  displayScale={effectiveScale}
-                  onBgChange={(bg) => setCurrentBg(bg || "none")}
-                  onSelectionChange={(obj) => { setSelected(obj); refresh(); }}
-                />
+                <div style={{ position: "relative" }}>
+                  <FabricCanvas
+                    ref={canvasRef}
+                    config={config}
+                    showMargins={false}
+                    displayScale={effectiveScale}
+                    onBgChange={(bg) => setCurrentBg(bg || "none")}
+                    onSelectionChange={(obj) => { setSelected(obj); refresh(); }}
+                  />
+                  {showGuides && (
+                    <div
+                      style={{
+                        pointerEvents: "none",
+                        position: "absolute",
+                        left: mmToPx(config.margin.left) * effectiveScale,
+                        top: mmToPx(config.margin.top) * effectiveScale,
+                        width: Math.max(1, (mmToPx(config.canvas.width) - mmToPx(config.margin.left) - mmToPx(config.margin.right)) * effectiveScale),
+                        height: Math.max(1, (mmToPx(config.canvas.height) - mmToPx(config.margin.top) - mmToPx(config.margin.bottom)) * effectiveScale),
+                        border: "1.5px dashed rgba(37,99,235,0.85)",
+                        boxSizing: "border-box",
+                      }}
+                    />
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1234,7 +1358,7 @@ export function DesignerStudio() {
         {/* ══════ RIGHT PROPERTIES PANEL ══════ */}
         <aside className="w-[300px] min-w-[300px] max-w-[300px] border-l bg-card flex flex-col shrink-0 overflow-hidden">
           <Tabs value={rightTab} onValueChange={(v) => setRightTab(v as typeof rightTab)} className="flex flex-col flex-1 min-h-0 overflow-hidden">
-            <TabsList className="grid grid-cols-4 m-2 mb-0 shrink-0 h-8">
+            <TabsList className="grid grid-cols-5 m-2 mb-0 shrink-0 h-8">
               <TabsTrigger value="background" className="text-[10px] gap-0.5 px-1">
                 <Palette className="h-3 w-3" /> BG
               </TabsTrigger>
@@ -1246,6 +1370,9 @@ export function DesignerStudio() {
               </TabsTrigger>
               <TabsTrigger value="layers" className="text-[10px] gap-0.5 px-1">
                 <Layers className="h-3 w-3" /> Layers
+              </TabsTrigger>
+              <TabsTrigger value="variables" className="text-[10px] gap-0.5 px-1">
+                <Variable className="h-3 w-3" /> Vars
               </TabsTrigger>
             </TabsList>
 
@@ -1311,6 +1438,15 @@ export function DesignerStudio() {
 
               <TabsContent value="alignment" className="mt-2 p-0">
                 <AlignmentTools canvasRef={canvasRef} onRefresh={refresh} />
+              </TabsContent>
+
+              <TabsContent value="variables" className="mt-2 p-0">
+                <VariableFieldsPanel
+                  onAddField={(fieldKey) => {
+                    canvasRef.current?.addDynamicField(fieldKey);
+                    refresh();
+                  }}
+                />
               </TabsContent>
             </ScrollArea>
           </Tabs>
@@ -1383,8 +1519,8 @@ export function DesignerStudio() {
                           isActive={page.id === activePageId}
                           activeLiveThumb={activeLiveThumb}
                           thumbZoom={thumbZoom}
-                          sourceCanvasWidth={displayPxW}
-                          sourceCanvasHeight={displayPxH}
+                          sourceCanvasWidth={canvasPxW}
+                          sourceCanvasHeight={canvasPxH}
                           onOpen={() => switchPage(page.id)}
                           onDuplicate={() => duplicatePage(page.id)}
                           onDelete={() => pages.length > 1 && removePage(page.id)}
@@ -1409,8 +1545,8 @@ export function DesignerStudio() {
                           isActive={page.id === activePageId}
                           activeLiveThumb={activeLiveThumb}
                           thumbZoom={thumbZoom}
-                          sourceCanvasWidth={displayPxW}
-                          sourceCanvasHeight={displayPxH}
+                          sourceCanvasWidth={canvasPxW}
+                          sourceCanvasHeight={canvasPxH}
                           onOpen={() => switchPage(page.id)}
                           onDuplicate={() => duplicatePage(page.id)}
                           onDelete={() => pages.length > 1 && removePage(page.id)}

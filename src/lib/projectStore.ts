@@ -283,6 +283,8 @@ export interface ProjectDataGroup {
   projectId: string;
   name: string;
   category: DataCategory;
+  /** ID of the ProjectTemplate assigned to this group */
+  templateId?: string;
 }
 
 export interface ProjectDataRecord {
@@ -340,6 +342,12 @@ export function deleteDataGroup(id: string): void {
   const raw = localStorage.getItem(DATA_GROUPS_KEY);
   const all: ProjectDataGroup[] = raw ? JSON.parse(raw) : [];
   localStorage.setItem(DATA_GROUPS_KEY, JSON.stringify(all.filter((g) => g.id !== id)));
+}
+
+export function updateDataGroup(id: string, data: Partial<Omit<ProjectDataGroup, "id">>): void {
+  const raw = localStorage.getItem(DATA_GROUPS_KEY);
+  const all: ProjectDataGroup[] = raw ? JSON.parse(raw) : [];
+  localStorage.setItem(DATA_GROUPS_KEY, JSON.stringify(all.map((g) => g.id === id ? { ...g, ...data } : g)));
 }
 
 // -- Records --

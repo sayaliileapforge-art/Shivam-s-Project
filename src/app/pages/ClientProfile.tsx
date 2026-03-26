@@ -1,5 +1,5 @@
 import { useParams, Link } from "react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowLeft,
   Wallet,
@@ -80,6 +80,7 @@ const stages = [
 
 export function ClientProfile() {
   const { id } = useParams();
+  const [allClients, setAllClients] = useState<Client[]>([]);
   const [isWalletDialogOpen, setIsWalletDialogOpen] = useState(false);
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [isNewProjectOpen, setIsNewProjectOpen] = useState(false);
@@ -90,7 +91,23 @@ export function ClientProfile() {
   const [clientVersion, setClientVersion] = useState(0); // used to force re-read after save
   const [districtSearch, setDistrictSearch] = useState("");
 
-  const allClients = loadClients();
+  useEffect(() => {
+    let isMounted = true;
+
+    const hydrateClients = async () => {
+      const clients = await loadClients();
+      if (isMounted) {
+        setAllClients(Array.isArray(clients) ? clients : []);
+      }
+    };
+
+    void hydrateClients();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [clientVersion]);
+
   const found = allClients.find((c) => c.id === id);
   const emptyClient: Client = {
     id: id ?? "",
@@ -109,14 +126,14 @@ export function ClientProfile() {
     state: "",
     district: "",
     schoollogUniqueId: "",
+    busStop: "",
+    route: "",
     status: "active",
     createdAt: "",
   };
   const clientData = found ?? emptyClient;
   const walletTransactions = id ? loadTransactions(id) : [];
   const clientProjects = id ? loadProjects().filter((p) => p.clientId === id) : [];
-  // re-read after clientVersion bump so balance updates live
-  void clientVersion;
 
   const [editForm, setEditForm] = useState<Omit<Client, "id" | "status" | "createdAt">>({
     clientName: clientData.clientName,
@@ -142,9 +159,9 @@ export function ClientProfile() {
     (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
       setEditForm((f) => ({ ...f, [field]: e.target.value }));
 
-  const handleEditSave = () => {
+  const handleEditSave = async () => {
     if (id) {
-      updateClient(id, editForm);
+      await updateClient(id, editForm);
     }
     setIsEditDialogOpen(false);
     setClientVersion((v) => v + 1);
@@ -158,7 +175,7 @@ export function ClientProfile() {
     return Object.keys(e).length === 0;
   };
 
-  const handleAddFunds = () => {
+  const handleAddFunds = async () => {
     if (!validateWallet() || !id) return;
     const amount = Number(walletForm.amount);
     addTransaction({
@@ -169,7 +186,7 @@ export function ClientProfile() {
       reference: walletForm.reference,
       notes: walletForm.notes,
     });
-    updateClient(id, { balance: (clientData.balance ?? 0) + amount });
+    await updateClient(id, { balance: (clientData.balance ?? 0) + amount });
     setWalletForm(emptyWalletForm);
     setWalletErrors({});
     setIsWalletDialogOpen(false);
@@ -222,6 +239,8 @@ export function ClientProfile() {
       state: clientData.state,
       district: clientData.district,
       schoollogUniqueId: clientData.schoollogUniqueId,
+      busStop: clientData.busStop || "",
+      route: clientData.route || "",
     });
     setIsEditDialogOpen(true);
   };

@@ -20,7 +20,7 @@ router.get('/', async (req: Request, res: Response) => {
 
     const orders = await TemplateOrder.find(filter)
       .populate('productId', 'name')
-      .populate('templateId', 'templateName previewImageUrl category')
+      .populate('templateId', 'templateName previewImageUrl preview_image category')
       .sort({ createdAt: -1 });
 
     res.json({ success: true, data: orders });
@@ -67,6 +67,8 @@ router.post('/', async (req: Request, res: Response) => {
     const perUnit = Number.isFinite(Number(unitPrice)) ? Number(unitPrice) : Number(product.price || product.publicPrice || 0);
     const totalAmount = qty * perUnit;
 
+    const normalizedPreview = template.preview_image || template.previewImageUrl;
+
     const order = new TemplateOrder({
       userId,
       productId,
@@ -77,7 +79,8 @@ router.post('/', async (req: Request, res: Response) => {
       customDesignData: customDesignData ?? undefined,
       selectedTemplateSnapshot: {
         templateName: template.templateName,
-        previewImageUrl: template.previewImageUrl,
+        previewImageUrl: normalizedPreview,
+        preview_image: normalizedPreview,
         category: template.category,
       },
       status: 'pending',

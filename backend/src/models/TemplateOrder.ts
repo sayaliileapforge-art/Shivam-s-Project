@@ -13,6 +13,7 @@ export interface ITemplateOrder extends Document {
   selectedTemplateSnapshot?: {
     templateName?: string;
     previewImageUrl?: string;
+    preview_image?: string;
     category?: string;
   };
   status: OrderStatus;
@@ -32,6 +33,7 @@ const TemplateOrderSchema = new Schema<ITemplateOrder>(
     selectedTemplateSnapshot: {
       templateName: String,
       previewImageUrl: String,
+      preview_image: String,
       category: String,
     },
     status: {

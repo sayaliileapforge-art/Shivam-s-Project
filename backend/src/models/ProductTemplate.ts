@@ -6,7 +6,8 @@ export interface IProductTemplate extends Document {
   productId: mongoose.Types.ObjectId;
   templateName: string;
   category: TemplateCategory;
-  previewImageUrl: string;
+  previewImageUrl?: string;
+  preview_image?: string;
   designFileUrl?: string;
   designData: Record<string, any>;
   isActive: boolean;
@@ -25,7 +26,8 @@ const ProductTemplateSchema = new Schema<IProductTemplate>(
       default: 'Other',
       index: true,
     },
-    previewImageUrl: { type: String, required: true },
+    previewImageUrl: { type: String },
+    preview_image: { type: String, index: true },
     designFileUrl: String,
     designData: { type: Schema.Types.Mixed, default: {} },
     isActive: { type: Boolean, default: true, index: true },
@@ -33,6 +35,28 @@ const ProductTemplateSchema = new Schema<IProductTemplate>(
   },
   { timestamps: true }
 );
+
+ProductTemplateSchema.pre('validate', function ensurePreviewFields(next) {
+  const normalizedPreview = this.preview_image || this.previewImageUrl;
+
+  if (normalizedPreview) {
+    this.preview_image = normalizedPreview;
+    this.previewImageUrl = normalizedPreview;
+  }
+
+  next();
+});
+
+ProductTemplateSchema.set('toJSON', {
+  transform: (_doc, ret: any) => {
+    const normalizedPreview = ret.preview_image || ret.previewImageUrl;
+    if (normalizedPreview) {
+      ret.preview_image = normalizedPreview;
+      ret.previewImageUrl = normalizedPreview;
+    }
+    return ret;
+  },
+});
 
 ProductTemplateSchema.index({ productId: 1, templateName: 1 }, { unique: true });
 

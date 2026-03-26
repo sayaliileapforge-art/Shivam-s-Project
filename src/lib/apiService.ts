@@ -4,14 +4,14 @@
  * Falls back to localStorage if API unavailable
  */
 
-declare global {
-  interface ImportMetaEnv {
-    readonly VITE_API_BASE_URL?: string;
-  }
+function getApiBaseEnv(): string | undefined {
+  const env = (import.meta as any).env as Record<string, string | boolean | undefined>;
+  const value = env.VITE_API_BASE_URL;
+  return typeof value === 'string' ? value.trim() : undefined;
 }
 
 function resolveApiBase(): string {
-  const raw = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
+  const raw = getApiBaseEnv();
   if (!raw) return '/api';
 
   const normalized = raw.replace(/\/$/, '');
@@ -19,6 +19,52 @@ function resolveApiBase(): string {
     return normalized;
   }
   return `${normalized}/api`;
+}
+
+function resolveBackendOrigin(): string {
+  const raw = getApiBaseEnv();
+  if (!raw) return 'http://localhost:5000';
+
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      return new URL(raw).origin;
+    } catch {
+      return 'http://localhost:5000';
+    }
+  }
+
+  return 'http://localhost:5000';
+}
+
+export const BACKEND_ORIGIN = resolveBackendOrigin();
+export const UPLOADS_BASE_URL = `${BACKEND_ORIGIN}/uploads/`;
+
+export function resolveProfileImageUrl(profilePic?: string): string {
+  const raw = String(profilePic || '').trim();
+  if (!raw) return '';
+
+  if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) {
+    return raw;
+  }
+
+  const normalized = raw.replace(/\\/g, '/');
+  if (normalized.startsWith('/uploads/')) {
+    return `${BACKEND_ORIGIN}${normalized}`;
+  }
+
+  if (normalized.startsWith('uploads/')) {
+    return `${BACKEND_ORIGIN}/${normalized}`;
+  }
+
+  if (normalized.startsWith('/')) {
+    return `${BACKEND_ORIGIN}${normalized}`;
+  }
+
+  if (normalized.includes('/')) {
+    return `${UPLOADS_BASE_URL}${normalized}`;
+  }
+
+  return `${UPLOADS_BASE_URL}${encodeURIComponent(normalized)}`;
 }
 
 const API_BASE = resolveApiBase();

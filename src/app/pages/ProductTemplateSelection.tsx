@@ -14,7 +14,7 @@ import {
   DialogTitle,
 } from '../components/ui/dialog';
 import { fetchProductById } from '../../lib/productApi';
-import { getTemplatesByProductId, saveSelectedTemplate, type TemplateRecord } from '../../lib/templateApi';
+import { getTemplatesByProductId, resolveTemplatePreview, saveSelectedTemplate, type TemplateRecord } from '../../lib/templateApi';
 import { useRbac } from '../../lib/rbac';
 import type { Product } from '../../lib/productStore';
 
@@ -213,7 +213,7 @@ export function ProductTemplateSelection() {
               >
                 <div className='relative h-40 bg-muted overflow-hidden'>
                   <img
-                    src={template.previewImageUrl}
+                    src={resolveTemplatePreview(template)}
                     alt={template.templateName}
                     className='w-full h-full object-cover group-hover:scale-105 transition-transform duration-300'
                     onError={(e) => {

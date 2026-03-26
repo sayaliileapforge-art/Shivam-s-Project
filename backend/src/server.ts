@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { connectDB } from './config/database';
 import projectRoutes from './routes/projects';
 import clientRoutes from './routes/clients';
@@ -41,7 +42,19 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads')));
+
+const uploadsDir = path.resolve(process.cwd(), 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  console.warn(`Uploads directory was missing and has been created: ${uploadsDir}`);
+}
+app.use('/uploads', express.static(uploadsDir));
+
+const studentPhotosDir = process.env.STUDENT_PHOTOS_DIR?.trim()
+  || 'C:/Users/Sayali/OneDrive/Sem-V/Photos';
+// Fallback lookup: if a file is not found in backend/uploads, also try student photos.
+app.use('/uploads', express.static(path.resolve(studentPhotosDir)));
+app.use('/student-photos', express.static(path.resolve(studentPhotosDir)));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -72,6 +85,9 @@ async function startServer() {
     await connectDB();
     app.listen(PORT, () => {
       console.log(`\n✓ Backend server running on http://localhost:${PORT}`);
+      console.log(`✓ Serving uploads from: ${uploadsDir}`);
+      console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
+      console.log(`✓ Uploads URL base: http://localhost:${PORT}/uploads/`);
       console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n`);
     });
   } catch (error) {

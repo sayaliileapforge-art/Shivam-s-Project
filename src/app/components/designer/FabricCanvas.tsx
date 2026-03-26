@@ -8,6 +8,14 @@ import {
 import * as fabric from "fabric";
 import QRCode from "qrcode";
 import { mmToPx, type TemplateConfig } from "../../../lib/fabricUtils";
+import {
+  applyImageFit,
+  applyMaskAndBorder,
+  applyTextFit,
+  renderTemplateWithData as renderTemplateWithDataUtil,
+  type MaskBorderOptions,
+  type VariableRenderInput,
+} from "../../../lib/variableRendering";
 
 // ─── Public handle ────────────────────────────────────────────────────────────
 
@@ -25,7 +33,9 @@ export interface FabricCanvasHandle {
   addImage: (dataUrl: string) => void;
   addQRCode: (text: string) => void;
   addBarcode: (text: string) => void;
-  addDynamicField: (fieldKey: string) => void;
+  addDynamicField: (fieldKey: string, placement?: { x: number; y: number }) => void;
+  renderTemplateWithData: (template: Record<string, any> | null, data: VariableRenderInput) => Promise<string>;
+  applyMaskAndBorderToSelected: (options?: MaskBorderOptions) => void;
   /** Add a scalable SVG from an SVG string. */
   addSVG: (svgString: string) => void;
   /** Apply a PNG image as a transparency mask onto the selected FabricImage. */
@@ -72,6 +82,17 @@ export interface FabricCanvasHandle {
   canRedo: () => boolean;
   resetHistory: () => void;
   constrainSelectedToSafeArea: () => void;
+  getElementMetadata: () => Array<{
+    id: string;
+    type: string;
+    fieldKey: string | null;
+    fieldKind: string | null;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    rotation: number;
+  }>;
 }
 
 export type ImageMaskShape =
@@ -95,6 +116,7 @@ export type ImageMaskShape =
 interface Props {
   config: TemplateConfig;
   showMargins: boolean;
+  guideMode?: "outer" | "safe" | "both";
   onSelectionChange: (obj: fabric.FabricObject | null) => void;
   /** Scale factor to shrink the canvas to fit the viewport (0 < displayScale <= 1). Default: 1 */
   displayScale: number;
@@ -108,11 +130,15 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
   ({ config, showMargins, onSelectionChange, displayScale, onBgChange }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const fabricRef = useRef<fabric.Canvas | null>(null);
-    const marginGroupRef = useRef<fabric.Group | null>(null);
-    const displayScaleRef = useRef(displayScale);
-    displayScaleRef.current = displayScale;
+    const marginGroupRef = useRef<fabric.FabricObject | null>(null);
+    // Keep Fabric's internal coordinate system unscaled so zoom never mutates
+    // object positions/sizes in model space.
+    const displayScaleRef = useRef(1);
+    displayScaleRef.current = 1;
     const configRef = useRef(config);
     configRef.current = config;
+    const onSelectionChangeRef = useRef(onSelectionChange);
+    onSelectionChangeRef.current = onSelectionChange;
     const onBgChangeRef = useRef(onBgChange);
     onBgChangeRef.current = onBgChange;
     // Stores the raw CSS color/gradient string for serialisation
@@ -126,26 +152,393 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     // Track background position offset for contain mode
     const bgOffsetRef = useRef({ x: 0, y: 0 });
     // Undo/redo history stacks (serialized JSON snapshots)
-    const historyRef = useRef<string[]>([]);
-    const historyIndexRef = useRef(-1);
+    const HISTORY_LIMIT = 30;
+    const undoStackRef = useRef<string[]>([]);
+    const redoStackRef = useRef<string[]>([]);
     const ignoreSaveRef = useRef(false);
+    const drawMarginsRef = useRef<() => void>(() => {});
     // Track layer lock states: Map of object id → locked boolean
     const layerLockedRef = useRef<Map<string, boolean>>(new Map());
     // Layer counter for generating unique IDs
     const layerCounterRef = useRef(0);
 
-    const canvasPxW = Math.round(mmToPx(config.canvas.width) * displayScale);
-    const canvasPxH = Math.round(mmToPx(config.canvas.height) * displayScale);
+    const canvasPxW = Math.round(mmToPx(config.canvas.width));
+    const canvasPxH = Math.round(mmToPx(config.canvas.height));
+    const viewportCanvasPxW = Math.max(1, Math.round(canvasPxW * displayScale));
+    const viewportCanvasPxH = Math.max(1, Math.round(canvasPxH * displayScale));
+
+    const getSafeAreaRectPx = useCallback((cfg: TemplateConfig, scale: number) => {
+      const canvasWidth = mmToPx(Math.max(0, Number(cfg.canvas.width) || 0));
+      const canvasHeight = mmToPx(Math.max(0, Number(cfg.canvas.height) || 0));
+
+      let leftMargin = mmToPx(Math.max(0, Number(cfg.margin.left) || 0));
+      let rightMargin = mmToPx(Math.max(0, Number(cfg.margin.right) || 0));
+      let topMargin = mmToPx(Math.max(0, Number(cfg.margin.top) || 0));
+      let bottomMargin = mmToPx(Math.max(0, Number(cfg.margin.bottom) || 0));
+
+      const horizontalMargins = leftMargin + rightMargin;
+      if (horizontalMargins >= canvasWidth && horizontalMargins > 0) {
+        const shrink = Math.max(0, (canvasWidth - 1) / horizontalMargins);
+        leftMargin *= shrink;
+        rightMargin *= shrink;
+      }
+
+      const verticalMargins = topMargin + bottomMargin;
+      if (verticalMargins >= canvasHeight && verticalMargins > 0) {
+        const shrink = Math.max(0, (canvasHeight - 1) / verticalMargins);
+        topMargin *= shrink;
+        bottomMargin *= shrink;
+      }
+
+      const innerX = leftMargin;
+      const innerY = topMargin;
+      const innerWidth = Math.max(1, canvasWidth - (leftMargin + rightMargin));
+      const innerHeight = Math.max(1, canvasHeight - (topMargin + bottomMargin));
+
+      return {
+        x: innerX * scale,
+        y: innerY * scale,
+        width: innerWidth * scale,
+        height: innerHeight * scale,
+        right: (innerX + innerWidth) * scale,
+        bottom: (innerY + innerHeight) * scale,
+        debug: {
+          canvasWidth,
+          canvasHeight,
+          leftMargin,
+          rightMargin,
+          topMargin,
+          bottomMargin,
+          innerX,
+          innerY,
+          innerWidth,
+          innerHeight,
+        },
+      };
+    }, []);
+
+    const SERIALIZABLE_PROPS = [
+      "excludeFromExport",
+      "isBgImage",
+      "maskShape",
+      "maskRadius",
+      "__uid",
+      "__layerName",
+      "__fieldKey",
+      "__fieldKind",
+      "__isDynamicField",
+      "variableKey",
+      "__boxWidth",
+      "__boxHeight",
+      "__maskOptions",
+      "_originalSrc",
+    ] as const;
+
+    const createHistorySnapshot = useCallback((fc: fabric.Canvas): string => {
+      const json = (fc as any).toJSON(["selectable", "evented"]) as Record<string, unknown>;
+      const objects = Array.isArray(json.objects) ? json.objects : [];
+      const liveObjects = fc.getObjects();
+      json.objects = objects.filter((_, index) => !(liveObjects[index] as any)?.isGuide);
+
+      const payload = {
+        canvas: json,
+        backgroundColor: fc.backgroundColor ?? null,
+        bgString: bgStringRef.current,
+      };
+
+      return JSON.stringify(payload);
+    }, []);
+
+    const pushUndoSnapshot = useCallback((clearRedo = true) => {
+      const fc = fabricRef.current;
+      if (!fc || ignoreSaveRef.current) return;
+
+      const snapshot = createHistorySnapshot(fc);
+      const lastSnapshot = undoStackRef.current[undoStackRef.current.length - 1];
+      if (lastSnapshot === snapshot) return;
+
+      undoStackRef.current.push(snapshot);
+      if (undoStackRef.current.length > HISTORY_LIMIT) {
+        undoStackRef.current.shift();
+      }
+
+      if (clearRedo) {
+        redoStackRef.current = [];
+      }
+    }, [createHistorySnapshot]);
+
+    const restoreHistorySnapshot = useCallback((snapshot: string) => {
+      const fc = fabricRef.current;
+      if (!fc) return;
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(snapshot);
+      } catch {
+        return;
+      }
+
+      const stateCanvas = parsed?.canvas ?? parsed;
+      const restoredBackgroundColor = parsed?.backgroundColor;
+      const restoredBgString = parsed?.bgString;
+
+      ignoreSaveRef.current = true;
+      fc.loadFromJSON(stateCanvas).then(() => {
+        // Remove guide artifacts that may exist in legacy snapshots.
+        fc.getObjects()
+          .filter((obj) => (obj as any).isGuide)
+          .forEach((obj) => fc.remove(obj));
+
+        if (restoredBackgroundColor !== undefined) {
+          fc.backgroundColor = restoredBackgroundColor;
+        }
+
+        if (typeof restoredBgString === "string") {
+          bgStringRef.current = restoredBgString;
+          onBgChangeRef.current?.(restoredBgString);
+        }
+
+        fc.getObjects().forEach((obj) => {
+          obj.set({ hasControls: false });
+        });
+
+        drawMarginsRef.current();
+        fc.discardActiveObject();
+        onSelectionChangeRef.current(null);
+        fc.renderAll();
+        ignoreSaveRef.current = false;
+      });
+    }, []);
+
+    const performUndo = useCallback(() => {
+      if (ignoreSaveRef.current) return;
+      if (undoStackRef.current.length <= 1) return;
+
+      const currentSnapshot = undoStackRef.current.pop();
+      if (currentSnapshot) {
+        redoStackRef.current.push(currentSnapshot);
+        if (redoStackRef.current.length > HISTORY_LIMIT) {
+          redoStackRef.current.shift();
+        }
+      }
+
+      const previousSnapshot = undoStackRef.current[undoStackRef.current.length - 1];
+      if (previousSnapshot) {
+        restoreHistorySnapshot(previousSnapshot);
+      }
+    }, [restoreHistorySnapshot]);
+
+    const performRedo = useCallback(() => {
+      if (ignoreSaveRef.current) return;
+      if (redoStackRef.current.length === 0) return;
+
+      const nextSnapshot = redoStackRef.current.pop();
+      if (!nextSnapshot) return;
+
+      undoStackRef.current.push(nextSnapshot);
+      if (undoStackRef.current.length > HISTORY_LIMIT) {
+        undoStackRef.current.shift();
+      }
+
+      restoreHistorySnapshot(nextSnapshot);
+    }, [restoreHistorySnapshot]);
+
+    const normalizeFieldKey = (key: string): string => key.trim().replace(/[{}\s]+/g, "_").toLowerCase();
+    const isImageFieldKey = (key: string): boolean =>
+      ["photo", "avatar", "image", "picture", "student_photo", "profile_image"].includes(key);
+    const isBarcodeFieldKey = (key: string): boolean =>
+      ["barcode", "bar_code", "qr", "qrcode", "qr_code"].includes(key);
+
+    const extractElementMetadata = useCallback((fc: fabric.Canvas) => {
+      const objects = fc.getObjects().filter((obj) => !(obj as any).excludeFromExport && !(obj as any).isBgImage);
+      return objects.map((obj, index) => ({
+        id: String((obj as any).__uid || `layer-${index + 1}`),
+        type: String((obj as any).__fieldKind || obj.type || "object"),
+        fieldKey: ((obj as any).__fieldKey as string | undefined) ?? null,
+        fieldKind: ((obj as any).__fieldKind as string | undefined) ?? null,
+        x: Math.round((obj.left ?? 0) * 100) / 100,
+        y: Math.round((obj.top ?? 0) * 100) / 100,
+        width: Math.round(obj.getScaledWidth() * 100) / 100,
+        height: Math.round(obj.getScaledHeight() * 100) / 100,
+        rotation: Math.round((obj.angle ?? 0) * 100) / 100,
+      }));
+    }, []);
+
+    const placeBackgroundObject = useCallback((
+      obj: fabric.FabricObject,
+      canvasW: number,
+      canvasH: number,
+      mode: "cover" | "contain",
+      offsetX = 0,
+      offsetY = 0
+    ) => {
+      const srcW = obj.width ?? 1;
+      const srcH = obj.height ?? 1;
+      if (srcW <= 0 || srcH <= 0 || canvasW <= 0 || canvasH <= 0) return;
+
+      const scale = mode === "cover"
+        ? Math.max(canvasW / srcW, canvasH / srcH)
+        : Math.min(canvasW / srcW, canvasH / srcH);
+
+      obj.set({
+        originX: "center",
+        originY: "center",
+        scaleX: scale,
+        scaleY: scale,
+        left: canvasW / 2 + offsetX,
+        top: canvasH / 2 + offsetY,
+      });
+      obj.setCoords();
+    }, []);
+
+    const getCanvasBackgroundObject = useCallback((fc: fabric.Canvas): fabric.FabricObject | null => {
+      const bg = (fc as any).backgroundImage as fabric.FabricObject | undefined;
+      return bg ?? null;
+    }, []);
+
+    const setCanvasBackgroundObject = useCallback((fc: fabric.Canvas, obj: fabric.FabricObject | null) => {
+      const anyCanvas = fc as any;
+      if (typeof anyCanvas.setBackgroundImage === "function") {
+        anyCanvas.setBackgroundImage(obj, () => fc.requestRenderAll());
+      }
+      anyCanvas.backgroundImage = obj ?? undefined;
+      if (obj) {
+        obj.set({ selectable: false, evented: false } as any);
+      }
+      fc.requestRenderAll();
+    }, []);
+
+    const removeLegacyBackgroundArtifacts = useCallback((fc: fabric.Canvas) => {
+      const canvasW = Math.max(1, fc.getWidth());
+      const canvasH = Math.max(1, fc.getHeight());
+
+      const candidates = fc
+        .getObjects()
+        .filter((obj) => {
+          const anyObj = obj as any;
+          if (anyObj.isBgImage || anyObj.excludeFromExport) return false;
+          if (anyObj.__uid || anyObj.__layerName || anyObj.__isDynamicField) return false;
+          if (obj.selectable !== false || obj.evented !== false) return false;
+          if (obj.type !== "image" && obj.type !== "group") return false;
+
+          const areaRatio = (obj.getScaledWidth() * obj.getScaledHeight()) / (canvasW * canvasH);
+          const nearTopLeft = (obj.left ?? 0) <= canvasW * 0.12 && (obj.top ?? 0) <= canvasH * 0.12;
+          return areaRatio >= 0.08 || nearTopLeft;
+        });
+
+      candidates.forEach((obj) => fc.remove(obj));
+    }, []);
+
+    const addDynamicFieldObject = useCallback((
+      fc: fabric.Canvas,
+      rawFieldKey: string,
+      placement?: { x: number; y: number }
+    ) => {
+      const fieldKey = normalizeFieldKey(rawFieldKey || "field");
+      if (!fieldKey) return;
+      const uid = `layer-${++layerCounterRef.current}`;
+      const { margin } = configRef.current;
+      const ds = displayScaleRef.current;
+      const left = placement?.x ?? mmToPx(margin.left) * ds;
+      const top = placement?.y ?? mmToPx(margin.top) * ds;
+      const isImageField = isImageFieldKey(fieldKey);
+      const isBarcodeField = isBarcodeFieldKey(fieldKey);
+      const label = `{{${fieldKey}}}`;
+
+      if (isImageField || isBarcodeField) {
+        const width = isBarcodeField ? 160 : 110;
+        const height = isBarcodeField ? 56 : 120;
+        const frame = new fabric.Rect({
+          left: 0,
+          top: 0,
+          width,
+          height,
+          fill: isBarcodeField ? "rgba(16,185,129,0.08)" : "rgba(56,189,248,0.08)",
+          stroke: isBarcodeField ? "#059669" : "#0284c7",
+          strokeDashArray: [5, 3],
+          rx: 8,
+          ry: 8,
+          selectable: false,
+          evented: false,
+        });
+        const caption = new fabric.Text(label, {
+          left: width / 2,
+          top: height / 2,
+          originX: "center",
+          originY: "center",
+          fontSize: 12,
+          fill: isBarcodeField ? "#047857" : "#0369a1",
+          fontStyle: "italic",
+          selectable: false,
+          evented: false,
+        });
+        const placeholder = new fabric.Group([frame, caption], {
+          left,
+          top,
+          hasControls: false,
+        });
+        (placeholder as any).__uid = uid;
+        (placeholder as any).__layerName = `Field: ${fieldKey}`;
+        (placeholder as any).__fieldKey = fieldKey;
+        (placeholder as any).__fieldKind = isBarcodeField ? "barcode" : "image";
+        (placeholder as any).__isDynamicField = true;
+        (placeholder as any).variableKey = fieldKey;
+        (placeholder as any).__boxWidth = width;
+        (placeholder as any).__boxHeight = height;
+        fc.add(placeholder);
+        fc.setActiveObject(placeholder);
+        fc.renderAll();
+        return;
+      }
+
+      const textBoxWidth = 180;
+      const textBoxHeight = 44;
+      const textField = new fabric.Textbox(label, {
+        left,
+        top,
+        width: textBoxWidth,
+        fontFamily: "Inter, sans-serif",
+        fontSize: 14,
+        fill: "#7c3aed",
+        fontStyle: "italic",
+        hasControls: false,
+        backgroundColor: "transparent",
+        backgroundPadding: 0,
+      });
+      (textField as any).__uid = uid;
+      (textField as any).__layerName = `Field: ${fieldKey}`;
+      (textField as any).__fieldKey = fieldKey;
+      (textField as any).__fieldKind = "text";
+      (textField as any).__isDynamicField = true;
+      (textField as any).variableKey = fieldKey;
+      (textField as any).__boxWidth = textBoxWidth;
+      (textField as any).__boxHeight = textBoxHeight;
+      fc.add(textField);
+      fc.setActiveObject(textField);
+      fc.renderAll();
+    }, []);
+
+    const getImageMaskClipPadding = useCallback((image: fabric.FabricImage): number => {
+      const borderWidth = Math.max(0, Number((image as any).fxBorderWidth ?? image.strokeWidth ?? 0));
+      if (!borderWidth) return 0;
+      // Fabric centers stroke on path edges; half can be clipped by clipPath unless mask is padded.
+      return borderWidth / 2;
+    }, []);
 
     const createImageMaskClipPath = useCallback(
       (
         image: fabric.FabricImage,
         shape: ImageMaskShape,
-        radius: number
+        radius: number,
+        padding = 0
       ): fabric.FabricObject | undefined => {
-        const w = image.width ?? 0;
-        const h = image.height ?? 0;
-        if (!w || !h || shape === "none") return undefined;
+        const baseW = image.width ?? 0;
+        const baseH = image.height ?? 0;
+        if (!baseW || !baseH || shape === "none") return undefined;
+
+        const safePad = Math.max(0, Number(padding || 0));
+        const w = baseW + safePad * 2;
+        const h = baseH + safePad * 2;
 
         if (shape === "circle") {
           return new fabric.Circle({
@@ -170,7 +563,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         }
 
         if (shape === "rounded" || shape === "rounded-rectangle") {
-          const maxRadius = Math.min(w, h) / 2;
+          const maxRadius = Math.min(baseW, baseH) / 2 + safePad;
           const safeRadius = Math.max(0, Math.min(radius, maxRadius));
           return new fabric.Rect({
             width: w,
@@ -359,16 +752,52 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     );
 
     const constrainObjectToSafeArea = useCallback((obj: fabric.FabricObject, fitText = false) => {
-      if (!obj || (obj as unknown as { excludeFromExport?: boolean }).excludeFromExport) return;
+      const anyObj = obj as any;
+      if (!obj || anyObj.excludeFromExport || anyObj.isBgImage || anyObj.isGuide) return;
 
-      const { margin, canvas } = configRef.current;
+      const cfg = configRef.current;
       const ds = displayScaleRef.current;
-      const safeLeft = mmToPx(margin.left) * ds;
-      const safeTop = mmToPx(margin.top) * ds;
-      const safeRight = mmToPx(canvas.width) * ds - mmToPx(margin.right) * ds;
-      const safeBottom = mmToPx(canvas.height) * ds - mmToPx(margin.bottom) * ds;
-      const safeWidth = Math.max(1, safeRight - safeLeft);
-      const safeHeight = Math.max(1, safeBottom - safeTop);
+      const fc = fabricRef.current;
+      const safeRect = getSafeAreaRectPx(cfg, ds);
+      const safeLeft = safeRect.x;
+      const safeTop = safeRect.y;
+      const safeRight = safeRect.right;
+      const safeBottom = safeRect.bottom;
+      const safeWidth = safeRect.width;
+      const safeHeight = safeRect.height;
+
+      const getBounds = () => {
+        const coords = obj.getCoords();
+        if (coords && coords.length > 0) {
+          const xs = coords.map((p) => p.x);
+          const ys = coords.map((p) => p.y);
+          const left = Math.min(...xs);
+          const right = Math.max(...xs);
+          const top = Math.min(...ys);
+          const bottom = Math.max(...ys);
+          return {
+            left,
+            top,
+            right,
+            bottom,
+            width: right - left,
+            height: bottom - top,
+          };
+        }
+
+        const left = obj.left ?? 0;
+        const top = obj.top ?? 0;
+        const width = obj.getScaledWidth();
+        const height = obj.getScaledHeight();
+        return {
+          left,
+          top,
+          right: left + width,
+          bottom: top + height,
+          width,
+          height,
+        };
+      };
 
       if (fitText && (obj instanceof fabric.IText || obj instanceof fabric.Textbox)) {
         let fontSize = Number(obj.fontSize ?? 16);
@@ -377,28 +806,47 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         obj.set({ scaleX: 1, scaleY: 1 });
         obj.setCoords();
 
-        while ((obj.getScaledWidth() > safeWidth || obj.getScaledHeight() > safeHeight) && fontSize > minFontSize) {
+        let bounds = getBounds();
+        while ((bounds.width > safeWidth || bounds.height > safeHeight) && fontSize > minFontSize) {
           fontSize -= 1;
           obj.set({ fontSize });
           obj.setCoords();
+          bounds = getBounds();
         }
       }
 
-      const objLeft = obj.left ?? 0;
-      const objTop = obj.top ?? 0;
-      const objRight = objLeft + obj.getScaledWidth();
-      const objBottom = objTop + obj.getScaledHeight();
+      let bounds = getBounds();
+      if (bounds.width > safeWidth || bounds.height > safeHeight) {
+        const scaleRatio = Math.min(
+          safeWidth / Math.max(bounds.width, 1),
+          safeHeight / Math.max(bounds.height, 1),
+          1
+        );
 
-      let newLeft = objLeft;
-      let newTop = objTop;
+        if (Number.isFinite(scaleRatio) && scaleRatio > 0 && scaleRatio < 1) {
+          obj.set({
+            scaleX: (obj.scaleX ?? 1) * scaleRatio,
+            scaleY: (obj.scaleY ?? 1) * scaleRatio,
+          });
+          obj.setCoords();
+          bounds = getBounds();
+        }
+      }
 
-      if (objLeft < safeLeft) newLeft = safeLeft;
-      if (objTop < safeTop) newTop = safeTop;
-      if (objRight > safeRight) newLeft = safeRight - obj.getScaledWidth();
-      if (objBottom > safeBottom) newTop = safeBottom - obj.getScaledHeight();
+      let dx = 0;
+      let dy = 0;
 
-      if (newLeft !== objLeft || newTop !== objTop) {
-        obj.set({ left: newLeft, top: newTop });
+      if (bounds.left < safeLeft) dx = safeLeft - bounds.left;
+      else if (bounds.right > safeRight) dx = safeRight - bounds.right;
+
+      if (bounds.top < safeTop) dy = safeTop - bounds.top;
+      else if (bounds.bottom > safeBottom) dy = safeBottom - bounds.bottom;
+
+      if (dx !== 0 || dy !== 0) {
+        obj.set({
+          left: (obj.left ?? 0) + dx,
+          top: (obj.top ?? 0) + dy,
+        });
         obj.setCoords();
       }
     }, []);
@@ -414,70 +862,178 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       containerRef.current.appendChild(canvasEl);
 
       const fc = new fabric.Canvas(canvasEl, {
-        width: canvasPxW,
-        height: canvasPxH,
+        width: viewportCanvasPxW,
+        height: viewportCanvasPxH,
         backgroundColor: "#ffffff",
         selection: true,
+        selectionColor: "rgba(0,0,0,0)",
+        selectionBorderColor: "rgba(0,0,0,0)",
+        selectionLineWidth: 0,
         preserveObjectStacking: true,
+        enableRetinaScaling: true,
       });
+
+      // Use Fabric viewport zoom (vector rerender) instead of CSS bitmap scaling.
+      fc.setViewportTransform([displayScale, 0, 0, displayScale, 0, 0]);
 
       // Disable resize controls on all objects
       fc.on("selection:created", (e) => {
         if (e.selected) {
           e.selected.forEach((obj) => {
-            obj.set({ hasControls: false, hasBorders: true, borderColor: "#999" });
+            const anyObj = obj as any;
+            const isLocked = anyObj.isGuide || anyObj.isBgImage || anyObj.excludeFromExport;
+            obj.set({
+              hasControls: !isLocked,
+              hasBorders: true,
+              borderColor: "#999",
+            });
+
+            if (!isLocked && obj instanceof fabric.Textbox) {
+              obj.set({
+                centeredScaling: true,
+                lockScalingY: true,
+                lockSkewingX: true,
+                lockSkewingY: true,
+              });
+              obj.setControlsVisibility({
+                tl: false,
+                tr: false,
+                bl: false,
+                br: false,
+                mt: false,
+                mb: false,
+                ml: true,
+                mr: true,
+                mtr: true,
+              });
+            }
           });
         }
-        onSelectionChange(e.selected?.[0] ?? null);
+        onSelectionChangeRef.current(e.selected?.[0] ?? null);
       });
       fc.on("selection:updated", (e) => {
         if (e.selected) {
           e.selected.forEach((obj) => {
-            obj.set({ hasControls: false, hasBorders: true, borderColor: "#999" });
+            const anyObj = obj as any;
+            const isLocked = anyObj.isGuide || anyObj.isBgImage || anyObj.excludeFromExport;
+            obj.set({
+              hasControls: !isLocked,
+              hasBorders: true,
+              borderColor: "#999",
+            });
+
+            if (!isLocked && obj instanceof fabric.Textbox) {
+              obj.set({
+                centeredScaling: true,
+                lockScalingY: true,
+                lockSkewingX: true,
+                lockSkewingY: true,
+              });
+              obj.setControlsVisibility({
+                tl: false,
+                tr: false,
+                bl: false,
+                br: false,
+                mt: false,
+                mb: false,
+                ml: true,
+                mr: true,
+                mtr: true,
+              });
+            }
           });
         }
-        onSelectionChange(e.selected?.[0] ?? null);
+        onSelectionChangeRef.current(e.selected?.[0] ?? null);
       });
-      fc.on("selection:cleared", () => onSelectionChange(null));
+      fc.on("selection:cleared", () => onSelectionChangeRef.current(null));
       
       // Disable controls on newly added objects
       fc.on("object:added", (e) => {
         if (e.target) {
-          e.target.set({ hasControls: false });
+          const anyObj = e.target as any;
+          const isLocked = anyObj.isGuide || anyObj.isBgImage || anyObj.excludeFromExport;
+          e.target.set({ hasControls: !isLocked });
+
+          if (!isLocked && e.target instanceof fabric.Textbox) {
+            e.target.set({
+              centeredScaling: true,
+              lockScalingY: true,
+              lockSkewingX: true,
+              lockSkewingY: true,
+            });
+            e.target.setControlsVisibility({
+              tl: false,
+              tr: false,
+              bl: false,
+              br: false,
+              mt: false,
+              mb: false,
+              ml: true,
+              mr: true,
+              mtr: true,
+            });
+          }
+
+          constrainObjectToSafeArea(e.target, true);
         }
       });
 
-      // Save history snapshot after each modification
-      const saveSnapshot = () => {
-        if (ignoreSaveRef.current) return;
-        const json = JSON.stringify(fc.toObject(["excludeFromExport", "isBgImage", "maskShape", "maskRadius"]));
-        // Truncate redo branch
-        historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
-        historyRef.current.push(json);
-        // Keep at most 30 snapshots (optimized for performance)
-        if (historyRef.current.length > 30) historyRef.current.shift();
-        historyIndexRef.current = historyRef.current.length - 1;
+      // Save history snapshot after each modification.
+      const saveSnapshot = (e?: { target?: fabric.FabricObject }) => {
+        if (e?.target && (e.target as any).isGuide) return;
+        pushUndoSnapshot(true);
       };
       fc.on("object:added", saveSnapshot);
       fc.on("object:modified", saveSnapshot);
       fc.on("object:removed", saveSnapshot);
+      fc.on("text:changed", saveSnapshot);
 
       // ── Clamp objects inside the margin safe-area ──────────────────────
       const clampToMargin = (e: { target?: fabric.FabricObject }) => {
         const obj = e.target;
         if (!obj) return;
-        constrainObjectToSafeArea(obj, true);
+        constrainObjectToSafeArea(obj, false);
+      };
+
+      const onObjectScaling = (e: { target?: fabric.FabricObject }) => {
+        const obj = e.target;
+        if (!obj) return;
+
+        if (obj instanceof fabric.Textbox) {
+          const center = obj.getCenterPoint();
+          const anyObj = obj as any;
+          const rawWidth = Number(obj.width || anyObj.__boxWidth || obj.getScaledWidth() || 80);
+          const rawHeight = Number(anyObj.__boxHeight || obj.height || obj.getScaledHeight() || 20);
+
+          const nextWidth = Math.max(40, rawWidth * Math.max(0.01, Number(obj.scaleX || 1)));
+          const nextHeight = Math.max(20, rawHeight * Math.max(0.01, Number(obj.scaleY || 1)));
+
+          obj.set({
+            width: nextWidth,
+            scaleX: 1,
+            scaleY: 1,
+          });
+
+          obj.setPositionByOrigin(center, "center", "center");
+
+          anyObj.__boxWidth = nextWidth;
+          anyObj.__boxHeight = nextHeight;
+          (obj as any).initDimensions?.();
+          obj.setCoords();
+        }
+
+        constrainObjectToSafeArea(obj, false);
       };
       fc.on("object:moving",  clampToMargin);
-      fc.on("object:scaling", clampToMargin);
+      fc.on("object:scaling", onObjectScaling);
       fc.on("object:rotating", clampToMargin);
       fc.on("object:modified", clampToMargin);
       fc.on("text:changed", clampToMargin);
 
       // Save initial blank canvas snapshot for history
-      const initialSnapshot = JSON.stringify(fc.toObject(["excludeFromExport", "isBgImage", "maskShape", "maskRadius"]));
-      historyRef.current.push(initialSnapshot);
-      historyIndexRef.current = 0;
+      const initialSnapshot = createHistorySnapshot(fc);
+      undoStackRef.current = [initialSnapshot];
+      redoStackRef.current = [];
 
       fabricRef.current = fc;
 
@@ -488,190 +1044,125 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         fabricRef.current = null;
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    }, [createHistorySnapshot, performRedo, performUndo, pushUndoSnapshot]);
 
     // ── Resize when config dims change ──────────────────────────────────────
     useEffect(() => {
       const fc = fabricRef.current;
       if (!fc) return;
-      fc.setDimensions({ width: canvasPxW, height: canvasPxH });
+      fc.setDimensions({ width: viewportCanvasPxW, height: viewportCanvasPxH });
+      fc.setViewportTransform([displayScale, 0, 0, displayScale, 0, 0]);
       
-      // Rescale background image to match new canvas size
-      const bgImage = fc.getObjects().find((o) => (o as any).isBgImage) as fabric.FabricImage | undefined;
-      if (bgImage) {
-        const canvasW = fc.getWidth();
-        const canvasH = fc.getHeight();
-        const imgW = bgImage.width ?? 100;
-        const imgH = bgImage.height ?? 100;
-        const imgAspect = imgW / imgH;
-        const canvasAspect = canvasW / canvasH;
-        
-        if (bgFitModeRef.current === "cover") {
-          // Cover mode: fill canvas, crop if necessary
-          let scaleX = 1, scaleY = 1;
-          if (imgAspect > canvasAspect) {
-            // Image wider: scale by height
-            scaleY = canvasH / imgH;
-            scaleX = scaleY;
-          } else {
-            // Image taller: scale by width
-            scaleX = canvasW / imgW;
-            scaleY = scaleX;
-          }
-          const scaledW = imgW * scaleX;
-          const scaledH = imgH * scaleY;
-          bgImage.set({
-            scaleX,
-            scaleY,
-            left: (canvasW - scaledW) / 2,
-            top: (canvasH - scaledH) / 2,
-          });
-        } else {
-          // Contain mode: fit within canvas, no cropping, apply offset
-          let scaleX = 1, scaleY = 1;
-          if (imgAspect > canvasAspect) {
-            // Image wider: scale by width
-            scaleX = canvasW / imgW;
-            scaleY = scaleX;
-          } else {
-            // Image taller: scale by height
-            scaleY = canvasH / imgH;
-            scaleX = scaleY;
-          }
-          const scaledW = imgW * scaleX;
-          const scaledH = imgH * scaleY;
-          const baseX = (canvasW - scaledW) / 2;
-          const baseY = (canvasH - scaledH) / 2;
-          bgImage.set({
-            scaleX,
-            scaleY,
-            left: baseX + bgOffsetRef.current.x,
-            top: baseY + bgOffsetRef.current.y,
-          });
-        }
+      // Rescale current background media (image/SVG) to match new canvas size
+      const bgObject = getCanvasBackgroundObject(fc);
+      if (bgObject) {
+        placeBackgroundObject(
+          bgObject,
+          fc.getWidth(),
+          fc.getHeight(),
+          bgFitModeRef.current,
+          bgOffsetRef.current.x,
+          bgOffsetRef.current.y
+        );
       }
       
       // Rescale SVG background using cover or contain scaling
       if (bgSVGRef.current) {
-        const svg = bgSVGRef.current;
-        const canvasW = fc.getWidth();
-        const canvasH = fc.getHeight();
-        const svgW = svg.width ?? 100;
-        const svgH = svg.height ?? 100;
-        const svgAspect = svgW / svgH;
-        const canvasAspect = canvasW / canvasH;
-        
-        let scaleX = 1, scaleY = 1;
-        if (bgFitModeRef.current === "cover") {
-          if (svgAspect > canvasAspect) {
-            scaleY = canvasH / svgH;
-            scaleX = scaleY;
-          } else {
-            scaleX = canvasW / svgW;
-            scaleY = scaleX;
-          }
-          const scaledW = svgW * scaleX;
-          const scaledH = svgH * scaleY;
-          svg.set({
-            scaleX,
-            scaleY,
-            left: (canvasW - scaledW) / 2,
-            top: (canvasH - scaledH) / 2,
-          });
-        } else {
-          if (svgAspect > canvasAspect) {
-            scaleX = canvasW / svgW;
-            scaleY = scaleX;
-          } else {
-            scaleY = canvasH / svgH;
-            scaleX = scaleY;
-          }
-          const scaledW = svgW * scaleX;
-          const scaledH = svgH * scaleY;
-          const baseX = (canvasW - scaledW) / 2;
-          const baseY = (canvasH - scaledH) / 2;
-          svg.set({
-            scaleX,
-            scaleY,
-            left: baseX + bgOffsetRef.current.x,
-            top: baseY + bgOffsetRef.current.y,
-          });
-        }
+        placeBackgroundObject(
+          bgSVGRef.current,
+          fc.getWidth(),
+          fc.getHeight(),
+          bgFitModeRef.current,
+          bgOffsetRef.current.x,
+          bgOffsetRef.current.y
+        );
       }
       
       fc.renderAll();
-    }, [canvasPxW, canvasPxH]);
+    }, [canvasPxW, canvasPxH, viewportCanvasPxW, viewportCanvasPxH, displayScale, getCanvasBackgroundObject, placeBackgroundObject]);
 
     // ── Margin guides ───────────────────────────────────────────────────────
     const drawMargins = useCallback(() => {
       const fc = fabricRef.current;
       if (!fc) return;
 
-      // Remove previous
+      // Remove previous tracked guide object.
       if (marginGroupRef.current) {
         fc.remove(marginGroupRef.current);
         marginGroupRef.current = null;
       }
+
+      // Remove stale guide artifacts from older render strategies.
+      fc.getObjects()
+        .filter((obj) => {
+          const anyObj = obj as any;
+          if (anyObj.isGuide) return true;
+
+          const stroke = String(anyObj.stroke ?? "");
+          const hasGuideStroke =
+            stroke.includes("59,130,246") || // old blue guide lines
+            stroke.includes("37,99,235") ||  // current blue guide lines
+            stroke.includes("107,114,128");  // old gray safe-area stroke
+          const hasDash = Array.isArray(anyObj.strokeDashArray) && anyObj.strokeDashArray.length > 0;
+          const nonInteractive = obj.selectable === false && obj.evented === false;
+          const legacyGuideType = obj.type === "line" || obj.type === "rect" || obj.type === "group";
+
+          return nonInteractive && hasDash && hasGuideStroke && legacyGuideType;
+        })
+        .forEach((obj) => fc.remove(obj));
 
       if (!showMargins) {
         fc.renderAll();
         return;
       }
 
-      const { margin, canvas } = config;
-      const w = Math.round(mmToPx(canvas.width) * displayScaleRef.current);
-      const h = Math.round(mmToPx(canvas.height) * displayScaleRef.current);
-      const t = mmToPx(margin.top) * displayScaleRef.current;
-      const l = mmToPx(margin.left) * displayScaleRef.current;
-      const r = mmToPx(margin.right) * displayScaleRef.current;
-      const b = mmToPx(margin.bottom) * displayScaleRef.current;
+      const safeRectPx = getSafeAreaRectPx(config, 1);
 
-      const lineOpts = {
-        stroke: "rgba(59,130,246,0.65)",
-        strokeWidth: 0.8,
-        strokeDashArray: [4, 3],
-        selectable: false,
-        evented: false,
-        excludeFromExport: true,
+      const safeAreaDebug = {
+        canvasWidth: safeRectPx.debug.canvasWidth,
+        canvasHeight: safeRectPx.debug.canvasHeight,
+        leftMargin: safeRectPx.debug.leftMargin,
+        rightMargin: safeRectPx.debug.rightMargin,
+        topMargin: safeRectPx.debug.topMargin,
+        bottomMargin: safeRectPx.debug.bottomMargin,
+        innerX: safeRectPx.debug.innerX,
+        innerY: safeRectPx.debug.innerY,
+        innerWidth: safeRectPx.debug.innerWidth,
+        innerHeight: safeRectPx.debug.innerHeight,
+        scale: 1,
+        marginMm: {
+          left: Number(config.margin.left) || 0,
+          right: Number(config.margin.right) || 0,
+          top: Number(config.margin.top) || 0,
+          bottom: Number(config.margin.bottom) || 0,
+        },
       };
+      console.log("[SafeAreaDebug]", safeAreaDebug);
+      console.log("[SafeAreaDebugJSON]", JSON.stringify(safeAreaDebug));
 
-      const lines: fabric.Line[] = [
-        new fabric.Line([l, 0, l, h], lineOpts),
-        new fabric.Line([w - r, 0, w - r, h], lineOpts),
-        new fabric.Line([0, t, w, t], lineOpts),
-        new fabric.Line([0, h - b, w, h - b], lineOpts),
-      ];
-
-      // Safe-area rect (filled semi-transparent)
       const safeRect = new fabric.Rect({
-        left: l,
-        top: t,
-        width: w - l - r,
-        height: h - t - b,
-        fill: "rgba(59,130,246,0.04)",
-        stroke: "rgba(59,130,246,0.3)",
-        strokeWidth: 0.6,
-        strokeDashArray: [5, 4],
+        left: safeRectPx.x,
+        top: safeRectPx.y,
+        width: safeRectPx.width,
+        height: safeRectPx.height,
+        fill: "rgba(0,0,0,0)",
+        stroke: "rgba(37,99,235,0.95)",
+        strokeWidth: 1,
+        strokeDashArray: [6, 6],
         selectable: false,
         evented: false,
         excludeFromExport: true,
       });
+      (safeRect as any).isGuide = true;
 
-      const group = new fabric.Group([...lines, safeRect], {
-        selectable: false,
-        evented: false,
-        excludeFromExport: true,
-      });
-
-      fc.add(group);
-      fc.sendObjectToBack(group);
-      marginGroupRef.current = group;
+      fc.add(safeRect);
+      fc.bringObjectToFront(safeRect);
+      marginGroupRef.current = safeRect;
       fc.renderAll();
-    // displayScale is included so zoom changes recreate this function and
-    // trigger the drawMargins useEffect below, keeping guides pixel-accurate.
     }, [config, showMargins, displayScale]);
 
     useEffect(() => {
+      drawMarginsRef.current = drawMargins;
       drawMargins();
     }, [drawMargins]);
 
@@ -707,13 +1198,20 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           const data = e.dataTransfer!.getData("application/json");
           const item = JSON.parse(data);
 
+          const rect = fc.upperCanvasEl.getBoundingClientRect();
+          const vpt = fc.viewportTransform ?? [1, 0, 0, 1, 0, 0];
+          const scaleX = Math.max(0.0001, Number(vpt[0] || 1));
+          const scaleY = Math.max(0.0001, Number(vpt[3] || 1));
+          const x = (e.clientX - rect.left - Number(vpt[4] || 0)) / scaleX;
+          const y = (e.clientY - rect.top - Number(vpt[5] || 0)) / scaleY;
+
+          if (item.type === "dynamic-field" && item.fieldKey) {
+            addDynamicFieldObject(fc, String(item.fieldKey), { x, y });
+            fc.renderAll();
+            return;
+          }
+
           if (item.id && (item.type === "shape" || item.type === "icon")) {
-            // Get drop position relative to canvas
-            const rect = (e.target as HTMLElement)?.getBoundingClientRect?.();
-            const canvasLeft = rect?.left || 0;
-            const canvasTop = rect?.top || 0;
-            const x = (e.clientX || 0) - canvasLeft;
-            const y = (e.clientY || 0) - canvasTop;
 
             const uid = `layer-${++layerCounterRef.current}`;
 
@@ -821,7 +1319,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         container.removeEventListener("dragleave", handleDragLeave);
         container.removeEventListener("drop", handleDrop);
       };
-    }, []);
+    }, [addDynamicFieldObject]);
 
     // ── Imperative API ──────────────────────────────────────────────────────
     useImperativeHandle(ref, () => ({
@@ -1169,29 +1667,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         }).catch(() => {});
       },
 
-      addDynamicField(fieldKey: string) {
+      addDynamicField(fieldKey: string, placement?: { x: number; y: number }) {
         const fc = fabricRef.current;
         if (!fc) return;
-        const uid = `layer-${++layerCounterRef.current}`;
-        const label = `{{${fieldKey}}}`;
-        const { margin: dfMargin } = configRef.current;
-        const dfDs = displayScaleRef.current;
-        const t = new fabric.IText(label, {
-          left: mmToPx(dfMargin.left) * dfDs,
-          top:  mmToPx(dfMargin.top)  * dfDs,
-          fontFamily: "Inter, sans-serif",
-          fontSize: 14,
-          fill: "#7c3aed",
-          fontStyle: "italic",
-          hasControls: false,
-          backgroundColor: "transparent",
-          backgroundPadding: 0,
-        });
-        (t as any).__uid = uid;
-        (t as any).__layerName = `Field: ${fieldKey}`;
-        fc.add(t);
-        fc.setActiveObject(t);
-        fc.renderAll();
+        addDynamicFieldObject(fc, fieldKey, placement);
       },
 
       addImage(dataUrl: string) {
@@ -1212,7 +1691,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             const imgDs = displayScaleRef.current;
             (img as any).__uid = uid;
             (img as any).__layerName = "Image";
-            img.set({ left: mmToPx(imgMargin.left) * imgDs, top: mmToPx(imgMargin.top) * imgDs, maskShape: "none", maskRadius: 24, _originalSrc: dataUrl, hasControls: false } as any);
+            img.set({ left: mmToPx(imgMargin.left) * imgDs, top: mmToPx(imgMargin.top) * imgDs, maskShape: "none", maskRadius: 24, _originalSrc: dataUrl, hasControls: true, hasBorders: true } as any);
             fc.add(img);
             fc.setActiveObject(img);
             fc.renderAll();
@@ -1244,37 +1723,11 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       },
 
       undo() {
-        const fc = fabricRef.current;
-        if (!fc || historyIndexRef.current <= 0) return;
-        historyIndexRef.current -= 1;
-        const snapshot = historyRef.current[historyIndexRef.current];
-        ignoreSaveRef.current = true;
-        fc.loadFromJSON(snapshot).then(() => {
-          // Disable controls on all loaded objects
-          fc.getObjects().forEach((obj) => {
-            obj.set({ hasControls: false });
-          });
-          fc.renderAll();
-          ignoreSaveRef.current = false;
-          onSelectionChange(null);
-        });
+        performUndo();
       },
 
       redo() {
-        const fc = fabricRef.current;
-        if (!fc || historyIndexRef.current >= historyRef.current.length - 1) return;
-        historyIndexRef.current += 1;
-        const snapshot = historyRef.current[historyIndexRef.current];
-        ignoreSaveRef.current = true;
-        fc.loadFromJSON(snapshot).then(() => {
-          // Disable controls on all loaded objects
-          fc.getObjects().forEach((obj) => {
-            obj.set({ hasControls: false });
-          });
-          fc.renderAll();
-          ignoreSaveRef.current = false;
-          onSelectionChange(null);
-        });
+        performRedo();
       },
 
       getCanvas() {
@@ -1284,29 +1737,67 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       loadFromJSON(json: object) {
         const fc = fabricRef.current;
         if (!fc) return;
+        ignoreSaveRef.current = true;
         fc.loadFromJSON(JSON.stringify(json)).then(() => {
+          // Remove stale helper overlays persisted by legacy versions.
+          fc.getObjects()
+            .filter((obj) => {
+              const anyObj = obj as any;
+              if (anyObj.isGuide || anyObj.excludeFromExport) return true;
+              const isLegacyGuideLine =
+                obj.type === "line" &&
+                obj.selectable === false &&
+                obj.evented === false &&
+                Array.isArray((obj as any).strokeDashArray) &&
+                ((obj as any).stroke ?? "").includes("59,130,246");
+              return isLegacyGuideLine;
+            })
+            .forEach((obj) => fc.remove(obj));
+
           // Disable controls on all loaded objects
           fc.getObjects().forEach((obj) => {
             obj.set({ hasControls: false });
           });
+
+          // If template has no explicit background, drop any stale background-image objects
+          // and keep a clean white base canvas.
+          const storedBg = (json as any)._bgString as string | undefined;
+          if (!storedBg || storedBg === "none") {
+            setCanvasBackgroundObject(fc, null);
+            fc.getObjects()
+              .filter((o) => (o as any).isBgImage)
+              .forEach((o) => fc.remove(o));
+            removeLegacyBackgroundArtifacts(fc);
+            fc.backgroundColor = "#ffffff";
+            bgStringRef.current = "#ffffff";
+            fc.discardActiveObject();
+            onSelectionChangeRef.current(null);
+          }
+
           fc.renderAll();
           drawMargins();
           // Restore bgString and notify parent
-          const storedBg = (json as any)._bgString as string | undefined;
           if (storedBg !== undefined) {
             bgStringRef.current = storedBg;
             onBgChangeRef.current?.(storedBg);
+          } else {
+            onBgChangeRef.current?.("none");
           }
+
+          ignoreSaveRef.current = false;
+          undoStackRef.current = [createHistorySnapshot(fc)];
+          redoStackRef.current = [];
         });
       },
 
       toJSON() {
         const fc = fabricRef.current;
         if (!fc) return {};
-        const json = fc.toObject(["excludeFromExport", "isBgImage", "maskShape", "maskRadius"]) as Record<string, unknown>;
+        const json = fc.toObject([...SERIALIZABLE_PROPS]) as Record<string, unknown>;
         json.objects = (json.objects as fabric.FabricObject[]).filter(
-          (o: { excludeFromExport?: boolean }) => !o.excludeFromExport
+          (o: { excludeFromExport?: boolean; isGuide?: boolean }) => !o.excludeFromExport && !o.isGuide
         );
+        json._elements = extractElementMetadata(fc);
         json._bgString = bgStringRef.current;
         return json;
       },
@@ -1314,12 +1805,29 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       toPNG() {
         const fc = fabricRef.current;
         if (!fc) return "";
-        marginGroupRef.current && fc.remove(marginGroupRef.current);
-        // Export at full print resolution: multiply back up from display scale
+        const prevClipPath = (fc as any).clipPath;
+        const prevBg = fc.backgroundColor;
+        if (!prevBg) fc.backgroundColor = "#ffffff";
+        (fc as any).clipPath = undefined;
+        fc.renderAll();
+
         const multiplier = Math.max(2, Math.ceil(1 / displayScaleRef.current));
-        const url = fc.toDataURL({ format: "png", multiplier });
-        marginGroupRef.current && fc.add(marginGroupRef.current);
-        fc.sendObjectToBack(marginGroupRef.current!);
+        const url = fc.toDataURL({
+          format: "png",
+          quality: 1,
+          multiplier,
+          left: 0,
+          top: 0,
+          width: fc.getWidth(),
+          height: fc.getHeight(),
+          filter: (obj: fabric.FabricObject) => {
+            const anyObj = obj as any;
+            return !anyObj.excludeFromExport && !anyObj.isGuide;
+          },
+        } as any);
+
+        (fc as any).clipPath = prevClipPath;
+        if (!prevBg) fc.backgroundColor = prevBg;
         fc.renderAll();
         return url;
       },
@@ -1327,11 +1835,29 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       toJPG() {
         const fc = fabricRef.current;
         if (!fc) return "";
-        marginGroupRef.current && fc.remove(marginGroupRef.current);
+        const prevClipPath = (fc as any).clipPath;
+        const prevBg = fc.backgroundColor;
+        if (!prevBg) fc.backgroundColor = "#ffffff";
+        (fc as any).clipPath = undefined;
+        fc.renderAll();
+
         const multiplier = Math.max(2, Math.ceil(1 / displayScaleRef.current));
-        const url = fc.toDataURL({ format: "jpeg", quality: 0.95, multiplier });
-        marginGroupRef.current && fc.add(marginGroupRef.current);
-        fc.sendObjectToBack(marginGroupRef.current!);
+        const url = fc.toDataURL({
+          format: "jpeg",
+          quality: 0.95,
+          multiplier,
+          left: 0,
+          top: 0,
+          width: fc.getWidth(),
+          height: fc.getHeight(),
+          filter: (obj: fabric.FabricObject) => {
+            const anyObj = obj as any;
+            return !anyObj.excludeFromExport && !anyObj.isGuide;
+          },
+        } as any);
+
+        (fc as any).clipPath = prevClipPath;
+        if (!prevBg) fc.backgroundColor = prevBg;
         fc.renderAll();
         return url;
       },
@@ -1441,7 +1967,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             ctx.fillStyle = "#ffffff";
           }
           ctx.fillRect(0, 0, offscreen.width, offscreen.height);
-          fc.backgroundColor = "transparent";
+          fc.backgroundColor = "#ffffff";
           fabric.FabricImage.fromURL(offscreen.toDataURL()).then((img) => {
             // Discard if a newer call has already started
             if (token !== bgTokenRef.current) return;
@@ -1449,18 +1975,18 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             fc.getObjects()
               .filter((o) => (o as any).isBgImage)
               .forEach((o) => fc.remove(o));
-            img.set({ left: 0, top: 0, selectable: false, evented: false, isBgImage: true, excludeFromExport: false } as any);
-            img.scaleToWidth(fc.getWidth());
-            img.scaleToHeight(fc.getHeight());
-            fc.add(img);
-            fc.sendObjectToBack(img);
-            // keep margin guides behind content but above bg
-            if (marginGroupRef.current) fc.sendObjectToBack(marginGroupRef.current);
+            placeBackgroundObject(img, fc.getWidth(), fc.getHeight(), "cover", 0, 0);
+            img.set({ selectable: false, evented: false, excludeFromExport: false } as any);
+            setCanvasBackgroundObject(fc, img);
+            if (marginGroupRef.current) fc.bringObjectToFront(marginGroupRef.current);
             fc.renderAll();
+            pushUndoSnapshot(true);
           });
         } else {
+          setCanvasBackgroundObject(fc, null);
           fc.backgroundColor = colorOrGradient;
           fc.renderAll();
+          pushUndoSnapshot(true);
         }
       },
 
@@ -1470,64 +1996,24 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         bgStringRef.current = "image";
         bgFitModeRef.current = fitMode;
         bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset
-        const existing = fc.getObjects().find((o) => (o as any).isBgImage);
-        if (existing) fc.remove(existing);
+        setCanvasBackgroundObject(fc, null);
+        fc.getObjects()
+          .filter((o) => (o as any).isBgImage)
+          .forEach((o) => fc.remove(o));
         bgSVGRef.current = null; // Clear SVG background
-        fc.backgroundColor = "transparent";
+        fc.backgroundColor = "#ffffff";
         fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" }).then((img) => {
-          const canvasW = fc.getWidth();
-          const canvasH = fc.getHeight();
-          const imgW = img.width ?? 100;
-          const imgH = img.height ?? 100;
-          const imgAspect = imgW / imgH;
-          const canvasAspect = canvasW / canvasH;
-          
-          let scaleX = 1, scaleY = 1;
-          if (fitMode === "cover") {
-            // Cover mode: fill canvas, crop if necessary
-            if (imgAspect > canvasAspect) {
-              scaleY = canvasH / imgH;
-              scaleX = scaleY;
-            } else {
-              scaleX = canvasW / imgW;
-              scaleY = scaleX;
-            }
-            const scaledW = imgW * scaleX;
-            const scaledH = imgH * scaleY;
-            img.set({
-              scaleX,
-              scaleY,
-              left: (canvasW - scaledW) / 2,
-              top: (canvasH - scaledH) / 2,
-              selectable: false,
-              evented: false,
-              isBgImage: true,
-            } as any);
-          } else {
-            // Contain mode: fit within canvas, no cropping
-            if (imgAspect > canvasAspect) {
-              scaleX = canvasW / imgW;
-              scaleY = scaleX;
-            } else {
-              scaleY = canvasH / imgH;
-              scaleX = scaleY;
-            }
-            const scaledW = imgW * scaleX;
-            const scaledH = imgH * scaleY;
-            img.set({
-              scaleX,
-              scaleY,
-              left: (canvasW - scaledW) / 2,
-              top: (canvasH - scaledH) / 2,
-              selectable: false,
-              evented: false,
-              isBgImage: true,
-            } as any);
-          }
-          fc.add(img);
-          fc.sendObjectToBack(img);
-          if (marginGroupRef.current) fc.sendObjectToBack(marginGroupRef.current);
+          placeBackgroundObject(img, fc.getWidth(), fc.getHeight(), fitMode, 0, 0);
+          img.set({
+            originX: "center",
+            originY: "center",
+            selectable: false,
+            evented: false,
+          } as any);
+          setCanvasBackgroundObject(fc, img);
+          if (marginGroupRef.current) fc.bringObjectToFront(marginGroupRef.current);
           fc.renderAll();
+          pushUndoSnapshot(true);
         });
       },
 
@@ -1538,12 +2024,14 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         bgFitModeRef.current = fitMode;
         bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset
         
+        setCanvasBackgroundObject(fc, null);
         // Remove existing background (image or SVG)
-        const existingBg = fc.getObjects().find((o) => (o as any).isBgImage);
-        if (existingBg) fc.remove(existingBg);
+        fc.getObjects()
+          .filter((o) => (o as any).isBgImage)
+          .forEach((o) => fc.remove(o));
         bgSVGRef.current = null;
         
-        fc.backgroundColor = "transparent";
+        fc.backgroundColor = "#ffffff";
         
         // Load SVG and apply appropriate scaling
         (fabric as any).loadSVGFromString(svgString)
@@ -1556,60 +2044,23 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
                 ? objs[0]
                 : new fabric.Group(objs, { left: 0, top: 0, ...result.options });
             
-            // Get SVG dimensions
-            const svgW = svgElement.width ?? 100;
-            const svgH = svgElement.height ?? 100;
-            const canvasW = fc.getWidth();
-            const canvasH = fc.getHeight();
-            const svgAspect = svgW / svgH;
-            const canvasAspect = canvasW / canvasH;
-            
-            let scaleX = 1, scaleY = 1;
-            if (fitMode === "cover") {
-              // Cover mode: fill canvas, crop if necessary
-              if (svgAspect > canvasAspect) {
-                scaleY = canvasH / svgH;
-                scaleX = scaleY;
-              } else {
-                scaleX = canvasW / svgW;
-                scaleY = scaleX;
-              }
-            } else {
-              // Contain mode: fit within canvas, no cropping
-              if (svgAspect > canvasAspect) {
-                scaleX = canvasW / svgW;
-                scaleY = scaleX;
-              } else {
-                scaleY = canvasH / svgH;
-                scaleX = scaleY;
-              }
-            }
-            
-            // Center the SVG
-            const scaledW = svgW * scaleX;
-            const scaledH = svgH * scaleY;
-            const offsetX = (canvasW - scaledW) / 2;
-            const offsetY = (canvasH - scaledH) / 2;
-            
             svgElement.set({
-              scaleX,
-              scaleY,
-              left: offsetX,
-              top: offsetY,
+              originX: "center",
+              originY: "center",
               selectable: false,
               evented: false,
-              isBgImage: true, // Mark as background for layer management
             } as any);
+            placeBackgroundObject(svgElement, fc.getWidth(), fc.getHeight(), fitMode, 0, 0);
             
             svgElement.setCoords();
-            fc.add(svgElement);
-            fc.sendObjectToBack(svgElement);
-            if (marginGroupRef.current) fc.sendObjectToBack(marginGroupRef.current);
+            setCanvasBackgroundObject(fc, svgElement);
+            if (marginGroupRef.current) fc.bringObjectToFront(marginGroupRef.current);
             
             // Store reference for zoom rescaling
             bgSVGRef.current = svgElement;
             
             fc.renderAll();
+            pushUndoSnapshot(true);
           })
           .catch(() => {/* SVG parse failed – silently ignore */});
       },
@@ -1619,11 +2070,13 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         if (!fc) return;
         bgFitModeRef.current = fitMode;
         bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset when changing mode
-        // Trigger resize effect to reapply scaling
-        const curW = fc.getWidth();
-        const curH = fc.getHeight();
-        fc.setDimensions({ width: curW, height: curH });
+        const bg = getCanvasBackgroundObject(fc);
+        if (bg) {
+          placeBackgroundObject(bg, fc.getWidth(), fc.getHeight(), fitMode, 0, 0);
+          setCanvasBackgroundObject(fc, bg);
+        }
         fc.renderAll();
+        pushUndoSnapshot(true);
       },
 
       moveBackground(offsetX: number, offsetY: number) {
@@ -1631,15 +2084,18 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         bgOffsetRef.current.y += offsetY;
         const fc = fabricRef.current;
         if (!fc) return;
-        const bg = fc.getObjects().find((o) => (o as any).isBgImage);
+        const bg = getCanvasBackgroundObject(fc);
         if (!bg) return;
         
         const canvasW = fc.getWidth();
         const canvasH = fc.getHeight();
-        const bgW = bg.getScaledWidth();
-        const bgH = bg.getScaledHeight();
-        const baseX = (canvasW - bgW) / 2;
-        const baseY = (canvasH - bgH) / 2;
+        const srcW = bg.width ?? 1;
+        const srcH = bg.height ?? 1;
+        const scale = bgFitModeRef.current === "cover"
+          ? Math.max(canvasW / srcW, canvasH / srcH)
+          : Math.min(canvasW / srcW, canvasH / srcH);
+        const bgW = srcW * scale;
+        const bgH = srcH * scale;
         
         // Clamp offset to prevent excessive dragging
         const maxOffsetX = (bgW - canvasW) / 2;
@@ -1648,42 +2104,50 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         bgOffsetRef.current.y = Math.max(-maxOffsetY, Math.min(maxOffsetY, bgOffsetRef.current.y));
         
         bg.set({
-          left: baseX + bgOffsetRef.current.x,
-          top: baseY + bgOffsetRef.current.y,
+          originX: "center",
+          originY: "center",
+          scaleX: scale,
+          scaleY: scale,
+          left: canvasW / 2 + bgOffsetRef.current.x,
+          top: canvasH / 2 + bgOffsetRef.current.y,
         });
+        setCanvasBackgroundObject(fc, bg);
         fc.renderAll();
+        pushUndoSnapshot(true);
       },
 
       resetBackgroundPosition() {
         bgOffsetRef.current = { x: 0, y: 0 };
         const fc = fabricRef.current;
         if (!fc) return;
-        const bg = fc.getObjects().find((o) => (o as any).isBgImage);
+        const bg = getCanvasBackgroundObject(fc);
         if (!bg) return;
         
         const canvasW = fc.getWidth();
         const canvasH = fc.getHeight();
-        const bgW = bg.getScaledWidth();
-        const bgH = bg.getScaledHeight();
-        
-        bg.set({
-          left: (canvasW - bgW) / 2,
-          top: (canvasH - bgH) / 2,
-        });
+        placeBackgroundObject(bg, canvasW, canvasH, bgFitModeRef.current, 0, 0);
+        setCanvasBackgroundObject(fc, bg);
         fc.renderAll();
+        pushUndoSnapshot(true);
       },
 
       clearBackground() {
         const fc = fabricRef.current;
         if (!fc) return;
-        bgStringRef.current = "";
+        bgStringRef.current = "none";
         ++bgTokenRef.current; // cancel any in-flight gradient renders
         bgSVGRef.current = null;
+        setCanvasBackgroundObject(fc, null);
         fc.getObjects()
           .filter((o) => (o as any).isBgImage)
           .forEach((o) => fc.remove(o));
-        fc.backgroundColor = "transparent";
+        removeLegacyBackgroundArtifacts(fc);
+        fc.backgroundColor = "#ffffff";
+        fc.discardActiveObject();
+        onSelectionChange(null);
+        onBgChangeRef.current?.("none");
         fc.renderAll();
+        pushUndoSnapshot(true);
       },
 
       bringForward() {
@@ -1715,7 +2179,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const obj = fc?.getActiveObject();
         if (!fc || !obj) return;
         fc.sendObjectToBack(obj);
-        if (marginGroupRef.current) fc.sendObjectToBack(marginGroupRef.current);
+        if (marginGroupRef.current) fc.bringObjectToFront(marginGroupRef.current);
         fc.renderAll();
       },
 
@@ -1723,14 +2187,13 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const fc = fabricRef.current;
         const obj = fc?.getActiveObject();
         if (!fc || !obj) return;
-        const { margin, canvas } = configRef.current;
-        const ds = displayScaleRef.current;
-        const safeLeft = mmToPx(margin.left) * ds;
-        const safeTop = mmToPx(margin.top) * ds;
-        const safeRight = mmToPx(canvas.width) * ds - mmToPx(margin.right) * ds;
-        const safeBottom = mmToPx(canvas.height) * ds - mmToPx(margin.bottom) * ds;
-        const safeW = Math.max(1, safeRight - safeLeft);
-        const safeH = Math.max(1, safeBottom - safeTop);
+        const safeRect = getSafeAreaRectPx(configRef.current, displayScaleRef.current);
+        const safeLeft = safeRect.x;
+        const safeTop = safeRect.y;
+        const safeRight = safeRect.right;
+        const safeBottom = safeRect.bottom;
+        const safeW = safeRect.width;
+        const safeH = safeRect.height;
 
         if (obj instanceof fabric.IText || obj instanceof fabric.Textbox) {
           // Recompute text dimensions before aligning to avoid stale bounds.
@@ -1777,7 +2240,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           maskShape?: ImageMaskShape;
           maskRadius?: number;
         };
-        const clipPath = createImageMaskClipPath(image, shape, radius);
+        const clipPath = createImageMaskClipPath(image, shape, radius, getImageMaskClipPadding(image));
         image.set({ clipPath });
         image.maskShape = shape;
         image.maskRadius = radius;
@@ -1799,7 +2262,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const shape = image.maskShape ?? "rounded";
         const normalizedShape: ImageMaskShape = shape === "none" ? "rounded" : shape;
         const safeRadius = Math.max(0, radius);
-        const clipPath = createImageMaskClipPath(image, normalizedShape, safeRadius);
+        const clipPath = createImageMaskClipPath(image, normalizedShape, safeRadius, getImageMaskClipPadding(image));
         image.set({ clipPath });
         image.maskShape = normalizedShape;
         image.maskRadius = safeRadius;
@@ -1815,52 +2278,19 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         if (!fc || !obj) return;
         if (!(obj instanceof fabric.IText)) return; // Textbox extends IText so this catches both
         const text = obj as fabric.IText;
+        const anyText = text as any;
+        const boxW = Math.max(40, Number(anyText.__boxWidth) || Number(text.getScaledWidth()) || 80);
+        const boxH = Math.max(20, Number(anyText.__boxHeight) || Number(text.getScaledHeight()) || 20);
 
-        // Compute the safe area (inside margins) in canvas px at current display scale
-        const { margin, canvas: canvasCfg } = configRef.current;
-        const ds = displayScaleRef.current;
-        const safeLeft   = mmToPx(margin.left)  * ds;
-        const safeTop    = mmToPx(margin.top)   * ds;
-        const maxW = mmToPx(canvasCfg.width  - margin.left - margin.right)  * ds;
-        const maxH = mmToPx(canvasCfg.height - margin.top  - margin.bottom) * ds;
+        anyText.__boxWidth = boxW;
+        anyText.__boxHeight = boxH;
 
-        // Reset any handle-scaling so fontSize is the sole size control
-        text.set({ scaleX: 1, scaleY: 1 });
-
-        // For Textbox, pin the width to the safe-area width before measuring
-        const isBox = obj instanceof fabric.Textbox;
-        if (isBox) {
-          (obj as fabric.Textbox).set({ width: maxW });
+        if (text instanceof fabric.Textbox) {
+          text.set({ width: boxW, scaleX: 1 });
         }
 
-        // Force Fabric to re-measure after every fontSize change.
-        // IMPORTANT: Textbox.initDimensions() can expand `width` via dynamicMinWidth
-        // when a single word is wider than the box (large font).  We must re-check
-        // *both* dimensions so those cases are correctly rejected.
-        const refreshDims = () => {
-          (text as any).initDimensions?.();
-          text.setCoords();
-        };
-
-        // Binary-search: largest font where text fits inside the safe area.
-        // CRITICAL: reset Textbox width to maxW at the START of every iteration.
-        // Fabric's initDimensions() expands `width` via dynamicMinWidth but NEVER
-        // auto-shrinks it.  Without a reset, the expanded value from a large-font
-        // iteration poisons all subsequent smaller-font checks, driving lo → 6.
-        let lo = 6, hi = 800;
-        while (hi - lo > 1) {
-          const mid = (lo + hi) >> 1;
-          text.set({ fontSize: mid });
-          if (isBox) (obj as fabric.Textbox).set({ width: maxW }); // reset BEFORE measuring
-          refreshDims();
-          if (text.width <= maxW && text.height <= maxH) lo = mid;
-          else hi = mid;
-        }
-
-        // Apply the found size; always restore the correct Textbox width
-        if (isBox) (obj as fabric.Textbox).set({ width: maxW });
-        text.set({ fontSize: lo, left: safeLeft, top: safeTop });
-        refreshDims();
+        applyTextFit(text, boxW, boxH);
+        constrainObjectToSafeArea(text, true);
         fc.fire("object:modified", { target: text });
         fc.renderAll();
       },
@@ -2045,31 +2475,61 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const fc = fabricRef.current;
         const active = fc?.getActiveObject();
         if (!fc || !active) return;
+        const anyActive = active as any;
+        const boxW = Math.max(
+          40,
+          Number(fixedWidth)
+          || Number(anyActive.__boxWidth)
+          || Number(active.getScaledWidth())
+          || 80
+        );
+        const boxH = Math.max(
+          20,
+          Number(anyActive.__boxHeight)
+          || Number(active.getScaledHeight())
+          || 20
+        );
+
         if (active instanceof fabric.Textbox) {
-          // Already a Textbox; just update width if provided
-          if (fixedWidth && fixedWidth > 0) {
-            (active as fabric.Textbox).set({ width: fixedWidth });
-            active.setCoords();
-            fc.fire("object:modified", { target: active });
-            fc.renderAll();
-          }
+          const tb = active as fabric.Textbox;
+          tb.set({ width: boxW, scaleX: 1 });
+          (tb as any).__boxWidth = boxW;
+          (tb as any).__boxHeight = boxH;
+          tb.setCoords();
+          fc.fire("object:modified", { target: active });
+          fc.renderAll();
           return;
         }
         if (!(active instanceof fabric.IText)) return;
         const it = active as fabric.IText;
+        const extraProps = {
+          __uid: anyActive.__uid,
+          __layerName: anyActive.__layerName,
+          __fieldKey: anyActive.__fieldKey,
+          __fieldKind: anyActive.__fieldKind,
+          __isDynamicField: anyActive.__isDynamicField,
+          variableKey: anyActive.variableKey,
+          __boxWidth: boxW,
+          __boxHeight: boxH,
+          backgroundColor: anyActive.backgroundColor,
+          backgroundPadding: anyActive.backgroundPadding,
+        };
         const tb = new fabric.Textbox(it.text ?? "", {
           left:       it.left,
           top:        it.top,
-          width:      fixedWidth ?? Math.max(80, it.getScaledWidth()),
+          width:      boxW,
           fontSize:   it.fontSize,
           fontFamily: it.fontFamily,
           fontWeight: it.fontWeight as string,
-          fontStyle:  it.fontStyle  as string,
+          fontStyle:  it.fontStyle as any,
           fill:       it.fill,
-          textAlign:  it.textAlign  as string,
+          textAlign:  it.textAlign as any,
           angle:      it.angle,
           opacity:    it.opacity,
           underline:  it.underline,
+          scaleX: 1,
+          scaleY: it.scaleY,
+          ...extraProps,
         });
         ignoreSaveRef.current = true;
         fc.remove(active);
@@ -2085,20 +2545,33 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const active = fc?.getActiveObject();
         if (!fc || !active || !(active instanceof fabric.Textbox)) return;
         const tb = active as fabric.Textbox;
+        const anyTb = tb as any;
+        const boxW = Math.max(40, Number(anyTb.__boxWidth) || Number(tb.getScaledWidth()) || 80);
+        const boxH = Math.max(20, Number(anyTb.__boxHeight) || Number(tb.getScaledHeight()) || 20);
         const it = new fabric.IText(tb.text ?? "", {
           left:       tb.left,
           top:        tb.top,
           fontSize:   tb.fontSize,
           fontFamily: tb.fontFamily,
           fontWeight: tb.fontWeight as string,
-          fontStyle:  tb.fontStyle  as string,
+          fontStyle:  tb.fontStyle as any,
           fill:       tb.fill,
-          textAlign:  tb.textAlign  as string,
+          textAlign:  tb.textAlign as any,
           angle:      tb.angle,
           opacity:    tb.opacity,
           underline:  tb.underline,
           backgroundColor: (tb as any).backgroundColor ?? "transparent",
           backgroundPadding: (tb as any).backgroundPadding ?? 0,
+          scaleX: tb.scaleX,
+          scaleY: tb.scaleY,
+          __uid: anyTb.__uid,
+          __layerName: anyTb.__layerName,
+          __fieldKey: anyTb.__fieldKey,
+          __fieldKind: anyTb.__fieldKind,
+          __isDynamicField: anyTb.__isDynamicField,
+          variableKey: anyTb.variableKey,
+          __boxWidth: boxW,
+          __boxHeight: boxH,
         });
         ignoreSaveRef.current = true;
         fc.remove(active);
@@ -2119,20 +2592,30 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         let tb: fabric.Textbox;
         if (active instanceof fabric.IText && !(active instanceof fabric.Textbox)) {
           const it = active as fabric.IText;
-          const vw = Math.max(80, it.getScaledWidth());
+          const anyIt = it as any;
+          const boxW = Math.max(40, Number(anyIt.__boxWidth) || Number(it.getScaledWidth()) || 80);
+          const boxH = Math.max(20, Number(anyIt.__boxHeight) || Number(it.getScaledHeight()) || 20);
           tb = new fabric.Textbox(it.text ?? "", {
             left:       it.left,
             top:        it.top,
-            width:      vw,
+            width:      boxW,
             fontSize:   it.fontSize,
             fontFamily: it.fontFamily,
             fontWeight: it.fontWeight as string,
-            fontStyle:  it.fontStyle  as string,
+            fontStyle:  it.fontStyle as any,
             fill:       it.fill,
-            textAlign:  it.textAlign  as string,
+            textAlign:  it.textAlign as any,
             angle:      it.angle,
             opacity:    it.opacity,
             underline:  it.underline,
+            __uid: anyIt.__uid,
+            __layerName: anyIt.__layerName,
+            __fieldKey: anyIt.__fieldKey,
+            __fieldKind: anyIt.__fieldKind,
+            __isDynamicField: anyIt.__isDynamicField,
+            variableKey: anyIt.variableKey,
+            __boxWidth: boxW,
+            __boxHeight: boxH,
           });
           ignoreSaveRef.current = true;
           fc.remove(active);
@@ -2145,40 +2628,60 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           return;
         }
 
-        // Capture the VISUAL width (before scale reset) — this is the "box" the user
-        // has drawn.  Use the canvas safe-area height as the target height, because
-        // Fabric Textbox height is auto-calculated from content (no fixed frame height).
-        const targetW = Math.max(80, tb.getScaledWidth());
-        const { margin, canvas: canvasCfg } = configRef.current;
-        const ds = displayScaleRef.current;
-        const targetH = mmToPx(canvasCfg.height - margin.top - margin.bottom) * ds;
+        const anyTb = tb as any;
+        const targetW = Math.max(40, Number(anyTb.__boxWidth) || Number(tb.getScaledWidth()) || 80);
+        const targetH = Math.max(20, Number(anyTb.__boxHeight) || Number(tb.getScaledHeight()) || 20);
+        anyTb.__boxWidth = targetW;
+        anyTb.__boxHeight = targetH;
 
-        // Reset scale and fix width to the visual width
         tb.set({ scaleX: 1, scaleY: 1, width: targetW });
-
-        const refreshDims = () => {
-          (tb as any).initDimensions?.();
-          tb.setCoords();
-        };
-
-        // Binary-search: largest font where text wraps within targetW and fits in targetH.
-        // CRITICAL: reset width to targetW at the START of every iteration.
-        // Fabric's initDimensions() expands `width` via dynamicMinWidth but NEVER
-        // auto-shrinks it.  Without a reset, the expanded value from a large-font
-        // iteration poisons all subsequent smaller-font checks, driving lo → 6.
-        let lo = 6, hi = Math.min(400, Math.ceil(targetH));
-        while (hi - lo > 1) {
-          const mid = (lo + hi) >> 1;
-          tb.set({ fontSize: mid, width: targetW }); // reset width BEFORE measuring
-          refreshDims();
-          if (tb.width <= targetW && tb.height <= targetH) lo = mid;
-          else hi = mid;
-        }
-        // Restore correct width after search
-        tb.set({ fontSize: lo, width: targetW });
-        refreshDims();
+        applyTextFit(tb, targetW, targetH);
         fc.fire("object:modified", { target: tb });
         fc.renderAll();
+      },
+
+      applyMaskAndBorderToSelected(options: MaskBorderOptions = {}) {
+        const fc = fabricRef.current;
+        const active = fc?.getActiveObject();
+        if (!fc || !active) return;
+
+        const anyActive = active as any;
+        if (!anyActive.__boxWidth || !anyActive.__boxHeight) {
+          anyActive.__boxWidth = Math.max(1, Number(active.width || active.getScaledWidth() || 1));
+          anyActive.__boxHeight = Math.max(1, Number(active.height || active.getScaledHeight() || 1));
+        }
+
+        applyMaskAndBorder(active, options);
+        fc.fire("object:modified", { target: active });
+        fc.renderAll();
+      },
+
+      async renderTemplateWithData(template: Record<string, any> | null, data: VariableRenderInput) {
+        const fc = fabricRef.current;
+        if (!fc) return "";
+
+        const preview = await renderTemplateWithDataUtil(fc, template, data);
+
+        // Ensure all text is clamped to its assigned dynamic box after replacement.
+        fc.getObjects().forEach((obj) => {
+          if (!(obj instanceof fabric.IText || obj instanceof fabric.Textbox)) return;
+          const anyObj = obj as any;
+          const boxW = Math.max(1, Number(anyObj.__boxWidth || obj.width || obj.getScaledWidth() || 1));
+          const boxH = Math.max(1, Number(anyObj.__boxHeight || obj.height || obj.getScaledHeight() || 20));
+          applyTextFit(obj, boxW, boxH);
+        });
+
+        // Ensure all images maintain aspect ratio and remain centered in their dynamic box.
+        fc.getObjects().forEach((obj) => {
+          if (!(obj instanceof fabric.FabricImage)) return;
+          const anyObj = obj as any;
+          const boxW = Math.max(1, Number(anyObj.__boxWidth || obj.width || obj.getScaledWidth() || 1));
+          const boxH = Math.max(1, Number(anyObj.__boxHeight || obj.height || obj.getScaledHeight() || 1));
+          applyImageFit(obj, boxW, boxH);
+        });
+
+        fc.renderAll();
+        return preview;
       },
 
       // ── Layer Management ────────────────────────────────────────────────
@@ -2228,19 +2731,19 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       },
 
       canUndo() {
-        return historyIndexRef.current > 0;
+        return undoStackRef.current.length > 1;
       },
 
       canRedo() {
-        return historyIndexRef.current < historyRef.current.length - 1;
+        return redoStackRef.current.length > 0;
       },
 
       resetHistory() {
         const fc = fabricRef.current;
         if (!fc) return;
-        const snapshot = JSON.stringify(fc.toObject(["excludeFromExport", "isBgImage", "maskShape", "maskRadius"]));
-        historyRef.current = [snapshot];
-        historyIndexRef.current = 0;
+        const snapshot = createHistorySnapshot(fc);
+        undoStackRef.current = [snapshot];
+        redoStackRef.current = [];
       },
 
       constrainSelectedToSafeArea() {
@@ -2251,12 +2754,23 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         constrainObjectToSafeArea(active, true);
         fc.requestRenderAll();
       },
+
+      getElementMetadata() {
+        const fc = fabricRef.current;
+        if (!fc) return [];
+        return extractElementMetadata(fc);
+      },
     }));
 
     return (
       <div
         ref={containerRef}
-        style={{ display: "block", boxShadow: "0 4px 24px rgba(0,0,0,0.12)" }}
+        style={{
+          display: "block",
+          width: `${viewportCanvasPxW}px`,
+          height: `${viewportCanvasPxH}px`,
+          boxShadow: "0 4px 24px rgba(0,0,0,0.12)",
+        }}
       />
     );
   }

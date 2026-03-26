@@ -254,6 +254,8 @@ export function MaskPanel({ selected, canvasRef, onRefresh }: Props) {
     image.set({
       stroke,
       strokeWidth: Math.max(0, next.borderWidth),
+      strokeLineJoin: "round",
+      strokeLineCap: "round",
       strokeUniform: true,
       opacity: Math.max(0, Math.min(1, next.opacity)),
       shadow,
@@ -280,6 +282,11 @@ export function MaskPanel({ selected, canvasRef, onRefresh }: Props) {
       fxGlowSize: next.glowSize,
       dirty: true,
     });
+
+    // Recompute clip path with stroke-aware padding so the full border remains visible.
+    if (image.maskShape && image.maskShape !== "none") {
+      canvasRef.current?.setImageBorderRadius(Number(image.maskRadius ?? 24));
+    }
 
     canvasRef.current?.getCanvas()?.requestRenderAll();
     onRefresh();

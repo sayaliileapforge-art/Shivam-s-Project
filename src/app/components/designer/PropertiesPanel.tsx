@@ -510,7 +510,7 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
 
                 {/* Auto-fit + Word Wrap buttons */}
                 <div className="grid grid-cols-2 gap-1.5 mb-2">
-                  <Button variant="outline" className="h-8 text-xs gap-1" title="Shrink font to fill canvas safe area"
+                  <Button variant="outline" className="h-8 text-xs gap-1" title="Shrink text to fit inside the current text box"
                     onClick={() => { canvasRef.current?.autoFitText(); onRefresh(); }}>
                     <Maximize2 className="h-3 w-3" /> Auto Size
                   </Button>
