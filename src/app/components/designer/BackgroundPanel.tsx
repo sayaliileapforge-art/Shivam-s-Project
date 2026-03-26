@@ -265,7 +265,7 @@ export function BackgroundPanel({
   ]);
   const [selectedStopId, setSelectedStopId] = useState("stop-0");
   const [savedFills, setSavedFills] = useState<SavedFill[]>(loadSavedFills);
-  const [imageFitMode, setImageFitMode] = useState<"cover" | "contain">("cover");
+  const [imageFitMode, setImageFitMode] = useState<"cover" | "contain">("contain");
   const barRef = useRef<HTMLDivElement>(null);
   const draggingStopRef = useRef<string | null>(null);
   const lastAppliedBgRef = useRef<string>("");
@@ -847,7 +847,7 @@ export function BackgroundPanel({
           </Button>
         )}
         <p className="text-[10px] text-muted-foreground mt-1">
-          Image will be scaled to fill the canvas (cover mode).
+          Upload an image to use as canvas background.
         </p>
       </div>
 
@@ -861,16 +861,6 @@ export function BackgroundPanel({
             </p>
             <div className="grid grid-cols-2 gap-1.5">
               <Button
-                variant={imageFitMode === "cover" ? "default" : "outline"}
-                className="h-8 text-xs"
-                onClick={() => {
-                  setImageFitMode("cover");
-                  onSetBackgroundFitMode?.("cover");
-                }}
-              >
-                Cover
-              </Button>
-              <Button
                 variant={imageFitMode === "contain" ? "default" : "outline"}
                 className="h-8 text-xs"
                 onClick={() => {
@@ -880,16 +870,26 @@ export function BackgroundPanel({
               >
                 Fit
               </Button>
+              <Button
+                variant={imageFitMode === "cover" ? "default" : "outline"}
+                className="h-8 text-xs"
+                onClick={() => {
+                  setImageFitMode("cover");
+                  onSetBackgroundFitMode?.("cover");
+                }}
+              >
+                Fill
+              </Button>
             </div>
             <p className="text-[9px] text-muted-foreground mt-1.5 leading-tight">
-              <strong>Cover:</strong> Fills canvas (crops image if needed)
+              <strong>Fit:</strong> Full image visible, centered, no cropping
               <br />
-              <strong>Fit:</strong> Image fits within canvas (no cropping)
+              <strong>Fill:</strong> Fills entire canvas (may crop edges)
             </p>
           </div>
 
-          {/* ── Position Controls (for contain mode) ──────────────────────── */}
-          {imageFitMode === "contain" && (
+          {/* ── Position Controls (both modes) ────────────────────────────── */}
+          {(imageFitMode === "contain" || imageFitMode === "cover") && (
             <>
               <Separator />
               <div>

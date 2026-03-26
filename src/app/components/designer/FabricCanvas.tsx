@@ -148,7 +148,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     // Track SVG background for zoom rescaling
     const bgSVGRef = useRef<fabric.Group | fabric.FabricObject | null>(null);
     // Track background fit mode: "cover" (fill canvas) or "contain" (fit with aspect ratio)
-    const bgFitModeRef = useRef<"cover" | "contain">("cover");
+    const bgFitModeRef = useRef<"cover" | "contain">("contain");
     // Track background position offset for contain mode
     const bgOffsetRef = useRef({ x: 0, y: 0 });
     // Undo/redo history stacks (serialized JSON snapshots)
@@ -397,11 +397,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     }, []);
 
     const setCanvasBackgroundObject = useCallback((fc: fabric.Canvas, obj: fabric.FabricObject | null) => {
-      const anyCanvas = fc as any;
-      if (typeof anyCanvas.setBackgroundImage === "function") {
-        anyCanvas.setBackgroundImage(obj, () => fc.requestRenderAll());
-      }
-      anyCanvas.backgroundImage = obj ?? undefined;
+      // Directly assign backgroundImage — avoids the deprecated setBackgroundImage(url, cb)
+      // which can reset position/scale in Fabric v6.
+      (fc as any).backgroundImage = obj ?? undefined;
       if (obj) {
         obj.set({ selectable: false, evented: false } as any);
       }
@@ -1058,8 +1056,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       if (bgObject) {
         placeBackgroundObject(
           bgObject,
-          fc.getWidth(),
-          fc.getHeight(),
+          canvasPxW,
+          canvasPxH,
           bgFitModeRef.current,
           bgOffsetRef.current.x,
           bgOffsetRef.current.y
@@ -1070,8 +1068,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       if (bgSVGRef.current) {
         placeBackgroundObject(
           bgSVGRef.current,
-          fc.getWidth(),
-          fc.getHeight(),
+          canvasPxW,
+          canvasPxH,
           bgFitModeRef.current,
           bgOffsetRef.current.x,
           bgOffsetRef.current.y
@@ -1975,7 +1973,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             fc.getObjects()
               .filter((o) => (o as any).isBgImage)
               .forEach((o) => fc.remove(o));
-            placeBackgroundObject(img, fc.getWidth(), fc.getHeight(), "cover", 0, 0);
+            const lW = Math.round(mmToPx(configRef.current.canvas.width));
+            const lH = Math.round(mmToPx(configRef.current.canvas.height));
+            placeBackgroundObject(img, lW, lH, "cover", 0, 0);
             img.set({ selectable: false, evented: false, excludeFromExport: false } as any);
             setCanvasBackgroundObject(fc, img);
             if (marginGroupRef.current) fc.bringObjectToFront(marginGroupRef.current);
@@ -1990,7 +1990,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         }
       },
 
-      setBackgroundImage(dataUrl: string, fitMode: "cover" | "contain" = "cover") {
+      setBackgroundImage(dataUrl: string, fitMode: "cover" | "contain" = "contain") {
         const fc = fabricRef.current;
         if (!fc) return;
         bgStringRef.current = "image";
@@ -2003,7 +2003,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         bgSVGRef.current = null; // Clear SVG background
         fc.backgroundColor = "#ffffff";
         fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" }).then((img) => {
-          placeBackgroundObject(img, fc.getWidth(), fc.getHeight(), fitMode, 0, 0);
+          const lW = Math.round(mmToPx(configRef.current.canvas.width));
+          const lH = Math.round(mmToPx(configRef.current.canvas.height));
+          placeBackgroundObject(img, lW, lH, fitMode, 0, 0);
           img.set({
             originX: "center",
             originY: "center",
@@ -2017,7 +2019,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         });
       },
 
-      setBackgroundSVG(svgString: string, fitMode: "cover" | "contain" = "cover") {
+      setBackgroundSVG(svgString: string, fitMode: "cover" | "contain" = "contain") {
         const fc = fabricRef.current;
         if (!fc) return;
         bgStringRef.current = "svg";
@@ -2050,7 +2052,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
               selectable: false,
               evented: false,
             } as any);
-            placeBackgroundObject(svgElement, fc.getWidth(), fc.getHeight(), fitMode, 0, 0);
+            const lW = Math.round(mmToPx(configRef.current.canvas.width));
+            const lH = Math.round(mmToPx(configRef.current.canvas.height));
+            placeBackgroundObject(svgElement, lW, lH, fitMode, 0, 0);
             
             svgElement.setCoords();
             setCanvasBackgroundObject(fc, svgElement);
@@ -2072,7 +2076,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset when changing mode
         const bg = getCanvasBackgroundObject(fc);
         if (bg) {
-          placeBackgroundObject(bg, fc.getWidth(), fc.getHeight(), fitMode, 0, 0);
+          const lW = Math.round(mmToPx(configRef.current.canvas.width));
+          const lH = Math.round(mmToPx(configRef.current.canvas.height));
+          placeBackgroundObject(bg, lW, lH, fitMode, 0, 0);
           setCanvasBackgroundObject(fc, bg);
         }
         fc.renderAll();
@@ -2087,8 +2093,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const bg = getCanvasBackgroundObject(fc);
         if (!bg) return;
         
-        const canvasW = fc.getWidth();
-        const canvasH = fc.getHeight();
+        const canvasW = Math.round(mmToPx(configRef.current.canvas.width));
+        const canvasH = Math.round(mmToPx(configRef.current.canvas.height));
         const srcW = bg.width ?? 1;
         const srcH = bg.height ?? 1;
         const scale = bgFitModeRef.current === "cover"
@@ -2097,9 +2103,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const bgW = srcW * scale;
         const bgH = srcH * scale;
         
-        // Clamp offset to prevent excessive dragging
-        const maxOffsetX = (bgW - canvasW) / 2;
-        const maxOffsetY = (bgH - canvasH) / 2;
+        // Clamp using abs so it works for both cover (bgW>canvasW) and contain (bgW<canvasW)
+        const maxOffsetX = Math.abs(bgW - canvasW) / 2;
+        const maxOffsetY = Math.abs(bgH - canvasH) / 2;
         bgOffsetRef.current.x = Math.max(-maxOffsetX, Math.min(maxOffsetX, bgOffsetRef.current.x));
         bgOffsetRef.current.y = Math.max(-maxOffsetY, Math.min(maxOffsetY, bgOffsetRef.current.y));
         
@@ -2123,8 +2129,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const bg = getCanvasBackgroundObject(fc);
         if (!bg) return;
         
-        const canvasW = fc.getWidth();
-        const canvasH = fc.getHeight();
+        const canvasW = Math.round(mmToPx(configRef.current.canvas.width));
+        const canvasH = Math.round(mmToPx(configRef.current.canvas.height));
         placeBackgroundObject(bg, canvasW, canvasH, bgFitModeRef.current, 0, 0);
         setCanvasBackgroundObject(fc, bg);
         fc.renderAll();
