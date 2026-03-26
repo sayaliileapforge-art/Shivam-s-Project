@@ -747,8 +747,39 @@ export function ProjectDetail() {
           results.forEach(({ file: f, dataUrl }) => {
             const baseName = f.name.replace(/\.[^.]+$/, "").toLowerCase().trim();
             const match = targets.find((r) => {
+              // 1. Match by SchoolCode_AdmissionNumber prefix (e.g. "44837_10_Nitin_.jpg")
+              const schoolCode = String(
+                r["School Code"] ?? r["schoolCode"] ?? r["school_code"] ?? ""
+              ).trim();
+              const admNo = String(
+                r["Admission Number"] ?? r["admissionNumber"] ?? r["admission_number"] ?? ""
+              ).trim();
+              if (schoolCode && admNo) {
+                const prefix = `${schoolCode}_${admNo}_`.toLowerCase();
+                if (baseName.startsWith(prefix)) return true;
+              }
+              // 2. Match by student name
               const name = String(r["Name"] ?? r["name"] ?? "").toLowerCase().trim();
-              return name === baseName || baseName.startsWith(name) || name.startsWith(baseName);
+              if (name === baseName || baseName.startsWith(name) || name.startsWith(baseName)) return true;
+              // 3. Match by name tokens appearing in filename segments
+              //    e.g. filename "44837_10_nitin_" contains segment "nitin" which matches name "nitin"
+              if (name) {
+                const segments = baseName.split("_").filter(Boolean);
+                const nameTokens = name.split(/\s+/);
+                if (nameTokens.every((token) => segments.includes(token))) return true;
+              }
+              // 4. Match by the record's existing photo field filename (for CSV-imported records
+              //    where the photo column contains a filename like "44837_10_Nitin_.jpg").
+              const existingPhoto = String(getRecordPhoto(r) || "");
+              const existingFilename = existingPhoto
+                .split("/").pop()!
+                .replace(/\.[^.]+$/, "")
+                .toLowerCase().trim();
+              return existingFilename.length > 0 && (
+                existingFilename === baseName ||
+                baseName.startsWith(existingFilename) ||
+                existingFilename.startsWith(baseName)
+              );
             });
             if (match) {
               const i = updated.findIndex((r) => r.id === match.id);

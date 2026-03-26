@@ -23,17 +23,22 @@ function resolveApiBase(): string {
 
 function resolveBackendOrigin(): string {
   const raw = getApiBaseEnv();
-  if (!raw) return 'http://localhost:5000';
+  if (!raw) {
+    // No env var set: use the current page's origin so that the Render proxy
+    // routes (/uploads/*, /api/*) or the Vite dev-server proxy handle requests.
+    return typeof window !== 'undefined' ? window.location.origin : '';
+  }
 
   if (/^https?:\/\//i.test(raw)) {
     try {
       return new URL(raw).origin;
     } catch {
-      return 'http://localhost:5000';
+      return '';
     }
   }
 
-  return 'http://localhost:5000';
+  // Relative path (e.g. "/api") – same-origin deployment or proxied via render.yaml.
+  return typeof window !== 'undefined' ? window.location.origin : '';
 }
 
 export const BACKEND_ORIGIN = resolveBackendOrigin();
@@ -67,7 +72,7 @@ export function resolveProfileImageUrl(profilePic?: string): string {
   return `${UPLOADS_BASE_URL}${encodeURIComponent(normalized)}`;
 }
 
-const API_BASE = resolveApiBase();
+export const API_BASE = resolveApiBase();
 
 interface ApiResponse<T> {
   success: boolean;

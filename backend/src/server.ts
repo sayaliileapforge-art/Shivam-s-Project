@@ -51,10 +51,17 @@ if (!fs.existsSync(uploadsDir)) {
 app.use('/uploads', express.static(uploadsDir));
 
 const studentPhotosDir = process.env.STUDENT_PHOTOS_DIR?.trim()
-  || 'C:/Users/Sayali/OneDrive/Sem-V/Photos';
+  || (process.env.NODE_ENV !== 'production' ? 'C:/Users/Sayali/OneDrive/Sem-V/Photos' : '');
 // Fallback lookup: if a file is not found in backend/uploads, also try student photos.
-app.use('/uploads', express.static(path.resolve(studentPhotosDir)));
-app.use('/student-photos', express.static(path.resolve(studentPhotosDir)));
+if (studentPhotosDir) {
+  const resolvedStudentDir = path.resolve(studentPhotosDir);
+  if (fs.existsSync(resolvedStudentDir)) {
+    app.use('/uploads', express.static(resolvedStudentDir));
+    app.use('/student-photos', express.static(resolvedStudentDir));
+  } else {
+    console.warn(`Student photos directory not found (skipped): ${resolvedStudentDir}`);
+  }
+}
 
 // Health check
 app.get('/health', (req, res) => {
@@ -86,7 +93,9 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`\n✓ Backend server running on http://localhost:${PORT}`);
       console.log(`✓ Serving uploads from: ${uploadsDir}`);
-      console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
+      if (studentPhotosDir && fs.existsSync(path.resolve(studentPhotosDir))) {
+        console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
+      }
       console.log(`✓ Uploads URL base: http://localhost:${PORT}/uploads/`);
       console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n`);
     });
