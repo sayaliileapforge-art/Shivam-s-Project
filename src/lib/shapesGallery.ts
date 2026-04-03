@@ -12,6 +12,35 @@ export interface ShapeItem {
   description?: string;
 }
 
+export function normalizeShapePreviewSvg(preview: string): string {
+  const trimmed = String(preview || "").trim();
+  if (!trimmed || !/^<svg\b/i.test(trimmed)) return "";
+
+  const withXmlns = /<svg\b[^>]*xmlns=/i.test(trimmed)
+    ? trimmed
+    : trimmed.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+
+  return withXmlns.replace(/<svg\b([^>]*)>/i, (full, attrs) => {
+    let next = String(attrs || "");
+    if (!/\bviewBox\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' viewBox="0 0 24 24"';
+    }
+    if (!/\bwidth\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' width="24"';
+    }
+    if (!/\bheight\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' height="24"';
+    }
+    if (!/\bstroke-linecap\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' stroke-linecap="round"';
+    }
+    if (!/\bstroke-linejoin\s*=\s*["'][^"']+["']/i.test(next)) {
+      next += ' stroke-linejoin="round"';
+    }
+    return `<svg${next}>`;
+  });
+}
+
 // ─── BASIC SHAPES ──────────────────────────────────────────────────────────
 
 export const BASIC_SHAPES: ShapeItem[] = [
@@ -254,8 +283,9 @@ export const SOCIAL_ICONS: ShapeItem[] = [
     label: "Twitter",
     category: "social",
     type: "icon",
-    preview: `<svg viewBox="0 0 24 24" fill="currentColor">
-      <path d="M23.953 4.57a10 10 0 002.856-9.515a9.954 9.954 0 01-2.825.856a4.958 4.958 0 00-8.848 3.348a4.987 4.987 0 00.127 1.133A14.137 14.137 0 012.23 1.949a4.958 4.958 0 001.534 6.61a4.922 4.922 0 01-2.245-.616c-.054 2.281 1.581 4.415 3.949 4.89a4.935 4.935 0 01-2.224.084a4.962 4.962 0 004.6 3.417A9.867 9.867 0 012 21.54a13.994 13.994 0 007.557 2.209c9.053 0 13.998-7.496 13.998-13.985c0-.21 0-.42-.015-.63A9.935 9.935 0 0024 4.59z"/>
+    preview: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+      <path d="M4 4l16 16"/>
+      <path d="M20 4 4 20"/>
     </svg>`,
   },
   {

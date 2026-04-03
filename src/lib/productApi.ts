@@ -1,6 +1,7 @@
 import { Product } from './productStore';
+import { resolveProfileImageUrl, API_BASE as API_ROOT } from './apiService';
 
-const API_BASE = '/api/products';
+const API_BASE = `${API_ROOT}/products`;
 
 export interface ProductPayload {
   name: string;
@@ -37,8 +38,10 @@ function normalizeProduct(item: any): Product {
     name: item.name || '',
     description: item.description || '',
     descriptionHtml: item.descriptionHtml || '',
-    images: Array.isArray(item.images) ? item.images : item.image ? [item.image] : [],
-    thumbnailImage: item.thumbnailImage || item.image || '',
+    images: Array.isArray(item.images)
+      ? item.images.map((u: string) => resolveProfileImageUrl(u)).filter(Boolean)
+      : item.image ? [resolveProfileImageUrl(item.image)].filter(Boolean) : [],
+    thumbnailImage: resolveProfileImageUrl(item.thumbnailImage || item.image || ''),
     videoUrl: item.videoUrl,
     youtubeLink: item.youtubeLink,
     instagramLink: item.instagramLink,

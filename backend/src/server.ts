@@ -4,11 +4,13 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import { connectDB } from './config/database';
+import { hasPostgresConfig, initAuthSchema, testAuthDbConnection } from './config/postgres';
 import projectRoutes from './routes/projects';
 import clientRoutes from './routes/clients';
 import productRoutes from './routes/products';
 import templateRoutes from './routes/templates';
 import orderRoutes from './routes/orders';
+import authRoutes from './routes/auth';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -74,6 +76,7 @@ app.use('/api/clients', clientRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/orders', orderRoutes);
+app.use('/api/auth', authRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -90,14 +93,23 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 async function startServer() {
   try {
     await connectDB();
+    if (hasPostgresConfig()) {
+      await testAuthDbConnection();
+      await initAuthSchema();
+    } else {
+      console.warn('! PostgreSQL auth config not found. Auth endpoints require PostgreSQL configuration.');
+    }
     app.listen(PORT, () => {
       console.log(`\n✓ Backend server running on http://localhost:${PORT}`);
+      if (hasPostgresConfig()) {
+        console.log('✓ PostgreSQL auth database connected successfully');
+      }
       console.log(`✓ Serving uploads from: ${uploadsDir}`);
       if (studentPhotosDir && fs.existsSync(path.resolve(studentPhotosDir))) {
         console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
       }
       console.log(`✓ Uploads URL base: http://localhost:${PORT}/uploads/`);
-      console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n`);
+      console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n  - /api/auth\n`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);

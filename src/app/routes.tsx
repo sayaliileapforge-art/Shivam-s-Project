@@ -16,6 +16,7 @@ import { Finance } from "./pages/Finance";
 import { Staff } from "./pages/Staff";
 import { Reports } from "./pages/Reports";
 import { RoleManagement } from "./pages/RoleManagement";
+import { Profile } from "./pages/Profile";
 import { Settings } from "./pages/Settings";
 import { ProjectTask } from "./pages/ProjectTask";
 import { Unauthorized } from "./pages/Unauthorized";
@@ -252,6 +253,12 @@ export const router = createBrowserRouter([
             <RoleManagement />
           </RouteGuard>
         ),
+      },
+
+      // Profile — all authenticated users
+      {
+        path: "profile",
+        Component: Profile,
       },
 
       // Settings — platform config

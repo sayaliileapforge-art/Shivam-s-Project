@@ -90,13 +90,14 @@ export function AddClient() {
 
   const validate = () => {
     const e: Partial<typeof emptyForm> = {};
-    if (!form.clientName.trim()) e.clientName = "Client name is required";
+    if (!form.clientName.trim()) e.clientName = "School / Institute / Company Name is required";
     if (!form.email.trim()) e.email = "Email is required";
     if (!form.contact.trim()) e.contact = "Contact is required";
     if (!form.deliveryMode) e.deliveryMode = "Select a delivery mode";
     if (!form.type) e.type = "Select a type";
     if (!form.state) e.state = "State is required";
     if (!form.district) e.district = "District is required";
+    if (!form.schoollogUniqueId.trim()) e.schoollogUniqueId = "School Unique ID is required";
     if (form.deliveryMode === "Bus") {
       if (!form.busStop.trim()) e.busStop = "Bus stop is required";
       if (!form.route.trim()) e.route = "Route is required";
@@ -141,11 +142,11 @@ export function AddClient() {
         <CardContent className="pt-6">
           <form onSubmit={handleSubmit} className="space-y-6">
 
-            {/* Row 1: Client Name | Email | Contact */}
+            {/* Row 1: School / Institute / Company Name | Email | Contact */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
               <div className="space-y-2">
-                <Label htmlFor="clientName">Client Name <span className="text-destructive">*</span></Label>
-                <Input id="clientName" placeholder="Client Name" value={form.clientName} onChange={set("clientName")} />
+                <Label htmlFor="clientName">School / Institute / Company Name <span className="text-destructive">*</span></Label>
+                <Input id="clientName" placeholder="School / Institute / Company Name" value={form.clientName} onChange={set("clientName")} />
                 {errors.clientName && <p className="text-xs text-destructive">{errors.clientName}</p>}
               </div>
               <div className="space-y-2">
@@ -268,16 +269,8 @@ export function AddClient() {
               <Input id="address" placeholder="Address" value={form.address} onChange={set("address")} />
             </div>
 
-            {/* Row 6: Pincode | City | State | District */}
+            {/* Row 6: State | District | City | Pincode */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
-              <div className="space-y-2">
-                <Label htmlFor="pincode">Pincode</Label>
-                <Input id="pincode" placeholder="Pincode" maxLength={6} value={form.pincode} onChange={set("pincode")} />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="city">City</Label>
-                <Input id="city" placeholder="City" value={form.city} onChange={set("city")} />
-              </div>
               <div className="space-y-2">
                 <Label>State</Label>
                 <Select value={form.state} onValueChange={(v) => setForm((f) => ({ ...f, state: v, district: "" }))}>
@@ -319,13 +312,22 @@ export function AddClient() {
                 </Select>
                 {errors.district && <div className="text-red-500 text-xs mt-1">{errors.district}</div>}
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="city">City</Label>
+                <Input id="city" placeholder="City" value={form.city} onChange={set("city")} />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="pincode">Pincode</Label>
+                <Input id="pincode" placeholder="Pincode" maxLength={6} value={form.pincode} onChange={set("pincode")} />
+              </div>
             </div>
 
-            {/* Row 7: Schoollog Unique Id */}
+            {/* Row 7: Unique ID */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
               <div className="space-y-2">
-                <Label htmlFor="schoollogUniqueId">Schoollog Unique Id</Label>
-                <Input id="schoollogUniqueId" placeholder="School Id" value={form.schoollogUniqueId} onChange={set("schoollogUniqueId")} />
+                <Label htmlFor="schoollogUniqueId" className="leading-snug">School / Institute / Company Unique ID <span className="text-destructive">*</span></Label>
+                <Input id="schoollogUniqueId" placeholder="School / Institute / Company Unique ID" value={form.schoollogUniqueId} onChange={set("schoollogUniqueId")} />
+                {errors.schoollogUniqueId && <p className="text-xs text-destructive">{errors.schoollogUniqueId}</p>}
               </div>
             </div>
 

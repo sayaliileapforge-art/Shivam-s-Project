@@ -9,6 +9,7 @@ export interface Project {
   name: string;
   client: string;
   clientId: string;
+  clientUniqueId?: string;
   stage: string;
   priority: "urgent" | "high" | "medium" | "low";
   dueDate: string;

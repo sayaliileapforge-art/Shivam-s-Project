@@ -1,12 +1,14 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
-import { Search, Palette, Globe, Lock } from "lucide-react";
+import { Search, Palette, Globe, Lock, Download } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Input } from "../components/ui/input";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
 import { loadAllProjectTemplates } from "../../lib/projectStore";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
+import { downloadTemplateAsPdf } from "../../lib/templatePdf";
+import { toast } from "sonner";
 
 const DESIGNER_IMPORT_MODE_KEY = "vendor_designer_import_mode";
 
@@ -40,6 +42,21 @@ export function TemplateGallery() {
     );
     localStorage.setItem(DESIGNER_IMPORT_MODE_KEY, "true");
     navigate("/designer-studio");
+  };
+
+  const handleDownloadPdf = async (templateId: string) => {
+    const template = templates.find((t) => t.id === templateId);
+    if (!template) {
+      toast.error("Template not found");
+      return;
+    }
+
+    try {
+      await downloadTemplateAsPdf(template);
+      toast.success("PDF downloaded");
+    } catch (error) {
+      toast.error((error as Error).message || "Failed to generate PDF");
+    }
   };
 
   return (
@@ -108,6 +125,13 @@ export function TemplateGallery() {
                   onClick={() => openInDesigner(t.id, t.projectId, t.templateName)}
                 >
                   <Palette className="h-4 w-4" /> Open and Customize
+                </Button>
+                <Button
+                  variant="outline"
+                  className="w-full gap-2"
+                  onClick={() => void handleDownloadPdf(t.id)}
+                >
+                  <Download className="h-4 w-4" /> Download PDF
                 </Button>
               </CardContent>
             </Card>

@@ -18,13 +18,14 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/t
 import { useRbac } from "../../lib/rbac/RbacContext";
 import { getNavForRole } from "../../lib/rbac/navigation";
 import { Role } from "../../lib/rbac/roles"
-import { MOCK_USERS } from "../../lib/rbac/mockUsers";
+import { clearAuthToken } from "../../lib/authApi";
 
 const SIDEBAR_COLLAPSED_KEY = "sidebar-collapsed";
 
 export function Layout() {
   const location = useLocation();
   const navigate = useNavigate();
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     const saved = localStorage.getItem(SIDEBAR_COLLAPSED_KEY);
@@ -63,6 +64,18 @@ export function Layout() {
   const toggleDarkMode = () => {
     setDarkMode(!darkMode);
     document.documentElement.classList.toggle("dark");
+  };
+
+  const handleProfileClick = () => {
+    console.log("[AccountMenu] Profile clicked");
+    setAccountMenuOpen(false);
+    navigate("/profile");
+  };
+
+  const handleSettingsClick = () => {
+    console.log("[AccountMenu] Settings clicked");
+    setAccountMenuOpen(false);
+    navigate("/settings");
   };
 
   return (
@@ -287,7 +300,7 @@ export function Layout() {
               )}
             </Button>
 
-            <DropdownMenu>
+            <DropdownMenu open={accountMenuOpen} onOpenChange={setAccountMenuOpen}>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" className="flex items-center gap-2 rounded-lg px-2 py-1.5 sm:px-3">
                   <Avatar className="h-8 w-8">
@@ -303,25 +316,20 @@ export function Layout() {
               <DropdownMenuContent align="end">
                 <DropdownMenuLabel>My Account</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem>Profile</DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to="/settings">Settings</Link>
+                <DropdownMenuItem disabled>
+                  {displayName} ({displayRole})
                 </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel>Switch User</DropdownMenuLabel>
-                {MOCK_USERS.map((mockUser) => (
-                  <DropdownMenuItem
-                    key={mockUser.id}
-                    onClick={() => setUser(mockUser)}
-                    className={mockUser.id === user?.id ? "bg-muted" : ""}
-                  >
-                    {mockUser.name}
-                  </DropdownMenuItem>
-                ))}
+                <DropdownMenuItem className="cursor-pointer hover:bg-accent" onClick={handleProfileClick}>
+                  Profile
+                </DropdownMenuItem>
+                <DropdownMenuItem className="cursor-pointer hover:bg-accent" onClick={handleSettingsClick}>
+                  Settings
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="text-destructive"
                   onClick={() => {
+                    clearAuthToken();
                     setUser(null);
                     navigate("/login", { replace: true });
                   }}

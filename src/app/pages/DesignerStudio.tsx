@@ -52,7 +52,7 @@ import {
   updateProjectTemplate, type Project,
 } from "../../lib/projectStore";
 import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
-import { type ShapeItem } from "../../lib/shapesGallery";
+import { normalizeShapePreviewSvg, type ShapeItem } from "../../lib/shapesGallery";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -639,9 +639,24 @@ export function DesignerStudio() {
       refresh();
     } else if (item.type === "icon" && item.preview) {
       // For icons, add as SVG
-      canvasRef.current?.addSVG(item.preview);
+      const normalized = normalizeShapePreviewSvg(item.preview);
+      if (!normalized) {
+        toast.error("This icon could not be parsed");
+        return;
+      }
+      canvasRef.current?.addSVG(normalized);
       refresh();
     }
+    setActiveTool("select");
+  }, [refresh]);
+
+  const handleCreateCustomShape = useCallback((shape: { kind: "polygon" | "star"; sidesOrPoints: number }) => {
+    if (shape.kind === "polygon") {
+      canvasRef.current?.addPolygon(shape.sidesOrPoints);
+    } else {
+      canvasRef.current?.addStar(shape.sidesOrPoints);
+    }
+    refresh();
     setActiveTool("select");
   }, [refresh]);
 
@@ -1828,6 +1843,7 @@ export function DesignerStudio() {
         isOpen={galleryOpen}
         onClose={() => setGalleryOpen(false)}
         onSelectItem={handleGalleryItemSelect}
+        onCreateCustomShape={handleCreateCustomShape}
         onDragStart={(item, e) => {
           e.dataTransfer.effectAllowed = "copy";
           e.dataTransfer.setData("application/json", JSON.stringify(item));

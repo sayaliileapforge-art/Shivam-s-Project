@@ -20,6 +20,9 @@ export interface RbacUser {
   /** Optional tenant scoping for multi-tenant setups */
   tenantId?: string;
   avatarInitials?: string;
+  firmName?: string;
+  profileImage?: string;
+  lastLoginAt?: string | null;
 }
 
 interface RbacContextValue {

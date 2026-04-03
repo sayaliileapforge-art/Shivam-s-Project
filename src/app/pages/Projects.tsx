@@ -27,9 +27,12 @@ import { ScrollArea, ScrollBar } from "../components/ui/scroll-area";
 import { Avatar, AvatarFallback } from "../components/ui/avatar";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../components/ui/dropdown-menu";
@@ -86,7 +89,6 @@ const getPriorityBadge = (priority: string) => {
 const emptyForm = {
   name: "",
   clientId: "",
-  workflowType: "variable_data" as "variable_data" | "direct_print",
   stage: "draft",
   priority: "medium" as Project["priority"],
   dueDate: "",
@@ -110,18 +112,25 @@ const mapApiProjectToUi = (p: any): Project => {
     assignee: String(p.assignee || ""),
     amount: Number(p.amount || 0),
     description: String(p.description || ""),
-    workflowType: (p.workflowType || "variable_data") as Project["workflowType"],
+    workflowType: (p.workflowType || "direct_print") as Project["workflowType"],
     createdAt: String(p.createdAt || new Date().toISOString()),
+    clientUniqueId: String(
+      populatedClient?.schoollogUniqueId
+      || p.clientUniqueId
+      || p.client_unique_id
+      || ""
+    ),
   };
 };
 
 interface ProjectCardProps {
   project: Project;
+  clientUniqueId: string;
   onDelete: (id: string) => void;
   onEdit: (project: Project) => void;
 }
 
-const ProjectCard = ({ project, onDelete, onEdit }: ProjectCardProps) => {
+const ProjectCard = ({ project, clientUniqueId, onDelete, onEdit }: ProjectCardProps) => {
   const [{ isDragging }, drag] = useDrag(() => ({
     type: "PROJECT",
     item: { id: project.id, stage: project.stage },
@@ -144,7 +153,9 @@ const ProjectCard = ({ project, onDelete, onEdit }: ProjectCardProps) => {
               {project.client}
             </h4>
           </Link>
-          <p className="text-xs text-muted-foreground mt-1">{project.id}</p>
+          <p className="text-xs text-muted-foreground mt-1 truncate" title={clientUniqueId}>
+            {clientUniqueId}
+          </p>
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -220,12 +231,13 @@ const ProjectCard = ({ project, onDelete, onEdit }: ProjectCardProps) => {
 interface KanbanColumnProps {
   stage: typeof stages[0];
   projects: Project[];
+  resolveClientUniqueId: (project: Project) => string;
   onDrop: (id: string, stage: string) => void;
   onDelete: (id: string) => void;
   onEdit: (project: Project) => void;
 }
 
-const KanbanColumn = ({ stage, projects, onDrop, onDelete, onEdit }: KanbanColumnProps) => {
+const KanbanColumn = ({ stage, projects, resolveClientUniqueId, onDrop, onDelete, onEdit }: KanbanColumnProps) => {
   const [{ isOver }, drop] = useDrop(() => ({
     accept: "PROJECT",
     drop: (item: { id: string; stage: string }) => {
@@ -258,7 +270,13 @@ const KanbanColumn = ({ stage, projects, onDrop, onDelete, onEdit }: KanbanColum
       <ScrollArea className="h-[calc(100vh-300px)]">
         <div className="p-4 space-y-3">
           {stageProjects.map((project) => (
-            <ProjectCard key={project.id} project={project} onDelete={onDelete} onEdit={onEdit} />
+            <ProjectCard
+              key={project.id}
+              project={project}
+              clientUniqueId={resolveClientUniqueId(project)}
+              onDelete={onDelete}
+              onEdit={onEdit}
+            />
           ))}
         </div>
       </ScrollArea>
@@ -271,6 +289,9 @@ export function Projects() {
   const [clients, setClients] = useState<Client[]>([]);
   const [allProjects, setAllProjects] = useState<Project[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
+  const [stageFilter, setStageFilter] = useState<string>("all");
+  const [priorityFilter, setPriorityFilter] = useState<string>("all");
+  const [overdueOnly, setOverdueOnly] = useState(false);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);
@@ -322,19 +343,45 @@ export function Projects() {
   }, [version]);
 
   void version;
+  const today = new Date();
 
-  const filtered = allProjects.filter(
-    (p) =>
+  const filtered = allProjects.filter((p) => {
+    const matchesSearch =
       p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       p.client.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      p.id.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+      p.id.toLowerCase().includes(searchQuery.toLowerCase());
+
+    const matchesStage = stageFilter === "all" || p.stage === stageFilter;
+    const matchesPriority = priorityFilter === "all" || p.priority === priorityFilter;
+
+    const isOverdue = Boolean(
+      p.dueDate
+      && p.stage !== "delivered"
+      && new Date(p.dueDate) < today
+    );
+    const matchesOverdue = !overdueOnly || isOverdue;
+
+    return matchesSearch && matchesStage && matchesPriority && matchesOverdue;
+  });
+
+  const activeFilterCount =
+    (stageFilter !== "all" ? 1 : 0)
+    + (priorityFilter !== "all" ? 1 : 0)
+    + (overdueOnly ? 1 : 0);
+
+  const resolveClientUniqueId = (project: Project): string => {
+    const fromProject = String((project as any).clientUniqueId || "").trim();
+    if (fromProject) return fromProject;
+
+    const matchedClient = clients.find((c) => String(c.id) === String(project.clientId));
+    const fromClient = String(matchedClient?.schoollogUniqueId || "").trim();
+    return fromClient || "N/A";
+  };
 
   const inProgress = allProjects.filter(
     (p) => !["delivered", "draft"].includes(p.stage)
   ).length;
   const completed = allProjects.filter((p) => p.stage === "delivered").length;
-  const today = new Date();
   const thisWeek = allProjects.filter((p) => {
     const created = new Date(p.createdAt);
     return (today.getTime() - created.getTime()) / (1000 * 60 * 60 * 24) <= 7;
@@ -372,7 +419,7 @@ export function Projects() {
       assignee: form.assignee,
       amount: Number(form.amount),
       description: form.description,
-      workflowType: form.workflowType,
+      workflowType: "direct_print" as const,
     };
 
     const created = await apiCreateProject(payload);
@@ -390,7 +437,6 @@ export function Projects() {
     setEditForm({
       name: project.name,
       clientId: project.clientId,
-      workflowType: project.workflowType || "variable_data",
       stage: project.stage,
       priority: project.priority,
       dueDate: project.dueDate,
@@ -425,7 +471,7 @@ export function Projects() {
       assignee: editForm.assignee,
       amount: Number(editForm.amount),
       description: editForm.description,
-      workflowType: editForm.workflowType,
+      workflowType: "direct_print" as const,
     });
 
     if (updated) {
@@ -497,17 +543,6 @@ export function Projects() {
                     </SelectContent>
                   </Select>
                   {errors.clientId && <p className="text-xs text-destructive">{errors.clientId}</p>}
-                </div>
-                {/* Workflow Type */}
-                <div className="space-y-2">
-                  <Label>Workflow Type <span className="text-destructive">*</span></Label>
-                  <Select value={form.workflowType} onValueChange={(v) => setForm((f) => ({ ...f, workflowType: v as "variable_data" | "direct_print" }))}>
-                    <SelectTrigger><SelectValue placeholder="Select workflow type" /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="variable_data">Variable Data Printing</SelectItem>
-                      <SelectItem value="direct_print">Direct Print Order</SelectItem>
-                    </SelectContent>
-                  </Select>
                 </div>
                 {/* Stage & Priority */}
                 <div className="grid grid-cols-2 gap-4">
@@ -595,17 +630,6 @@ export function Projects() {
                 </Select>
                 {editErrors.clientId && <p className="text-xs text-destructive">{editErrors.clientId}</p>}
               </div>
-              {/* Workflow Type */}
-              <div className="space-y-2">
-                <Label>Workflow Type <span className="text-destructive">*</span></Label>
-                <Select value={editForm.workflowType} onValueChange={(v) => setEditForm((f) => ({ ...f, workflowType: v as "variable_data" | "direct_print" }))}>
-                  <SelectTrigger><SelectValue placeholder="Select workflow type" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="variable_data">Variable Data Printing</SelectItem>
-                    <SelectItem value="direct_print">Direct Print Order</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
               {/* Stage & Priority */}
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
@@ -681,10 +705,62 @@ export function Projects() {
               />
             </div>
             <div className="flex gap-2">
-              <Button variant="outline" className="gap-2">
-                <Filter className="h-4 w-4" />
-                Filter
-              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" className="gap-2">
+                    <Filter className="h-4 w-4" />
+                    Filter
+                    {activeFilterCount > 0 && (
+                      <Badge variant="secondary" className="ml-1 px-1.5 py-0 text-[10px]">
+                        {activeFilterCount}
+                      </Badge>
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-64">
+                  <DropdownMenuLabel>Stage</DropdownMenuLabel>
+                  <DropdownMenuRadioGroup value={stageFilter} onValueChange={setStageFilter}>
+                    <DropdownMenuRadioItem value="all">All Stages</DropdownMenuRadioItem>
+                    {stages.map((stage) => (
+                      <DropdownMenuRadioItem key={stage.id} value={stage.id}>
+                        {stage.name}
+                      </DropdownMenuRadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+
+                  <DropdownMenuSeparator />
+
+                  <DropdownMenuLabel>Priority</DropdownMenuLabel>
+                  <DropdownMenuRadioGroup value={priorityFilter} onValueChange={setPriorityFilter}>
+                    <DropdownMenuRadioItem value="all">All Priorities</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="low">Low</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="medium">Medium</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="high">High</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="urgent">Urgent</DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+
+                  <DropdownMenuSeparator />
+
+                  <DropdownMenuCheckboxItem
+                    checked={overdueOnly}
+                    onCheckedChange={(checked) => setOverdueOnly(checked === true)}
+                  >
+                    Overdue Only
+                  </DropdownMenuCheckboxItem>
+
+                  <DropdownMenuSeparator />
+
+                  <DropdownMenuItem
+                    onClick={() => {
+                      setStageFilter("all");
+                      setPriorityFilter("all");
+                      setOverdueOnly(false);
+                    }}
+                  >
+                    Clear Filters
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <div className="flex border rounded-lg">
                 <Button
                   variant={viewMode === "kanban" ? "secondary" : "ghost"}
@@ -766,6 +842,7 @@ export function Projects() {
                       key={stage.id}
                       stage={stage}
                       projects={filtered}
+                      resolveClientUniqueId={resolveClientUniqueId}
                       onDrop={handleDrop}
                       onDelete={handleDelete}
                       onEdit={handleEditOpen}
@@ -798,7 +875,9 @@ export function Projects() {
                       <Link to={`/projects/${project.id}`} className="font-medium text-foreground hover:text-secondary transition-colors">
                         {project.name}
                       </Link>
-                      <p className="text-xs text-muted-foreground">{project.id} · {project.client}</p>
+                      <p className="text-xs text-muted-foreground truncate" title={`${resolveClientUniqueId(project)} · ${project.client}`}>
+                        {resolveClientUniqueId(project)} · {project.client}
+                      </p>
                     </div>
                     <div className="flex items-center gap-3">
                       {getPriorityBadge(project.priority)}
