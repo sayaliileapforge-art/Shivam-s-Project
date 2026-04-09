@@ -15,6 +15,8 @@ import previewRoutes from './routes/preview';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const backendRootDir = path.resolve(__dirname, '..');
+const repoRootDir = path.resolve(backendRootDir, '..');
 
 function parseCsvOrigins(value?: string): string[] {
   if (!value) return [];
@@ -46,7 +48,7 @@ app.use(cors({
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-const uploadsDir = path.resolve(process.cwd(), 'uploads');
+const uploadsDir = path.resolve(backendRootDir, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
   console.warn(`Uploads directory was missing and has been created: ${uploadsDir}`);
@@ -79,6 +81,21 @@ app.use('/api/templates', templateRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/preview', previewRoutes);
+
+// API 404 handler
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, error: 'API route not found' });
+});
+
+const frontendDistDir = path.resolve(repoRootDir, 'dist');
+const frontendIndexPath = path.resolve(frontendDistDir, 'index.html');
+if (process.env.NODE_ENV === 'production' && fs.existsSync(frontendIndexPath)) {
+  // In one-service deployment, serve the Vite build from Express.
+  app.use(express.static(frontendDistDir));
+  app.get(/^\/(?!api\/|uploads\/|student-photos\/|health$).*/, (req, res) => {
+    res.sendFile(frontendIndexPath);
+  });
+}
 
 // 404 handler
 app.use((req, res) => {

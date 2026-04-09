@@ -5,10 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
+    "build:backend": "npm --prefix backend run build",
+    "build:all": "npm run build && npm run build:backend",
     "dev": "vite",
     "dev:backend": "npm --prefix backend run dev",
     "dev:frontend": "vite",
-    "dev:full": "concurrently -k -n backend,frontend \"npm:dev:backend\" \"wait-on tcp:5000 && npm run dev:frontend\""
+    "dev:full": "concurrently -k -n backend,frontend \"npm:dev:backend\" \"wait-on tcp:5000 && npm run dev:frontend\"",
+    "start:render": "node backend/dist/server.js"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
