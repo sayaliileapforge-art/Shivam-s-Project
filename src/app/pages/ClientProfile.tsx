@@ -132,6 +132,7 @@ export function ClientProfile() {
     createdAt: "",
   };
   const clientData = found ?? emptyClient;
+  const displayClientId = clientData.schoollogUniqueId || clientData.id;
   const walletTransactions = id ? loadTransactions(id) : [];
   const clientProjects = id ? loadProjects().filter((p) => p.clientId === id) : [];
 
@@ -264,7 +265,7 @@ export function ClientProfile() {
             </Badge>
           </div>
           <p className="text-muted-foreground mt-1">
-            Client ID: {clientData.id} • Joined {clientData.createdAt}
+            Client ID: {displayClientId} • Joined {clientData.createdAt}
           </p>
         </div>
         <div className="flex gap-2">

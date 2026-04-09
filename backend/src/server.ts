@@ -11,6 +11,7 @@ import productRoutes from './routes/products';
 import templateRoutes from './routes/templates';
 import orderRoutes from './routes/orders';
 import authRoutes from './routes/auth';
+import previewRoutes from './routes/preview';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -42,8 +43,8 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 const uploadsDir = path.resolve(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -77,6 +78,7 @@ app.use('/api/products', productRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/preview', previewRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -109,7 +111,7 @@ async function startServer() {
         console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
       }
       console.log(`✓ Uploads URL base: http://localhost:${PORT}/uploads/`);
-      console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n  - /api/auth\n`);
+      console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n  - /api/auth\n  - /api/preview\n`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);

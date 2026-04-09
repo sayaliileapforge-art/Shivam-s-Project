@@ -46,6 +46,60 @@ interface MongoAuthUser {
   passwordHash: string;
 }
 
+interface RawMongoAuthUser {
+  _id: unknown;
+  name?: unknown;
+  schoolName?: unknown;
+  contactName?: unknown;
+  email?: unknown;
+  mobile?: unknown;
+  phone?: unknown;
+  role?: unknown;
+  firmName?: unknown;
+  profileImage?: unknown;
+  lastLoginAt?: unknown;
+  passwordHash?: unknown;
+  password?: unknown;
+}
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function readIsoDate(value: unknown): string | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
+function mapMongoAuthUser(raw: RawMongoAuthUser | null): MongoAuthUser | null {
+  if (!raw?._id) return null;
+
+  const mongoId = String(raw._id);
+  const name = readString(raw.name) || readString(raw.schoolName) || readString(raw.contactName) || 'User';
+  const email = normalizeEmail(readString(raw.email));
+  const mobile = normalizeMobile(readString(raw.mobile) || readString(raw.phone));
+  const passwordHash = readString(raw.passwordHash) || readString(raw.password);
+
+  if (!passwordHash) {
+    return null;
+  }
+
+  return {
+    mongoId,
+    id: mongoObjectIdToNumeric(mongoId),
+    name,
+    email,
+    mobile,
+    role: readString(raw.role) || 'sub_vendor',
+    firmName: readString(raw.firmName),
+    profileImage: readString(raw.profileImage),
+    lastLoginAt: readIsoDate(raw.lastLoginAt),
+    passwordHash,
+  };
+}
+
 function randomOtp(): string {
   const min = Math.pow(10, OTP_DIGITS - 1);
   const max = Math.pow(10, OTP_DIGITS) - 1;
@@ -113,25 +167,27 @@ async function findUserByEmailOrMobile(client: PoolClient, identifier: string): 
 }
 
 async function findMongoUserByEmailOrMobile(identifier: string): Promise<MongoAuthUser | null> {
-  const user = await AuthUserModel.findOne({
-    $or: [{ email: identifier }, { mobile: identifier }],
-  }).lean();
+  const normalized = identifier.includes('@') ? normalizeEmail(identifier) : normalizeMobile(identifier);
 
-  if (!user) return null;
+  const queryOr: Array<Record<string, unknown>> = [
+    { email: normalized },
+    { mobile: normalized },
+    { phone: normalized },
+  ];
 
-  const mongoId = String(user._id);
-  return {
-    mongoId,
-    id: mongoObjectIdToNumeric(mongoId),
-    name: user.name,
-    email: user.email,
-    mobile: user.mobile,
-    role: user.role || 'sub_vendor',
-    firmName: user.firmName || '',
-    profileImage: user.profileImage || '',
-    lastLoginAt: user.lastLoginAt ? new Date(user.lastLoginAt).toISOString() : null,
-    passwordHash: user.passwordHash,
-  };
+  if (normalized.includes('@')) {
+    queryOr.push({ email: { $regex: `^${normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } });
+  }
+
+  const rawAuthUser = await AuthUserModel.collection.findOne({ $or: queryOr }) as RawMongoAuthUser | null;
+  const mappedAuthUser = mapMongoAuthUser(rawAuthUser);
+  if (mappedAuthUser) {
+    return mappedAuthUser;
+  }
+
+  // Legacy mobile-app auth data can live in `users` with `phone` + `password`.
+  const rawLegacyUser = await AuthUserModel.db.collection('users').findOne({ $or: queryOr }) as RawMongoAuthUser | null;
+  return mapMongoAuthUser(rawLegacyUser);
 }
 
 export async function signup(payload: { name: string; email: string; mobile: string; password: string }) {

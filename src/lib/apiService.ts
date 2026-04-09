@@ -80,6 +80,19 @@ interface ApiResponse<T> {
   error?: string;
 }
 
+async function parseApiResponse<T>(response: Response): Promise<ApiResponse<T>> {
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return (await response.json()) as ApiResponse<T>;
+  }
+
+  const text = await response.text();
+  return {
+    success: response.ok,
+    error: text || `Request failed with status ${response.status}`,
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 //  Projects API
 // ─────────────────────────────────────────────────────────────
@@ -168,11 +181,16 @@ export async function createClient(data: Record<string, any>) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
-    const result = await response.json() as ApiResponse<any>;
+
+    const result = await parseApiResponse<any>(response);
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || `Failed to create client (HTTP ${response.status})`);
+    }
+
     return result.data;
   } catch (error) {
     console.error('Create client failed:', error);
-    return null;
+    throw error;
   }
 }
 
@@ -183,11 +201,16 @@ export async function updateClient(id: string, data: Record<string, any>) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
-    const result = await response.json() as ApiResponse<any>;
+
+    const result = await parseApiResponse<any>(response);
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || `Failed to update client (HTTP ${response.status})`);
+    }
+
     return result.data;
   } catch (error) {
     console.error('Update client failed:', error);
-    return null;
+    throw error;
   }
 }
 

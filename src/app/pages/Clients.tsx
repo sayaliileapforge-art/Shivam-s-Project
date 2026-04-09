@@ -334,9 +334,11 @@ export function Clients() {
                                 </Link>
                               </DropdownMenuItem>
                               <Can permission={Permission.CLIENTS__MANAGE}>
-                                <DropdownMenuItem>
-                                  <Edit className="h-4 w-4 mr-2" />
-                                  Edit Details
+                                <DropdownMenuItem asChild>
+                                  <Link to={`/clients/${client.id}`} className="cursor-pointer">
+                                    <Edit className="h-4 w-4 mr-2" />
+                                    Edit Details
+                                  </Link>
                                 </DropdownMenuItem>
                               </Can>
                               <Can permission={Permission.WALLET__MANAGE}>

@@ -29,6 +29,83 @@ export interface Client {
   balance?: number;
 }
 
+function pickString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+  return '';
+}
+
+function pickNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === 'string' && value.trim() !== '') {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function normalizeStatus(value: unknown): Client['status'] {
+  if (value === 'inactive' || value === 'blocked') {
+    return value;
+  }
+  return 'active';
+}
+
+function normalizeClientRecord(raw: any, index: number): Client {
+  const id = pickString(
+    raw._id,
+    raw.id,
+    raw.schoolCode,
+    raw.schoollogUniqueId,
+  ) || `legacy-${index}`;
+
+  const createdAt = typeof raw.createdAt === 'string'
+    ? raw.createdAt
+    : raw.createdAt instanceof Date
+      ? raw.createdAt.toISOString()
+      : '';
+
+  return {
+    _id: pickString(raw._id) || undefined,
+    id,
+    clientName: pickString(raw.clientName, raw.schoolName, raw.name, raw.companyName, raw.contactName),
+    email: pickString(raw.email),
+    contact: pickString(raw.contact, raw.phone, raw.mobile, raw.contactNumber),
+    gstNumber: pickString(raw.gstNumber, raw.gstNo),
+    gstName: pickString(raw.gstName),
+    gstStateCode: pickString(raw.gstStateCode),
+    gstAddress: pickString(raw.gstAddress),
+    deliveryMode: pickString(raw.deliveryMode, raw.deliveryMethod),
+    type: pickString(raw.type, raw.clientType),
+    address: pickString(raw.address),
+    pincode: pickString(raw.pincode, raw.zipCode, raw.postalCode),
+    city: pickString(raw.city),
+    state: pickString(raw.state),
+    district: pickString(raw.district),
+    schoollogUniqueId: pickString(raw.schoollogUniqueId, raw.schoolCode, raw.schoolId, raw.uniqueId),
+    busStop: pickString(raw.busStop),
+    route: pickString(raw.route),
+    status: normalizeStatus(raw.status),
+    createdAt,
+    salesPerson: pickString(raw.salesPerson, raw.salesperson, raw.assignedTo) || undefined,
+    maxCredit: pickNumber(raw.maxCredit),
+    balance: pickNumber(raw.balance),
+  };
+}
+
 export async function loadClients(): Promise<Client[]> {
   const localFallback = (): Client[] => {
     try {
@@ -42,10 +119,7 @@ export async function loadClients(): Promise<Client[]> {
   try {
     const data = await apiFetchClients();
     if (data && Array.isArray(data)) {
-      return data.map((c: any) => ({
-        ...c,
-        id: c._id || c.id,
-      }));
+      return data.map((c: any, index: number) => normalizeClientRecord(c, index));
     }
     // API returned null — backend is offline, fall back to localStorage
     return localFallback();

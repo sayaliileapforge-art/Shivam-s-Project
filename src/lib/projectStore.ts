@@ -286,6 +286,11 @@ export interface ProjectDataGroup {
   category: DataCategory;
   /** ID of the ProjectTemplate assigned to this group */
   templateId?: string;
+  classFilter?: string;
+  genderFilter?: string;
+  transportFilter?: string;
+  boardingFilter?: string;
+  houseFilter?: string;
 }
 
 export interface ProjectDataRecord {

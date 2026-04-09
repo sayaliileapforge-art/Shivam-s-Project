@@ -412,6 +412,8 @@ export function DesignerStudio() {
   const [dragPageId, setDragPageId] = useState<string | null>(null);
   const [pageLoadNonce, setPageLoadNonce] = useState(0);
   const activeCanvasHashRef = useRef("");
+  const lastPersistedHashRef = useRef("");
+  const initialTemplateLoadDoneRef = useRef(false);
 
   // ── Designer context ───────────────────────────────────────────────────────
   const [designerContext] = useState<DesignerContext | null>(() => {
@@ -425,6 +427,7 @@ export function DesignerStudio() {
   const [saveProjectId,    setSaveProjectId]    = useState(() => designerContext?.projectId ?? "");
   const [saveTemplateName, setSaveTemplateName] = useState("");
   const [isSaving,         setIsSaving]         = useState(false);
+  const [isAutoSaving,     setIsAutoSaving]     = useState(false);
   const [importMode, setImportMode] = useState<boolean>(() => {
     try {
       return localStorage.getItem(DESIGNER_IMPORT_MODE_KEY) === "true";
@@ -751,10 +754,19 @@ export function DesignerStudio() {
   // ── Effects ────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    if (!designerContext?.templateId) return;
+    if (!designerContext?.templateId) {
+      initialTemplateLoadDoneRef.current = true;
+      return;
+    }
+
+    initialTemplateLoadDoneRef.current = false;
+
     const tmpl = loadProjectTemplates(designerContext.projectId)
       .find((t) => t.id === designerContext.templateId);
-    if (!tmpl) return;
+    if (!tmpl) {
+      initialTemplateLoadDoneRef.current = true;
+      return;
+    }
 
     const resolvedMargin = resolveTemplateMargin(tmpl as any, DEFAULT_CONFIG.margin);
 
@@ -774,6 +786,7 @@ export function DesignerStudio() {
       setPageCounter(1);
       setPageLoadNonce((n) => n + 1);
       refresh();
+      initialTemplateLoadDoneRef.current = true;
       return;
     }
 
@@ -804,6 +817,9 @@ export function DesignerStudio() {
         }
         refresh();
       } catch { /* ignore */ }
+      finally {
+        initialTemplateLoadDoneRef.current = true;
+      }
     }, 300);
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -910,6 +926,86 @@ export function DesignerStudio() {
   const updateConfig = useCallback((partial: Partial<TemplateConfig>) =>
     setConfig((prev) => ({ ...prev, ...partial })), []);
 
+  const autoSaveTemplateNow = useCallback((reason: "debounce" | "unmount" = "debounce") => {
+    if (!designerContext?.templateId || !designerContext.projectId) return false;
+    if (!initialTemplateLoadDoneRef.current || importMode || isSaving) return false;
+
+    const existingTemplate = loadProjectTemplates(designerContext.projectId)
+      .find((template) => template.id === designerContext.templateId);
+    if (!existingTemplate) return false;
+
+    const templateName = (config.templateName || existingTemplate.templateName || "Untitled Template").trim() || "Untitled Template";
+    const snap = buildPagesSnapshot();
+    const elementMetadata = canvasRef.current?.getElementMetadata() ?? [];
+    const canJSON = JSON.stringify({
+      config,
+      pages: snap,
+      activePageId,
+      canvas: snap.find((p) => p.id === activePageId)?.canvas ?? EMPTY_CANVAS_JSON,
+      elementMetadata,
+    });
+
+    const persistHash = JSON.stringify({
+      projectId: designerContext.projectId,
+      templateId: designerContext.templateId,
+      templateName,
+      templateType: config.templateType,
+      canvas: config.canvas,
+      margin: config.margin,
+      isPublic: saveIsPublic,
+      canJSON,
+    });
+
+    if (persistHash === lastPersistedHashRef.current) {
+      return false;
+    }
+
+    console.debug("[DesignerAutoSave] Persisting template", {
+      reason,
+      templateId: designerContext.templateId,
+      templateName,
+    });
+
+    const thumb = canvasRef.current?.toPNG() ?? existingTemplate.thumbnail;
+    updateProjectTemplate(designerContext.templateId, {
+      templateName,
+      templateType: config.templateType,
+      canvas: config.canvas,
+      margin: config.margin,
+      canvasJSON: canJSON,
+      thumbnail: thumb,
+      isPublic: saveIsPublic,
+    });
+
+    lastPersistedHashRef.current = persistHash;
+    return true;
+  }, [activePageId, buildPagesSnapshot, config, designerContext, importMode, isSaving, saveIsPublic]);
+
+  useEffect(() => {
+    if (!designerContext?.templateId || !initialTemplateLoadDoneRef.current || importMode || isSaving) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setIsAutoSaving(true);
+      try {
+        autoSaveTemplateNow("debounce");
+      } finally {
+        setIsAutoSaving(false);
+      }
+    }, 900);
+
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [autoSaveTemplateNow, designerContext?.templateId, importMode, isSaving]);
+
+  useEffect(() => {
+    return () => {
+      autoSaveTemplateNow("unmount");
+    };
+  }, [autoSaveTemplateNow]);
+
   // ── Image upload ────────────────────────────────────────────────────────────
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
@@ -957,6 +1053,16 @@ export function DesignerStudio() {
       canvas: snap.find((p) => p.id === activePageId)?.canvas ?? EMPTY_CANVAS_JSON,
       elementMetadata,
     });
+    const persistHash = JSON.stringify({
+      projectId,
+      templateId: existingId || "",
+      templateName: name,
+      templateType: config.templateType,
+      canvas: config.canvas,
+      margin: config.margin,
+      isPublic: saveIsPublic,
+      canJSON,
+    });
     const thumb   = canvasRef.current?.toPNG() ?? undefined;
     setIsSaving(true);
     try {
@@ -967,6 +1073,7 @@ export function DesignerStudio() {
           canvas: config.canvas, margin: config.margin,
           canvasJSON: canJSON, thumbnail: thumb, isPublic: saveIsPublic,
         });
+        lastPersistedHashRef.current = persistHash;
         toast.success(`Template "${name}" updated`);
       } else {
         const proj = projects.find((p) => p.id === projectId);
@@ -983,6 +1090,7 @@ export function DesignerStudio() {
           };
           localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify(ctx));
         }
+        lastPersistedHashRef.current = persistHash;
         toast.success(`Template "${name}" saved`);
       }
       localStorage.removeItem(DESIGNER_IMPORT_MODE_KEY);
@@ -1203,6 +1311,12 @@ export function DesignerStudio() {
           <Save className="h-3.5 w-3.5" />
           {designerContext ? "Save" : "Save to Project"}
         </Button>
+
+        {designerContext?.templateId && (
+          <span className="text-[10px] text-muted-foreground px-1 shrink-0">
+            {isAutoSaving ? "Auto-saving..." : "Auto-save on"}
+          </span>
+        )}
 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

@@ -1,5 +1,5 @@
 ﻿import { useParams, Link, useNavigate } from "react-router";
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import {
   ArrowLeft, Plus, Trash2, Edit, Upload, FileText,
   CheckCircle2, Circle, Clock, MoreVertical, Download,
@@ -88,6 +88,212 @@ const PRODUCT_CATEGORIES = [
 const emptyProductForm = { productName: "", spec: "", quantity: "1", unitPrice: "" };
 const emptyTaskForm = { title: "", assignee: "", dueDate: "", status: "pending" as ProjectTask["status"] };
 const emptyFileForm = { name: "", category: "other" as ProjectFile["category"] };
+
+type PreviewPageSize = "A4" | "A3" | "Letter" | "Legal" | "Custom";
+
+interface PreviewGenerationForm {
+  pageSize: PreviewPageSize;
+  templateId: string;
+  orientation: "portrait" | "landscape";
+  templateType: ProjectTemplate["templateType"];
+  isSample: "yes" | "no";
+  sheetWidthMm: string;
+  sheetHeightMm: string;
+  pageMarginTopMm: string;
+  pageMarginLeftMm: string;
+  rowMarginMm: string;
+  columnMarginMm: string;
+  fileName: string;
+}
+
+const PAGE_SIZE_DIMENSIONS: Record<Exclude<PreviewPageSize, "Custom">, { width: number; height: number }> = {
+  A4: { width: 210, height: 297 },
+  A3: { width: 297, height: 420 },
+  Letter: { width: 216, height: 279 },
+  Legal: { width: 216, height: 356 },
+};
+
+const emptyPreviewForm: PreviewGenerationForm = {
+  pageSize: "A4",
+  templateId: "",
+  orientation: "portrait",
+  templateType: "id_card",
+  isSample: "no",
+  sheetWidthMm: "210",
+  sheetHeightMm: "297",
+  pageMarginTopMm: "8",
+  pageMarginLeftMm: "8",
+  rowMarginMm: "4",
+  columnMarginMm: "4",
+  fileName: "preview",
+};
+
+const GROUP_FILTER_ALL = "__all__";
+
+const emptyNewGroupFilters = {
+  classValue: GROUP_FILTER_ALL,
+  gender: GROUP_FILTER_ALL,
+  transport: GROUP_FILTER_ALL,
+  boarding: GROUP_FILTER_ALL,
+  house: GROUP_FILTER_ALL,
+};
+
+const GROUP_FILTER_SOURCE_KEYS = {
+  classValue: ["Class", "class", "className", "Standard", "standard", "grade", "Grade"],
+  gender: ["Gender", "gender", "sex", "Sex"],
+  transport: ["Transport", "transport", "transportMode", "transport_mode"],
+  boarding: ["Boarding", "boarding", "boardingStatus", "boarding_status", "boarder"],
+  house: ["House", "house", "schoolHouse", "school_house"],
+} as const;
+
+const DEFAULT_GROUP_FILTER_OPTIONS = {
+  classValue: ["Pre-Primary", "1-5", "6-8", "9-12"],
+  gender: ["Male", "Female", "Other"],
+  transport: ["Bus", "Van", "Self"],
+  boarding: ["Day Scholar", "Hosteller"],
+  house: ["Red", "Blue", "Green", "Yellow"],
+} as const;
+
+interface TemplatePreviewDiagnostics {
+  hasValidLayoutJson: boolean;
+  elementCount: number;
+  hasDesignElements: boolean;
+  hasThumbnail: boolean;
+  hasRenderablePreview: boolean;
+  requiredFieldKeys: string[];
+  missingFieldKeys: string[];
+  fallbackMessage: string;
+}
+
+const FIELD_KEY_ALIASES: Array<[string, string[]]> = [
+  ["name", ["name", "studentname", "fullname", "candidate", "username"]],
+  ["photo", ["photo", "photourl", "profilepic", "profileimage", "image", "avatar", "picture"]],
+  ["class", ["class", "classname", "standard", "grade"]],
+  ["gender", ["gender", "sex"]],
+  ["house", ["house", "schoolhouse"]],
+  ["transport", ["transport", "transportmode"]],
+  ["boarding", ["boarding", "boardingstatus", "boarder"]],
+];
+
+function normalizeFieldKey(rawKey: string): string {
+  return String(rawKey || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function toCanonicalFieldKey(rawKey: string): string {
+  const normalized = normalizeFieldKey(rawKey);
+  if (!normalized) return "";
+  for (const [canonical, aliases] of FIELD_KEY_ALIASES) {
+    if (aliases.includes(normalized)) {
+      return canonical;
+    }
+  }
+  return normalized;
+}
+
+function formatFieldLabel(canonicalKey: string): string {
+  if (!canonicalKey) return "";
+  return canonicalKey.charAt(0).toUpperCase() + canonicalKey.slice(1);
+}
+
+function parseTemplateLayoutJSON(template: ProjectTemplate): Record<string, unknown> | null {
+  if (!template.canvasJSON) return null;
+  try {
+    const parsed = JSON.parse(template.canvasJSON) as Record<string, unknown>;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTemplateLayoutObjects(layout: Record<string, unknown> | null): Array<Record<string, unknown>> {
+  if (!layout) return [];
+
+  const objects: Array<Record<string, unknown>> = [];
+
+  const pushCanvasObjects = (canvas: unknown) => {
+    if (!canvas || typeof canvas !== "object") return;
+    const canvasObjects = (canvas as { objects?: unknown }).objects;
+    if (!Array.isArray(canvasObjects)) return;
+    canvasObjects.forEach((obj) => {
+      if (obj && typeof obj === "object") {
+        objects.push(obj as Record<string, unknown>);
+      }
+    });
+  };
+
+  pushCanvasObjects(layout.canvas);
+
+  const pages = (layout.pages as Array<{ canvas?: unknown }> | undefined) ?? [];
+  pages.forEach((page) => pushCanvasObjects(page.canvas));
+
+  return objects;
+}
+
+function collectTemplateRequiredFields(
+  template: ProjectTemplate,
+  layoutObjects: Array<Record<string, unknown>>
+): string[] {
+  const fields = new Set<string>();
+
+  if (template.templateType === "id_card") {
+    fields.add("name");
+    fields.add("photo");
+  } else if (template.templateType === "certificate") {
+    fields.add("name");
+  }
+
+  layoutObjects.forEach((obj) => {
+    const dynamicFieldCandidates = [
+      obj.variableKey,
+      obj.__fieldKey,
+      obj.fieldKey,
+      obj.dataKey,
+      obj.photoField,
+    ];
+
+    dynamicFieldCandidates.forEach((candidate) => {
+      if (typeof candidate !== "string") return;
+      const canonical = toCanonicalFieldKey(candidate);
+      if (canonical) fields.add(canonical);
+    });
+
+    const text = typeof obj.text === "string" ? obj.text : "";
+    if (!text) return;
+    const placeholderRegex = /\{([^{}]+)\}/g;
+    let match: RegExpExecArray | null;
+    while ((match = placeholderRegex.exec(text)) !== null) {
+      const canonical = toCanonicalFieldKey(match[1]);
+      if (canonical) fields.add(canonical);
+    }
+  });
+
+  return Array.from(fields);
+}
+
+function inspectTemplatePreview(
+  template: ProjectTemplate,
+  availableFieldKeys: Set<string>
+): TemplatePreviewDiagnostics {
+  const parsedLayout = parseTemplateLayoutJSON(template);
+  const layoutObjects = extractTemplateLayoutObjects(parsedLayout);
+  const elementCount = layoutObjects.length;
+  const hasValidLayoutJson = Boolean(parsedLayout);
+  const hasDesignElements = hasValidLayoutJson && elementCount > 0;
+  const hasThumbnail = typeof template.thumbnail === "string" && template.thumbnail.trim().length > 0;
+  const requiredFieldKeys = collectTemplateRequiredFields(template, layoutObjects);
+  const missingFieldKeys = requiredFieldKeys.filter((fieldKey) => !availableFieldKeys.has(fieldKey));
+
+  return {
+    hasValidLayoutJson,
+    elementCount,
+    hasDesignElements,
+    hasThumbnail,
+    hasRenderablePreview: hasDesignElements && hasThumbnail,
+    requiredFieldKeys,
+    missingFieldKeys,
+    fallbackMessage: hasDesignElements ? "" : "No preview available. Please configure the template.",
+  };
+}
 
 const mapApiProjectToUi = (p: any) => {
   const populatedClient = typeof p.clientId === "object" && p.clientId !== null ? p.clientId : null;
@@ -204,6 +410,7 @@ export function ProjectDetail() {
   const [isAddGroupOpen, setIsAddGroupOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupTemplateId, setNewGroupTemplateId] = useState("");
+  const [newGroupFilters, setNewGroupFilters] = useState({ ...emptyNewGroupFilters });
 
   // Reload data from localStorage whenever project id or category changes
   useEffect(() => {
@@ -225,6 +432,10 @@ export function ProjectDetail() {
   const [aiProcessing, setAiProcessing] = useState<string | null>(null);
   const [isGenerateBarcodeOpen, setIsGenerateBarcodeOpen] = useState(false);
   const [barcodeField, setBarcodeField] = useState("");
+  const [isGeneratePreviewOpen, setIsGeneratePreviewOpen] = useState(false);
+  const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [previewForm, setPreviewForm] = useState<PreviewGenerationForm>(emptyPreviewForm);
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
 
   // Template dialog state
@@ -232,6 +443,8 @@ export function ProjectDetail() {
   const [templateForm, setTemplateForm] = useState(emptyTemplateForm);
   const [templateErrors, setTemplateErrors] = useState<{ templateName?: string; applicableFor?: string }>({});
   const [previewTemplate, setPreviewTemplate] = useState<ProjectTemplate | null>(null);
+  const [brokenTemplatePreviewIds, setBrokenTemplatePreviewIds] = useState<Record<string, true>>({});
+  const [activeTab, setActiveTab] = useState("details");
 
   const updateTemplateMargin = (key: keyof typeof emptyTemplateForm.margin, val: number) =>
     setTemplateForm((f) => ({ ...f, margin: { ...f.margin, [key]: val } }));
@@ -270,6 +483,56 @@ export function ProjectDetail() {
   const files = id ? loadProjectFiles(id) : [];
   const templates = id ? loadProjectTemplates(id) : [];
 
+  const availableTemplateFieldKeys = useMemo(() => {
+    const keys = new Set<string>();
+
+    dataFields.forEach((field) => {
+      const fromKey = toCanonicalFieldKey(field.key);
+      const fromLabel = toCanonicalFieldKey(field.label);
+      if (fromKey) keys.add(fromKey);
+      if (fromLabel) keys.add(fromLabel);
+    });
+
+    dataRecords.slice(0, 500).forEach((record) => {
+      Object.keys(record).forEach((recordKey) => {
+        const canonical = toCanonicalFieldKey(recordKey);
+        if (canonical) keys.add(canonical);
+      });
+    });
+
+    return keys;
+  }, [dataFields, dataRecords]);
+
+  const templateDiagnosticsMap = useMemo(() => {
+    const diagnostics: Record<string, TemplatePreviewDiagnostics> = {};
+    templates.forEach((template) => {
+      diagnostics[template.id] = inspectTemplatePreview(template, availableTemplateFieldKeys);
+    });
+    return diagnostics;
+  }, [templates, availableTemplateFieldKeys]);
+
+  const selectedPreviewTemplateDiagnostics = previewTemplate
+    ? templateDiagnosticsMap[previewTemplate.id]
+    : undefined;
+
+  const selectedGenerateTemplateDiagnostics = previewForm.templateId
+    ? templateDiagnosticsMap[previewForm.templateId]
+    : undefined;
+
+  const canRenderSelectedTemplateImage = Boolean(
+    previewTemplate
+    && previewTemplate.thumbnail
+    && selectedPreviewTemplateDiagnostics?.hasDesignElements
+    && !brokenTemplatePreviewIds[previewTemplate.id]
+  );
+
+  const markTemplatePreviewBroken = (templateId: string) => {
+    setBrokenTemplatePreviewIds((prev) => {
+      if (prev[templateId]) return prev;
+      return { ...prev, [templateId]: true };
+    });
+  };
+
   const refresh = () => setVersion((v) => v + 1);
 
   // ── Template handlers ──
@@ -289,8 +552,17 @@ export function ProjectDetail() {
     c.height = heightPx;
     const ctx = c.getContext("2d");
     if (!ctx) return "";
-    ctx.fillStyle = "#ffffff";
+    ctx.fillStyle = "#f8fafc";
     ctx.fillRect(0, 0, widthPx, heightPx);
+    ctx.strokeStyle = "#cbd5e1";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, widthPx - 2, heightPx - 2);
+    ctx.fillStyle = "#64748b";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const fontSize = Math.max(12, Math.floor(Math.min(widthPx, heightPx) * 0.12));
+    ctx.font = `600 ${fontSize}px sans-serif`;
+    ctx.fillText("No Design", widthPx / 2, heightPx / 2);
     return c.toDataURL("image/png");
   };
 
@@ -310,7 +582,7 @@ export function ProjectDetail() {
     setTemplateForm(emptyTemplateForm);
     setTemplateErrors({});
     setIsCreateTemplateOpen(false);
-    refresh();
+    setActiveTab("templates");
   };
 
   const productTotal = products.reduce((s, p) => s + p.quantity * p.unitPrice, 0);
@@ -470,6 +742,42 @@ export function ProjectDetail() {
     );
   });
 
+  const groupFilterOptions = useMemo(() => {
+    const collectOptions = (candidateKeys: readonly string[], fallback: readonly string[]): string[] => {
+      const values = new Set<string>();
+      dataRecords.forEach((record) => {
+        for (const key of candidateKeys) {
+          const value = record[key];
+          if (value === undefined || value === null) continue;
+          const text = String(value).trim();
+          if (!text) continue;
+          values.add(text);
+          break;
+        }
+      });
+
+      const sorted = Array.from(values).sort((a, b) =>
+        a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" })
+      );
+
+      return sorted.length > 0 ? sorted : [...fallback];
+    };
+
+    return {
+      classValue: collectOptions(GROUP_FILTER_SOURCE_KEYS.classValue, DEFAULT_GROUP_FILTER_OPTIONS.classValue),
+      gender: collectOptions(GROUP_FILTER_SOURCE_KEYS.gender, DEFAULT_GROUP_FILTER_OPTIONS.gender),
+      transport: collectOptions(GROUP_FILTER_SOURCE_KEYS.transport, DEFAULT_GROUP_FILTER_OPTIONS.transport),
+      boarding: collectOptions(GROUP_FILTER_SOURCE_KEYS.boarding, DEFAULT_GROUP_FILTER_OPTIONS.boarding),
+      house: collectOptions(GROUP_FILTER_SOURCE_KEYS.house, DEFAULT_GROUP_FILTER_OPTIONS.house),
+    };
+  }, [dataRecords]);
+
+  const resetAddGroupDialog = () => {
+    setNewGroupName("");
+    setNewGroupTemplateId("");
+    setNewGroupFilters({ ...emptyNewGroupFilters });
+  };
+
   const toggleSelectAll = () => {
     if (dataSelectedIds.size === filteredRecords.length) {
       setDataSelectedIds(new Set());
@@ -500,10 +808,14 @@ export function ProjectDetail() {
       name: newGroupName.trim(),
       category: dataCategory,
       templateId: newGroupTemplateId || undefined,
+      classFilter: newGroupFilters.classValue === GROUP_FILTER_ALL ? undefined : newGroupFilters.classValue,
+      genderFilter: newGroupFilters.gender === GROUP_FILTER_ALL ? undefined : newGroupFilters.gender,
+      transportFilter: newGroupFilters.transport === GROUP_FILTER_ALL ? undefined : newGroupFilters.transport,
+      boardingFilter: newGroupFilters.boarding === GROUP_FILTER_ALL ? undefined : newGroupFilters.boarding,
+      houseFilter: newGroupFilters.house === GROUP_FILTER_ALL ? undefined : newGroupFilters.house,
     });
     setDataGroups((prev) => [...prev, g]);
-    setNewGroupName("");
-    setNewGroupTemplateId("");
+    resetAddGroupDialog();
     setIsAddGroupOpen(false);
   };
 
@@ -835,6 +1147,190 @@ export function ProjectDetail() {
     setBarcodeField("");
   };
 
+  const selectedRecords = dataRecords.filter((record) => dataSelectedIds.has(record.id));
+
+  const handleOpenGeneratePreview = () => {
+    if (!selectedRecords.length) return;
+
+    const templateFromGroup = dataGroups
+      .find((group) => selectedRecords.some((record) => record.groupId === group.id) && Boolean(group.templateId))
+      ?.templateId;
+    const defaultTemplate = templates.find((template) => template.id === templateFromGroup)
+      || templates[0]
+      || null;
+
+    setPreviewForm((prev) => ({
+      ...prev,
+      pageSize: "A4",
+      templateId: defaultTemplate?.id || "",
+      templateType: defaultTemplate?.templateType || prev.templateType,
+      orientation: defaultTemplate?.canvas?.width && defaultTemplate?.canvas?.height
+        ? (defaultTemplate.canvas.width > defaultTemplate.canvas.height ? "landscape" : "portrait")
+        : prev.orientation,
+      sheetWidthMm: String(PAGE_SIZE_DIMENSIONS.A4.width),
+      sheetHeightMm: String(PAGE_SIZE_DIMENSIONS.A4.height),
+      fileName: `${project?.name || "project"}_${dataCategory}_preview`,
+    }));
+    setPreviewError("");
+    setIsGeneratePreviewOpen(true);
+  };
+
+  const handleGeneratePreviewPdf = async () => {
+    if (!id) return;
+
+    const selectedTemplate = templates.find((template) => template.id === previewForm.templateId);
+    const selectedTemplateDiagnostics = selectedTemplate ? templateDiagnosticsMap[selectedTemplate.id] : undefined;
+    const sheetWidthMm = Number(previewForm.sheetWidthMm);
+    const sheetHeightMm = Number(previewForm.sheetHeightMm);
+    const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
+    const pageMarginLeftMm = Number(previewForm.pageMarginLeftMm);
+    const rowMarginMm = Number(previewForm.rowMarginMm || "0");
+    const columnMarginMm = Number(previewForm.columnMarginMm || "0");
+
+    if (!selectedRecords.length) {
+      setPreviewError("Please select at least one record.");
+      return;
+    }
+    if (!previewForm.templateId || !selectedTemplate) {
+      setPreviewError("Please select a template.");
+      return;
+    }
+    if (!selectedTemplateDiagnostics?.hasDesignElements) {
+      setPreviewError("No preview available. Please configure the template.");
+      return;
+    }
+    if (!previewForm.fileName.trim()) {
+      setPreviewError("File name is required.");
+      return;
+    }
+    if (!Number.isFinite(sheetWidthMm) || !Number.isFinite(sheetHeightMm) || sheetWidthMm <= 0 || sheetHeightMm <= 0) {
+      setPreviewError("Sheet size must be valid positive values.");
+      return;
+    }
+    if (!Number.isFinite(pageMarginTopMm) || !Number.isFinite(pageMarginLeftMm) || pageMarginTopMm < 0 || pageMarginLeftMm < 0) {
+      setPreviewError("Page margins cannot be negative.");
+      return;
+    }
+    if (!Number.isFinite(rowMarginMm) || !Number.isFinite(columnMarginMm) || rowMarginMm < 0 || columnMarginMm < 0) {
+      setPreviewError("Row and column margins cannot be negative.");
+      return;
+    }
+
+    const minimalRecords = selectedRecords.map((record) => {
+      const compact: Record<string, unknown> = {
+        id: record.id,
+        projectId: record.projectId,
+        category: record.category,
+        groupId: record.groupId,
+      };
+
+      Object.entries(record).forEach(([key, value]) => {
+        if (["id", "projectId", "category", "groupId", "photo", "barcode"].includes(key)) return;
+        const raw = String(value ?? "").trim();
+        if (raw) compact[key] = raw;
+      });
+
+      return compact;
+    });
+
+    setPreviewError("");
+    setIsGeneratingPreview(true);
+    try {
+      console.debug("[Preview] Preparing template payload", {
+        templateId: selectedTemplate.id,
+        templateName: selectedTemplate.templateName,
+        templateType: selectedTemplate.templateType,
+        hasValidLayoutJson: selectedTemplateDiagnostics.hasValidLayoutJson,
+        elementCount: selectedTemplateDiagnostics.elementCount,
+        requiredFieldKeys: selectedTemplateDiagnostics.requiredFieldKeys,
+        missingFieldKeys: selectedTemplateDiagnostics.missingFieldKeys,
+        selectedRecordCount: selectedRecords.length,
+      });
+
+      if (selectedTemplateDiagnostics.missingFieldKeys.length > 0) {
+        console.warn("[Preview] Missing template field mappings", {
+          templateId: selectedTemplate.id,
+          missingFieldKeys: selectedTemplateDiagnostics.missingFieldKeys,
+        });
+      }
+
+      const response = await fetch("/api/preview/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: id,
+          selectedRecordIds: selectedRecords.map((record) => record.id),
+          selectedRecords: minimalRecords,
+          configuration: {
+            pageSize: previewForm.pageSize,
+            templateId: previewForm.templateId,
+            orientation: previewForm.orientation,
+            templateType: previewForm.templateType,
+            isSample: previewForm.isSample === "yes",
+            sheetSize: {
+              widthMm: sheetWidthMm,
+              heightMm: sheetHeightMm,
+            },
+            pageMargin: {
+              topMm: pageMarginTopMm,
+              leftMm: pageMarginLeftMm,
+            },
+            rowMarginMm,
+            columnMarginMm,
+            fileName: previewForm.fileName.trim(),
+          },
+          template: {
+            id: selectedTemplate.id,
+            templateName: selectedTemplate.templateName,
+            templateType: selectedTemplate.templateType,
+            canvas: selectedTemplate.canvas,
+            thumbnail: selectedTemplate.thumbnail,
+            layoutJSON: selectedTemplate.canvasJSON,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        let errorMessage = "Failed to generate preview PDF.";
+        try {
+          const json = await response.json();
+          errorMessage = String(json?.error || json?.message || errorMessage);
+        } catch {
+          // Keep generic message if JSON parsing fails.
+        }
+        throw new Error(errorMessage);
+      }
+
+      const responseTemplateId = response.headers.get("x-preview-template-id");
+      const responseHasLayout = response.headers.get("x-preview-has-layout");
+      const responseRecordCount = Number(response.headers.get("x-preview-record-count") || "0");
+      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+
+      if (responseTemplateId && responseTemplateId !== selectedTemplate.id) {
+        throw new Error("Preview response template mismatch.");
+      }
+      if (responseHasLayout === "0") {
+        throw new Error("No preview available. Please configure the template.");
+      }
+      if (Number.isFinite(responseRecordCount) && responseRecordCount <= 0) {
+        throw new Error("Preview response has no data.");
+      }
+      if (!contentType.includes("application/pdf")) {
+        throw new Error("Invalid preview response format.");
+      }
+
+      const pdfBlob = await response.blob();
+      const pdfUrl = URL.createObjectURL(pdfBlob);
+      window.open(pdfUrl, "_blank", "noopener,noreferrer");
+      setTimeout(() => URL.revokeObjectURL(pdfUrl), 60000);
+      setIsGeneratePreviewOpen(false);
+    } catch (error) {
+      setPreviewError((error as Error).message || "Failed to generate preview PDF.");
+    } finally {
+      setIsGeneratingPreview(false);
+    }
+  };
+
   // ── Delete All student/staff Data ──
   const handleDeleteAllData = () => {
     if (!id) return;
@@ -1001,7 +1497,7 @@ export function ProjectDetail() {
       </Card>
 
       {/* Main Tabs */}
-      <Tabs defaultValue="details" className="space-y-4">
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
         <TabsList className="bg-muted flex flex-wrap h-auto gap-1 p-1">
           <TabsTrigger value="details" className="gap-2"><Package className="h-4 w-4" />Details</TabsTrigger>
           <TabsTrigger value="templates" className="gap-2"><Layers className="h-4 w-4" />Templates</TabsTrigger>
@@ -1255,20 +1751,39 @@ export function ProjectDetail() {
                   <div className="bg-muted/40 rounded-lg p-6 flex items-center justify-center">
                     <div className="bg-white shadow-md rounded border border-border relative overflow-hidden flex items-center justify-center"
                       style={{ width: Math.min(220, previewTemplate.canvas.width * 0.6), height: Math.min(280, previewTemplate.canvas.height * 0.6) }}>
-                      {previewTemplate.thumbnail ? (
+                      {canRenderSelectedTemplateImage ? (
                         <img
                           src={previewTemplate.thumbnail}
                           alt={previewTemplate.templateName}
                           className="h-full w-full object-contain"
+                          onError={() => markTemplatePreviewBroken(previewTemplate.id)}
                         />
                       ) : (
-                        <Layers className="h-8 w-8 text-muted-foreground" />
+                        <div className="h-full w-full bg-muted/30 flex flex-col items-center justify-center gap-1.5 px-3 text-center">
+                          <Layers className="h-6 w-6 text-muted-foreground" />
+                          <p className="text-[11px] text-muted-foreground leading-snug">
+                            {selectedPreviewTemplateDiagnostics?.fallbackMessage || "Preview image unavailable for this template."}
+                          </p>
+                        </div>
                       )}
                     </div>
                   </div>
+
+                  {!selectedPreviewTemplateDiagnostics?.hasDesignElements && (
+                    <p className="text-xs text-destructive bg-destructive/10 rounded px-2.5 py-2">
+                      No preview available. Please configure the template.
+                    </p>
+                  )}
+
+                  {Boolean(selectedPreviewTemplateDiagnostics?.missingFieldKeys.length) && (
+                    <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2">
+                      Missing field mapping: {selectedPreviewTemplateDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
+                    </p>
+                  )}
+
                   <div className="space-y-1 text-sm">
                     <div className="flex justify-between"><span className="text-muted-foreground">Type</span><span className="font-medium capitalize">{previewTemplate.templateType.replace("_"," ")}</span></div>
-                    <div className="flex justify-between"><span className="text-muted-foreground">Canvas</span><span className="font-medium">{previewTemplate.canvas.width} \u00d7 {previewTemplate.canvas.height} mm</span></div>
+                    <div className="flex justify-between"><span className="text-muted-foreground">Canvas</span><span className="font-medium">{previewTemplate.canvas.width} x {previewTemplate.canvas.height} mm</span></div>
                     <div className="flex justify-between"><span className="text-muted-foreground">Margin T/L/R/B</span><span className="font-medium">{previewTemplate.margin.top}/{previewTemplate.margin.left}/{previewTemplate.margin.right}/{previewTemplate.margin.bottom} mm</span></div>
                     {previewTemplate.applicableFor && <div className="flex justify-between"><span className="text-muted-foreground">For</span><span className="font-medium">{previewTemplate.applicableFor}</span></div>}
                   </div>
@@ -1305,73 +1820,94 @@ export function ProjectDetail() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {templates.map((tmpl) => (
-                    <div key={tmpl.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow space-y-3">
-                      <div className="bg-muted/30 rounded flex items-center justify-center h-28 relative overflow-hidden">
-                        {tmpl.thumbnail ? (
-                          <img
-                            src={tmpl.thumbnail}
-                            alt={tmpl.templateName}
-                            className="max-h-full max-w-full object-contain rounded shadow"
-                          />
-                        ) : (
-                          <div className="bg-white shadow rounded relative overflow-hidden flex items-center justify-center"
-                            style={{ width: Math.min(80, tmpl.canvas.width), height: Math.min(96, tmpl.canvas.height) }}>
-                            <Layers className="h-4 w-4 text-muted-foreground" />
-                          </div>
-                        )}
-                      </div>
-                      <div>
-                        <p className="font-medium text-sm truncate">{tmpl.templateName}</p>
-                        <div className="flex gap-1 mt-1 flex-wrap">
-                          <Badge variant="secondary" className="text-[10px] capitalize">{tmpl.templateType.replace("_"," ")}</Badge>
-                          <Badge variant="outline" className="text-[10px]">{tmpl.canvas.width}\u00d7{tmpl.canvas.height}mm</Badge>
+                  {templates.map((tmpl) => {
+                    const previewDiagnostics = templateDiagnosticsMap[tmpl.id];
+                    const canRenderCardImage = Boolean(
+                      tmpl.thumbnail
+                      && previewDiagnostics?.hasDesignElements
+                      && !brokenTemplatePreviewIds[tmpl.id]
+                    );
+                    return (
+                      <div key={tmpl.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow space-y-3">
+                        <div className="bg-muted/30 rounded flex items-center justify-center h-28 relative overflow-hidden">
+                          {canRenderCardImage ? (
+                            <img
+                              src={tmpl.thumbnail}
+                              alt={tmpl.templateName}
+                              className="max-h-full max-w-full object-contain rounded shadow"
+                              onError={() => markTemplatePreviewBroken(tmpl.id)}
+                            />
+                          ) : (
+                            <div className="h-full w-full bg-muted/20 flex flex-col items-center justify-center gap-1.5 px-3 text-center">
+                              <Layers className="h-5 w-5 text-muted-foreground" />
+                              <p className="text-[11px] text-muted-foreground leading-snug">
+                                {previewDiagnostics?.fallbackMessage || "Preview image unavailable for this template."}
+                              </p>
+                            </div>
+                          )}
                         </div>
-                        {tmpl.applicableFor && <p className="text-xs text-muted-foreground mt-1 truncate">For: {tmpl.applicableFor}</p>}
-                        <p className="text-xs text-muted-foreground">{tmpl.createdAt}</p>
+                        <div>
+                          <p className="font-medium text-sm truncate">{tmpl.templateName}</p>
+                          <div className="flex gap-1 mt-1 flex-wrap">
+                            <Badge variant="secondary" className="text-[10px] capitalize">{tmpl.templateType.replace("_"," ")}</Badge>
+                            <Badge variant="outline" className="text-[10px]">{tmpl.canvas.width}x{tmpl.canvas.height}mm</Badge>
+                          </div>
+                          {!previewDiagnostics?.hasDesignElements && (
+                            <p className="text-[11px] text-destructive mt-1">
+                              No preview available. Please configure the template.
+                            </p>
+                          )}
+                          {Boolean(previewDiagnostics?.missingFieldKeys.length) && (
+                            <p className="text-[11px] text-amber-700 mt-1">
+                              Missing field mapping: {previewDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
+                            </p>
+                          )}
+                          {tmpl.applicableFor && <p className="text-xs text-muted-foreground mt-1 truncate">For: {tmpl.applicableFor}</p>}
+                          <p className="text-xs text-muted-foreground">{tmpl.createdAt}</p>
+                        </div>
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="outline" className="flex-1 text-xs gap-1" onClick={() => setPreviewTemplate(tmpl)}>
+                            <Download className="h-3 w-3" />Preview
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="flex-1 text-xs gap-1 text-primary hover:text-primary"
+                            onClick={() => {
+                              const rawMargin = (tmpl as any).margin ?? {};
+                              const normalizedMargin = {
+                                top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
+                                left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
+                                right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
+                                bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
+                              };
+                              // Save template config to designer storage key so DesignerStudio picks it up
+                              const designerConfig = {
+                                templateName: tmpl.templateName,
+                                templateType: tmpl.templateType,
+                                canvas: tmpl.canvas,
+                                margin: normalizedMargin,
+                              };
+                              localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
+                              // Write context so DesignerStudio can save back to this exact template
+                              localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+                                projectId: project.id,
+                                templateId: tmpl.id,
+                                projectName: project.name,
+                                templateName: tmpl.templateName,
+                              }));
+                              navigate("/designer-studio");
+                            }}
+                          >
+                            <Pencil className="h-3 w-3" />Edit
+                          </Button>
+                          <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
+                            <Trash2 className="h-3 w-3" />
+                          </Button>
+                        </div>
                       </div>
-                      <div className="flex gap-2">
-                        <Button size="sm" variant="outline" className="flex-1 text-xs gap-1" onClick={() => setPreviewTemplate(tmpl)}>
-                          <Download className="h-3 w-3" />Preview
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="flex-1 text-xs gap-1 text-primary hover:text-primary"
-                          onClick={() => {
-                            const rawMargin = (tmpl as any).margin ?? {};
-                            const normalizedMargin = {
-                              top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
-                              left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
-                              right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
-                              bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
-                            };
-                            // Save template config to designer storage key so DesignerStudio picks it up
-                            const designerConfig = {
-                              templateName: tmpl.templateName,
-                              templateType: tmpl.templateType,
-                              canvas: tmpl.canvas,
-                              margin: normalizedMargin,
-                            };
-                            localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
-                            // Write context so DesignerStudio can save back to this exact template
-                            localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-                              projectId: project.id,
-                              templateId: tmpl.id,
-                              projectName: project.name,
-                              templateName: tmpl.templateName,
-                            }));
-                            navigate("/designer-studio");
-                          }}
-                        >
-                          <Pencil className="h-3 w-3" />Edit
-                        </Button>
-                        <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
-                          <Trash2 className="h-3 w-3" />
-                        </Button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </CardContent>
@@ -1807,6 +2343,32 @@ export function ProjectDetail() {
                             onChange={(e) => setDataFilter(e.target.value)}
                             className="h-8 text-xs w-48"
                           />
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="gap-1.5 text-xs h-8"
+                                disabled={dataSelectedIds.size === 0}
+                              >
+                                <FileText className="h-3.5 w-3.5" />
+                                Selected Actions
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-56">
+                              <DropdownMenuItem onClick={handleOpenGeneratePreview} disabled={dataSelectedIds.size === 0}>
+                                <Download className="h-4 w-4 mr-2" /> Generate preview
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                className="text-destructive focus:text-destructive"
+                                onClick={deleteSelected}
+                                disabled={dataSelectedIds.size === 0}
+                              >
+                                <Trash2 className="h-4 w-4 mr-2" /> Delete selected records
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                           <Button variant="outline" size="sm" className="gap-1.5 text-xs h-8">
                             <Filter className="h-3.5 w-3.5" />
                             Filter
@@ -2033,6 +2595,13 @@ export function ProjectDetail() {
                       {dataGroups.map((g) => {
                         const assignedTemplate = templates.find((t) => t.id === g.templateId);
                         const recordCount = dataRecords.filter((r) => r.groupId === g.id).length;
+                        const appliedFilters = [
+                          { label: "Class", value: g.classFilter },
+                          { label: "Gender", value: g.genderFilter },
+                          { label: "Transport", value: g.transportFilter },
+                          { label: "Boarding", value: g.boardingFilter },
+                          { label: "House", value: g.houseFilter },
+                        ].filter((item) => Boolean(item.value));
                         return (
                           <div key={g.id} className="flex items-center gap-3 px-3 py-3 rounded-lg border bg-muted/30">
                             <GripVertical className="h-4 w-4 text-muted-foreground shrink-0" />
@@ -2045,6 +2614,16 @@ export function ProjectDetail() {
                                   {recordCount} {recordCount === 1 ? "record" : "records"}
                                 </Badge>
                               </div>
+
+                              {appliedFilters.length > 0 && (
+                                <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                                  {appliedFilters.map((item) => (
+                                    <Badge key={`${g.id}-${item.label}`} variant="outline" className="text-[10px] h-5">
+                                      {item.label}: {item.value}
+                                    </Badge>
+                                  ))}
+                                </div>
+                              )}
 
                               {/* Template selector per group */}
                               <div className="flex items-center gap-1.5 mt-1.5">
@@ -2139,6 +2718,244 @@ export function ProjectDetail() {
               </Card>
             )}
           </div>
+
+          {/* ── Generate Preview Dialog ── */}
+          <Dialog open={isGeneratePreviewOpen} onOpenChange={(open) => {
+            if (isGeneratingPreview) return;
+            setIsGeneratePreviewOpen(open);
+            if (!open) setPreviewError("");
+          }}>
+            <DialogContent className="sm:max-w-[620px]">
+              <DialogHeader>
+                <DialogTitle>Generate Preview</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-4 py-1">
+                <p className="text-sm text-muted-foreground">
+                  Generate preview for {selectedRecords.length} selected record(s).
+                </p>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label>Page size</Label>
+                    <Select
+                      value={previewForm.pageSize}
+                      onValueChange={(value) => {
+                        const size = value as PreviewPageSize;
+                        setPreviewForm((prev) => {
+                          if (size === "Custom") {
+                            return { ...prev, pageSize: size };
+                          }
+                          const dims = PAGE_SIZE_DIMENSIONS[size];
+                          return {
+                            ...prev,
+                            pageSize: size,
+                            sheetWidthMm: String(dims.width),
+                            sheetHeightMm: String(dims.height),
+                          };
+                        });
+                      }}
+                    >
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select page size" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="A4">A4</SelectItem>
+                        <SelectItem value="A3">A3</SelectItem>
+                        <SelectItem value="Letter">Letter</SelectItem>
+                        <SelectItem value="Legal">Legal</SelectItem>
+                        <SelectItem value="Custom">Custom</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label>Select template</Label>
+                    <Select
+                      value={previewForm.templateId || "__none__"}
+                      onValueChange={(value) => {
+                        const selectedTemplate = templates.find((template) => template.id === value);
+                        setPreviewForm((prev) => ({
+                          ...prev,
+                          templateId: value === "__none__" ? "" : value,
+                          templateType: selectedTemplate?.templateType || prev.templateType,
+                        }));
+                      }}
+                    >
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select a template" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">Select a template</SelectItem>
+                        {templates.map((template) => (
+                          <SelectItem key={template.id} value={template.id}>
+                            {template.templateName}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {selectedGenerateTemplateDiagnostics && (
+                    <div className="sm:col-span-2 space-y-1">
+                      {!selectedGenerateTemplateDiagnostics.hasDesignElements && (
+                        <p className="text-xs text-destructive">
+                          No preview available. Please configure the template.
+                        </p>
+                      )}
+                      {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
+                        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                          Missing field mapping: {selectedGenerateTemplateDiagnostics.missingFieldKeys.map(formatFieldLabel).join(", ")}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="space-y-1.5">
+                    <Label>Orientation</Label>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        variant={previewForm.orientation === "portrait" ? "default" : "outline"}
+                        className="h-9 flex-1"
+                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
+                      >
+                        Portrait
+                      </Button>
+                      <Button
+                        type="button"
+                        variant={previewForm.orientation === "landscape" ? "default" : "outline"}
+                        className="h-9 flex-1"
+                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
+                      >
+                        Landscape
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label>Template type</Label>
+                    <Select
+                      value={previewForm.templateType}
+                      onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, templateType: value as ProjectTemplate["templateType"] }))}
+                    >
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select template type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="id_card">ID Card</SelectItem>
+                        <SelectItem value="certificate">Certificate</SelectItem>
+                        <SelectItem value="poster">Poster</SelectItem>
+                        <SelectItem value="custom">Custom</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label>Is sample</Label>
+                    <Select value={previewForm.isSample} onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, isSample: value as "yes" | "no" }))}>
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="yes">Yes</SelectItem>
+                        <SelectItem value="no">No</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-1.5 sm:col-span-2">
+                    <Label>File name</Label>
+                    <Input
+                      value={previewForm.fileName}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, fileName: event.target.value }))}
+                      placeholder="Enter file name"
+                      className="h-9"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="space-y-1.5">
+                    <Label>Sheet width (mm)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.sheetWidthMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Sheet height (mm)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.sheetHeightMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Page margin top</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.pageMarginTopMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Page margin left</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.pageMarginLeftMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label>Row margin (optional)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.rowMarginMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Column margin (optional)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.columnMarginMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                </div>
+
+                {previewError && (
+                  <p className="text-sm text-destructive">{previewError}</p>
+                )}
+              </div>
+              <div className="flex gap-3 pt-1">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  disabled={isGeneratingPreview}
+                  onClick={() => setIsGeneratePreviewOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button className="flex-1 gap-1.5" disabled={isGeneratingPreview} onClick={() => void handleGeneratePreviewPdf()}>
+                  {isGeneratingPreview
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Download className="h-4 w-4" />}
+                  Generate preview
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
 
           {/* ── Generate Bar Code Dialog ── */}
           <Dialog open={isGenerateBarcodeOpen} onOpenChange={setIsGenerateBarcodeOpen}>
@@ -2316,26 +3133,40 @@ export function ProjectDetail() {
           </Dialog>
 
           {/* ── Add Group Dialog ── */}
-          <Dialog open={isAddGroupOpen} onOpenChange={(open) => { setIsAddGroupOpen(open); if (!open) { setNewGroupName(""); setNewGroupTemplateId(""); } }}>
-            <DialogContent className="sm:max-w-[400px]">
+          <Dialog open={isAddGroupOpen} onOpenChange={(open) => { setIsAddGroupOpen(open); if (!open) { resetAddGroupDialog(); } }}>
+            <DialogContent className="sm:max-w-[560px] p-0 overflow-hidden">
               <DialogHeader>
-                <DialogTitle>Add Group</DialogTitle>
-              </DialogHeader>
-              <div className="space-y-3 py-1">
-                <div className="space-y-1.5">
-                  <Label>Group Name <span className="text-destructive">*</span></Label>
-                  <Input
-                    value={newGroupName}
-                    onChange={(e) => setNewGroupName(e.target.value)}
-                    placeholder="e.g. Class A, Good Quality…"
-                    onKeyDown={(e) => { if (e.key === "Enter") handleAddGroup(); }}
-                  />
+                <div className="border-b bg-muted/30 px-6 py-4">
+                  <DialogTitle>Add Group</DialogTitle>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Create a print group and assign a template for grouped records.
+                  </p>
                 </div>
+              </DialogHeader>
+              <div className="space-y-5 px-6 py-5">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-1.5">
+                    <Label>Group Name <span className="text-destructive">*</span></Label>
+                    <Input
+                      value={newGroupName}
+                      onChange={(e) => setNewGroupName(e.target.value)}
+                      placeholder="e.g. Class A, Good Quality"
+                      onKeyDown={(e) => { if (e.key === "Enter") handleAddGroup(); }}
+                      className="h-9"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label>School</Label>
+                    <Input value={project?.client || "-"} readOnly className="h-9 bg-muted/40" />
+                  </div>
+                </div>
+
                 <div className="space-y-1.5">
                   <Label>Template</Label>
                   <Select value={newGroupTemplateId || "__none__"} onValueChange={(val) => setNewGroupTemplateId(val === "__none__" ? "" : val)}>
                     <SelectTrigger className="h-9">
-                      <SelectValue placeholder={templates.length === 0 ? "No templates available" : "Select a template…"} />
+                      <SelectValue placeholder={templates.length === 0 ? "No templates available" : "Select a template"} />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="__none__">No template</SelectItem>
@@ -2354,10 +3185,100 @@ export function ProjectDetail() {
                     <p className="text-xs text-muted-foreground">Create templates in the Templates tab first.</p>
                   )}
                 </div>
+
+                <div className="space-y-2">
+                  <Label>Filters</Label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">Class</Label>
+                      <Select
+                        value={newGroupFilters.classValue}
+                        onValueChange={(value) => setNewGroupFilters((prev) => ({ ...prev, classValue: value }))}
+                      >
+                        <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Class" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={GROUP_FILTER_ALL}>All</SelectItem>
+                          {groupFilterOptions.classValue.map((value) => (
+                            <SelectItem key={value} value={value}>{value}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">Gender</Label>
+                      <Select
+                        value={newGroupFilters.gender}
+                        onValueChange={(value) => setNewGroupFilters((prev) => ({ ...prev, gender: value }))}
+                      >
+                        <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Gender" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={GROUP_FILTER_ALL}>All</SelectItem>
+                          {groupFilterOptions.gender.map((value) => (
+                            <SelectItem key={value} value={value}>{value}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">Transport</Label>
+                      <Select
+                        value={newGroupFilters.transport}
+                        onValueChange={(value) => setNewGroupFilters((prev) => ({ ...prev, transport: value }))}
+                      >
+                        <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Transport" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={GROUP_FILTER_ALL}>All</SelectItem>
+                          {groupFilterOptions.transport.map((value) => (
+                            <SelectItem key={value} value={value}>{value}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">Boarding</Label>
+                      <Select
+                        value={newGroupFilters.boarding}
+                        onValueChange={(value) => setNewGroupFilters((prev) => ({ ...prev, boarding: value }))}
+                      >
+                        <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Boarding" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={GROUP_FILTER_ALL}>All</SelectItem>
+                          {groupFilterOptions.boarding.map((value) => (
+                            <SelectItem key={value} value={value}>{value}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">House</Label>
+                      <Select
+                        value={newGroupFilters.house}
+                        onValueChange={(value) => setNewGroupFilters((prev) => ({ ...prev, house: value }))}
+                      >
+                        <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="House" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={GROUP_FILTER_ALL}>All</SelectItem>
+                          {groupFilterOptions.house.map((value) => (
+                            <SelectItem key={value} value={value}>{value}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                  Selected records can be assigned to this group from the Data tab after creating it.
+                </div>
               </div>
-              <div className="flex gap-3 pt-1">
+
+              <div className="flex gap-3 px-6 pb-6">
                 <Button variant="outline" className="flex-1" onClick={() => setIsAddGroupOpen(false)}>Cancel</Button>
-                <Button className="flex-1" onClick={handleAddGroup} disabled={!newGroupName.trim()}>Add Group</Button>
+                <Button className="flex-1" onClick={handleAddGroup} disabled={!newGroupName.trim()}>Create Group</Button>
               </div>
             </DialogContent>
           </Dialog>

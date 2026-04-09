@@ -7,6 +7,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "./ui/accordion";
 import { ScrollArea } from "./ui/scroll-area";
 import { Separator } from "./ui/separator";
 import {
@@ -34,6 +35,24 @@ import {
 } from "../../lib/importMapping";
 
 type Step = "upload" | "mapping" | "preview" | "done";
+
+const BASIC_INFO_KEYS = ["className", "sec", "gender", "email", "admDate", "session"] as const;
+const PARENT_DETAILS_KEYS = [
+  "fatherAadhaar",
+  "fatherOccupation",
+  "fatherProfilePic",
+  "motherAadhaar",
+  "motherMobNo",
+  "motherOccupation",
+  "motherWhatsApp",
+] as const;
+const ADDITIONAL_INFO_KEYS = ["religion", "caste", "subCaste"] as const;
+const SYSTEM_INFO_KEYS = ["rfid"] as const;
+const ADDITIONAL_DETAIL_KEY_SET = new Set<string>([
+  ...PARENT_DETAILS_KEYS,
+  ...ADDITIONAL_INFO_KEYS,
+  ...SYSTEM_INFO_KEYS,
+]);
 
 function validPhone(v?: string | number) {
   return !!v && /^\+?\d{7,15}$/.test(String(v).replace(/[\s\-()]/g, ""));
@@ -182,6 +201,155 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
   );
   const sampleValue      = (col: string) => rows[0]?.[col] ?? "–";
 
+  const projectFieldByKey = useMemo(
+    () => new Map(projectFields.map((field) => [field.key, field])),
+    [projectFields]
+  );
+
+  const basicInfoFields = useMemo(() => {
+    const prioritized = BASIC_INFO_KEYS
+      .map((key) => projectFieldByKey.get(key))
+      .filter((field): field is ImportSystemField => Boolean(field));
+    const prioritizedKeys = new Set(prioritized.map((field) => field.key));
+
+    const remaining = projectFields.filter(
+      (field) => !ADDITIONAL_DETAIL_KEY_SET.has(field.key) && !prioritizedKeys.has(field.key)
+    );
+
+    return [...prioritized, ...remaining];
+  }, [projectFields, projectFieldByKey]);
+
+  const parentDetailsFields = useMemo(
+    () => PARENT_DETAILS_KEYS
+      .map((key) => projectFieldByKey.get(key))
+      .filter((field): field is ImportSystemField => Boolean(field)),
+    [projectFieldByKey]
+  );
+
+  const additionalInfoFields = useMemo(
+    () => ADDITIONAL_INFO_KEYS
+      .map((key) => projectFieldByKey.get(key))
+      .filter((field): field is ImportSystemField => Boolean(field)),
+    [projectFieldByKey]
+  );
+
+  const systemInfoFields = useMemo(
+    () => SYSTEM_INFO_KEYS
+      .map((key) => projectFieldByKey.get(key))
+      .filter((field): field is ImportSystemField => Boolean(field)),
+    [projectFieldByKey]
+  );
+
+  const additionalFieldCount = parentDetailsFields.length + additionalInfoFields.length + systemInfoFields.length;
+
+  const renderMappingRow = (field: ImportSystemField) => {
+    const selected = mapping[field.key];
+    const sample = selected ? sampleValue(selected) : null;
+    const selectableHeaders = getSelectableHeaders(headers, mapping, field.key);
+    const admissionMapped = isMappedColumn(mapping.admissionNo);
+    const rollMapped = isMappedColumn(mapping.rollNo);
+    const fieldLocked =
+      (field.key === "rollNo" && admissionMapped && !isMappedColumn(mapping.rollNo))
+      || (field.key === "admissionNo" && rollMapped && !isMappedColumn(mapping.admissionNo));
+
+    return (
+      <TableRow key={field.key}>
+        <TableCell className="font-medium">
+          {field.label}
+          {field.required && <span className="text-destructive ml-1">*</span>}
+        </TableCell>
+        <TableCell className="min-w-[200px]">
+          <Select
+            value={mapping[field.key] ?? "__none__"}
+            disabled={fieldLocked}
+            onValueChange={(v) =>
+              setMapping((prev) => {
+                const next = { ...prev };
+                if (v === SKIP_MAPPING_VALUE) {
+                  next[field.key] = SKIP_MAPPING_VALUE;
+                } else if (v === "__none__") {
+                  delete next[field.key];
+                } else {
+                  next[field.key] = v;
+                }
+
+                if (field.key === "admissionNo" && isMappedColumn(next.admissionNo)) {
+                  delete next.rollNo;
+                }
+                if (field.key === "rollNo" && isMappedColumn(next.rollNo)) {
+                  delete next.admissionNo;
+                }
+
+                return normalizeMapping(next, projectFields);
+              })
+            }
+          >
+            <SelectTrigger className="h-8 text-sm">
+              <SelectValue placeholder="Select column" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__none__" className="text-muted-foreground text-xs">
+                — Select column —
+              </SelectItem>
+              <SelectItem value={SKIP_MAPPING_VALUE} className="text-muted-foreground text-xs">
+                — Skip this field —
+              </SelectItem>
+              {selectableHeaders.map((h) => (
+                <SelectItem key={h} value={h} className="text-sm">{h}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </TableCell>
+        <TableCell className="text-sm text-muted-foreground">
+          {selected && isMappedColumn(selected)
+            ? sample
+            : selected && isSkippedColumn(selected)
+              ? <span className="italic">Skipped</span>
+              : <span className="italic">No mapping</span>}
+        </TableCell>
+        <TableCell className="text-center">
+          {selected && isMappedColumn(selected) ? (
+            <CheckCircle className="h-4 w-4 text-success mx-auto" />
+          ) : selected && isSkippedColumn(selected) ? (
+            <span className="text-xs text-muted-foreground">skipped</span>
+          ) : fieldLocked ? (
+            <span className="text-xs text-muted-foreground">auto</span>
+          ) : field.required ? (
+            <AlertCircle className="h-4 w-4 text-destructive mx-auto" />
+          ) : (
+            <span className="text-xs text-muted-foreground">optional</span>
+          )}
+        </TableCell>
+      </TableRow>
+    );
+  };
+
+  const renderMappingTable = (fields: ImportSystemField[]) => (
+    <div className="rounded-md border overflow-hidden">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-[180px]">Project Field</TableHead>
+            <TableHead>Excel Column</TableHead>
+            <TableHead className="text-muted-foreground">Sample Data</TableHead>
+            <TableHead className="w-[90px] text-center">Status</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {fields.length > 0 ? (
+            fields.map((field) => renderMappingRow(field))
+          ) : (
+            <TableRow>
+              <TableCell colSpan={4} className="text-sm text-muted-foreground py-6 text-center">
+                No fields available in this section.
+              </TableCell>
+            </TableRow>
+          )}
+        </TableBody>
+      </Table>
+    </div>
+  );
+
   // ── Validation ────────────────────────────────────────────────────────────
   const validate = (): string[] => {
     const errs = validateMapping(projectFields, mapping);
@@ -326,99 +494,43 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
                 <Badge variant="outline">{mappedCount} / {projectFields.length} fields mapped</Badge>
               </div>
             </CardHeader>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-[180px]">Project Field</TableHead>
-                    <TableHead>Excel Column</TableHead>
-                    <TableHead className="text-muted-foreground">Sample Data</TableHead>
-                    <TableHead className="w-[90px] text-center">Status</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {projectFields.map((field) => {
-                    const selected = mapping[field.key];
-                    const sample   = selected ? sampleValue(selected) : null;
-                    const selectableHeaders = getSelectableHeaders(headers, mapping, field.key);
-                    const admissionMapped = isMappedColumn(mapping.admissionNo);
-                    const rollMapped = isMappedColumn(mapping.rollNo);
-                    const fieldLocked =
-                      (field.key === "rollNo" && admissionMapped && !isMappedColumn(mapping.rollNo))
-                      || (field.key === "admissionNo" && rollMapped && !isMappedColumn(mapping.admissionNo));
-                    return (
-                      <TableRow key={field.key}>
-                        <TableCell className="font-medium">
-                          {field.label}
-                          {field.required && <span className="text-destructive ml-1">*</span>}
-                        </TableCell>
-                        <TableCell className="min-w-[200px]">
-                          <Select
-                            value={mapping[field.key] ?? "__none__"}
-                            disabled={fieldLocked}
-                            onValueChange={(v) =>
-                              setMapping((prev) => {
-                                const next = { ...prev };
-                                if (v === SKIP_MAPPING_VALUE) {
-                                  next[field.key] = SKIP_MAPPING_VALUE;
-                                } else if (v === "__none__") {
-                                  delete next[field.key];
-                                } else {
-                                  next[field.key] = v;
-                                }
+            <CardContent className="space-y-3">
+              <div className="space-y-2">
+                <h3 className="text-sm font-semibold">Basic Info</h3>
+                {renderMappingTable(basicInfoFields)}
+              </div>
 
-                                if (field.key === "admissionNo" && isMappedColumn(next.admissionNo)) {
-                                  delete next.rollNo;
-                                }
-                                if (field.key === "rollNo" && isMappedColumn(next.rollNo)) {
-                                  delete next.admissionNo;
-                                }
+              <Accordion type="single" collapsible>
+                <AccordionItem value="additional-details" className="rounded-md border px-3">
+                  <AccordionTrigger className="py-3 text-sm font-semibold hover:no-underline">
+                    Additional Details (Others)
+                  </AccordionTrigger>
+                  <AccordionContent className="pb-3">
+                    <div className="space-y-3">
+                      <div className="space-y-2">
+                        <h4 className="text-sm font-medium">Parent Details</h4>
+                        {renderMappingTable(parentDetailsFields)}
+                      </div>
 
-                                return normalizeMapping(next, projectFields);
-                              })
-                            }
-                          >
-                            <SelectTrigger className="h-8 text-sm">
-                              <SelectValue placeholder="Select column" />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="__none__" className="text-muted-foreground text-xs">
-                                — Select column —
-                              </SelectItem>
-                              <SelectItem value={SKIP_MAPPING_VALUE} className="text-muted-foreground text-xs">
-                                — Skip this field —
-                              </SelectItem>
-                              {selectableHeaders.map((h) => (
-                                <SelectItem key={h} value={h} className="text-sm">{h}</SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </TableCell>
-                        <TableCell className="text-sm text-muted-foreground">
-                          {selected && isMappedColumn(selected)
-                            ? sample
-                            : selected && isSkippedColumn(selected)
-                              ? <span className="italic">Skipped</span>
-                              : <span className="italic">No mapping</span>}
-                        </TableCell>
-                        <TableCell className="text-center">
-                          {selected && isMappedColumn(selected) ? (
-                            <CheckCircle className="h-4 w-4 text-success mx-auto" />
-                          ) : selected && isSkippedColumn(selected) ? (
-                            <span className="text-xs text-muted-foreground">skipped</span>
-                          ) : fieldLocked ? (
-                            <span className="text-xs text-muted-foreground">auto</span>
-                          ) : field.required ? (
-                            <AlertCircle className="h-4 w-4 text-destructive mx-auto" />
-                          ) : (
-                            <span className="text-xs text-muted-foreground">optional</span>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
+                      <div className="space-y-2">
+                        <h4 className="text-sm font-medium">Additional Info</h4>
+                        {renderMappingTable(additionalInfoFields)}
+                      </div>
+
+                      <div className="space-y-2">
+                        <h4 className="text-sm font-medium">System Info</h4>
+                        {renderMappingTable(systemInfoFields)}
+                      </div>
+
+                      {additionalFieldCount === 0 && (
+                        <p className="text-sm text-muted-foreground">
+                          None of the additional fields were detected in this file.
+                        </p>
+                      )}
+                    </div>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
             </CardContent>
           </Card>
 
