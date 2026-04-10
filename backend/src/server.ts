@@ -90,7 +90,7 @@ app.use('/api', (req, res) => {
 
 const frontendDistDir = path.resolve(repoRootDir, 'dist');
 const frontendIndexPath = path.resolve(frontendDistDir, 'index.html');
-if (process.env.NODE_ENV === 'production' && fs.existsSync(frontendIndexPath)) {
+if (fs.existsSync(frontendIndexPath)) {
   // In one-service deployment, serve the Vite build from Express.
   app.use(express.static(frontendDistDir));
   app.get(/^\/(?!api\/|uploads\/|student-photos\/|health$).*/, (req, res) => {
@@ -125,6 +125,9 @@ async function startServer() {
         console.log('✓ PostgreSQL auth database connected successfully');
       }
       console.log(`✓ Serving uploads from: ${uploadsDir}`);
+      if (fs.existsSync(frontendIndexPath)) {
+        console.log(`✓ Serving frontend build from: ${frontendDistDir}`);
+      }
       if (studentPhotosDir && fs.existsSync(path.resolve(studentPhotosDir))) {
         console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
       }
