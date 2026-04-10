@@ -3,7 +3,7 @@ services:
     name: enterprise-saas-app
     runtime: node
     rootDir: .
-    buildCommand: npm ci --include=dev && npm --prefix backend ci && npm run build:all
+    buildCommand: npm ci --include=dev && npm --prefix backend ci --include=dev && npm run build:all
     startCommand: npm run start:render
     healthCheckPath: /health
     envVars:
