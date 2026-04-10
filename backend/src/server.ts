@@ -55,8 +55,9 @@ if (!fs.existsSync(uploadsDir)) {
 }
 app.use('/uploads', express.static(uploadsDir));
 
+const isRenderEnvironment = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID);
 const studentPhotosDir = process.env.STUDENT_PHOTOS_DIR?.trim()
-  || (process.env.NODE_ENV !== 'production' ? 'C:/Users/Sayali/OneDrive/Sem-V/Photos' : '');
+  || (process.env.NODE_ENV !== 'production' && !isRenderEnvironment ? 'C:/Users/Sayali/OneDrive/Sem-V/Photos' : '');
 // Fallback lookup: if a file is not found in backend/uploads, also try student photos.
 if (studentPhotosDir) {
   const resolvedStudentDir = path.resolve(studentPhotosDir);
