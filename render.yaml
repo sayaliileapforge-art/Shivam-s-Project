@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: enterprise-saas-backend
+    name: enterprise-saas-app
     runtime: node
-    rootDir: backend
-    buildCommand: npm ci && npm run build
-    startCommand: npm start
+    rootDir: .
+    buildCommand: npm ci --include=dev && npm --prefix backend ci && npm run build:all
+    startCommand: npm run start:render
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
@@ -15,23 +15,3 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
-
-  - type: web
-    name: enterprise-saas-frontend
-    runtime: static
-    rootDir: .
-    buildCommand: npm ci && npm run build
-    staticPublishPath: dist
-    envVars:
-      - key: VITE_API_BASE_URL
-        sync: false
-    routes:
-      - type: proxy
-        source: /api/*
-        destination: https://enterprise-saas-backend.onrender.com/api/:splat
-      - type: proxy
-        source: /uploads/*
-        destination: https://enterprise-saas-backend.onrender.com/uploads/:splat
-      - type: rewrite
-        source: /*
-        destination: /index.html
