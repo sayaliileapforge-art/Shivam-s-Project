@@ -797,7 +797,12 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         };
       };
 
+      // fitText: auto-shrink font so element fits the safe area.
+      // For Textbox, skip height-driven shrinkage — its height grows with content
+      // and clamping via font size would prevent word-wrap from spanning multiple lines.
+      // Only shrink when width exceeds safe area (horizontal overflow).
       if (fitText && (obj instanceof fabric.IText || obj instanceof fabric.Textbox)) {
+        const isTextbox = obj instanceof fabric.Textbox;
         let fontSize = Number(obj.fontSize ?? 16);
         const minFontSize = 6;
 
@@ -805,7 +810,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         obj.setCoords();
 
         let bounds = getBounds();
-        while ((bounds.width > safeWidth || bounds.height > safeHeight) && fontSize > minFontSize) {
+        while (
+          (bounds.width > safeWidth || (!isTextbox && bounds.height > safeHeight))
+          && fontSize > minFontSize
+        ) {
           fontSize -= 1;
           obj.set({ fontSize });
           obj.setCoords();
@@ -814,10 +822,14 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       }
 
       let bounds = getBounds();
-      if (bounds.width > safeWidth || bounds.height > safeHeight) {
+      // For Textbox, allow the height to exceed the safe area (content-driven height).
+      // Only check width overflow and skip the scale-down that would distort text.
+      const overflowW = bounds.width > safeWidth;
+      const overflowH = !(obj instanceof fabric.Textbox) && bounds.height > safeHeight;
+      if (overflowW || overflowH) {
         const scaleRatio = Math.min(
-          safeWidth / Math.max(bounds.width, 1),
-          safeHeight / Math.max(bounds.height, 1),
+          overflowW ? safeWidth / Math.max(bounds.width, 1) : 1,
+          overflowH ? safeHeight / Math.max(bounds.height, 1) : 1,
           1
         );
 
@@ -888,8 +900,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
 
             if (!isLocked && obj instanceof fabric.Textbox) {
               obj.set({
-                centeredScaling: true,
-                lockScalingY: true,
+                centeredScaling: false,
+                lockScalingY: false,
                 lockSkewingX: true,
                 lockSkewingY: true,
               });
@@ -899,7 +911,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
                 bl: false,
                 br: false,
                 mt: false,
-                mb: false,
+                mb: true,
                 ml: true,
                 mr: true,
                 mtr: true,
@@ -922,8 +934,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
 
             if (!isLocked && obj instanceof fabric.Textbox) {
               obj.set({
-                centeredScaling: true,
-                lockScalingY: true,
+                centeredScaling: false,
+                lockScalingY: false,
                 lockSkewingX: true,
                 lockSkewingY: true,
               });
@@ -933,7 +945,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
                 bl: false,
                 br: false,
                 mt: false,
-                mb: false,
+                mb: true,
                 ml: true,
                 mr: true,
                 mtr: true,
@@ -954,8 +966,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
 
           if (!isLocked && e.target instanceof fabric.Textbox) {
             e.target.set({
-              centeredScaling: true,
-              lockScalingY: true,
+              centeredScaling: false,
+              lockScalingY: false,
               lockSkewingX: true,
               lockSkewingY: true,
             });
@@ -965,14 +977,15 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
               bl: false,
               br: false,
               mt: false,
-              mb: false,
+              mb: true,
               ml: true,
               mr: true,
               mtr: true,
             });
           }
 
-          constrainObjectToSafeArea(e.target, true);
+          // For Textbox, skip fitText — auto-shrinking font on add undoes wrapping.
+          constrainObjectToSafeArea(e.target, !(e.target instanceof fabric.Textbox));
         }
       });
 
@@ -2482,12 +2495,17 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const active = fc?.getActiveObject();
         if (!fc || !active) return;
         const anyActive = active as any;
+
+        // When there is no previously stored box width (first time enabling wrap on
+        // a fresh IText), do NOT use getScaledWidth() — that returns the full
+        // rendered text width and would make the Textbox exactly as wide as the
+        // unwrapped text, so nothing would ever wrap.  Use 200 as a sensible
+        // default that forces visible wrapping.
         const boxW = Math.max(
           40,
           Number(fixedWidth)
           || Number(anyActive.__boxWidth)
-          || Number(active.getScaledWidth())
-          || 80
+          || 200
         );
         const boxH = Math.max(
           20,
@@ -2501,6 +2519,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           tb.set({ width: boxW, scaleX: 1 });
           (tb as any).__boxWidth = boxW;
           (tb as any).__boxHeight = boxH;
+          // Force Fabric to re-compute wrapped lines after property changes.
+          (tb as any).initDimensions?.();
           tb.setCoords();
           fc.fire("object:modified", { target: active });
           fc.renderAll();
@@ -2537,6 +2557,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           scaleY: it.scaleY,
           ...extraProps,
         });
+        // Re-compute wrapped lines in the new Textbox before rendering.
+        (tb as any).initDimensions?.();
         ignoreSaveRef.current = true;
         fc.remove(active);
         fc.add(tb);

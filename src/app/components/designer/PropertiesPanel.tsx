@@ -242,7 +242,7 @@ function getTextEffectFromObject(text: fabric.IText | fabric.Textbox): TextEffec
 
 function SLabel({ children }: { children: React.ReactNode }) {
   return (
-    <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+    <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
       {children}
     </p>
   );

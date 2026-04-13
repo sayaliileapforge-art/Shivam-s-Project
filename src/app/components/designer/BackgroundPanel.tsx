@@ -1,13 +1,13 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ImagePlus, Pencil, X, Bookmark, Trash2 } from "lucide-react";
 import { Button } from "../ui/button";
 import { Label } from "../ui/label";
 import { Separator } from "../ui/separator";
 import { Slider } from "../ui/slider";
 
-// ─── Color palette ────────────────────────────────────────────────────────────
-// Organised: whites/neutrals → dark neutrals → reds → oranges/yellows
-//            → greens → teals → blues → purples/pinks
+// --- Color palette ------------------------------------------------------------
+// Organised: whites/neutrals ? dark neutrals ? reds ? oranges/yellows
+//            ? greens ? teals ? blues ? purples/pinks
 const COLOR_SWATCHES = [
   // Whites / Neutrals
   "#ffffff", "#f8fafc", "#f1f5f9", "#e2e8f0", "#cbd5e1", "#94a3b8",
@@ -67,7 +67,7 @@ const GRADIENT_PRESETS: GradientPreset[] = [
   { id: "lagoon", label: "Lagoon", start: "#0f766e", end: "#67e8f9" },
 ];
 
-// ─── Saved fills (localStorage) ───────────────────────────────────────────────
+// --- Saved fills (localStorage) -----------------------------------------------
 const SAVED_FILLS_KEY = "designer_saved_fills";
 
 interface SavedFill {
@@ -89,7 +89,7 @@ function persistSavedFills(fills: SavedFill[]) {
   localStorage.setItem(SAVED_FILLS_KEY, JSON.stringify(fills));
 }
 
-// ─── Gradient helpers ─────────────────────────────────────────────────────────
+// --- Gradient helpers ---------------------------------------------------------
 function clamp(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n));
 }
@@ -402,7 +402,7 @@ export function BackgroundPanel({
     );
   };
 
-  // ── Save / delete helpers ────────────────────────────────────────────────────
+  // -- Save / delete helpers ----------------------------------------------------
   const saveFill = (type: "solid" | "gradient", value: string) => {
     // Avoid exact duplicates
     if (savedFills.some((f) => f.value === value)) return;
@@ -445,9 +445,9 @@ export function BackgroundPanel({
 
   return (
     <div className="p-3 space-y-4">
-      {/* ── Fill Type ──────────────────────────────────────────────────────── */}
+      {/* -- Fill Type -------------------------------------------------------- */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
           Fill Type
         </p>
         <div className="grid grid-cols-2 gap-1.5">
@@ -468,12 +468,12 @@ export function BackgroundPanel({
         </div>
       </div>
 
-      {/* ── Solid Color ────────────────────────────────────────────────────── */}
+      {/* -- Solid Color ------------------------------------------------------ */}
       {fillType === "solid" && (
         <div className="space-y-3">
           {/* Current color row */}
           <div>
-            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+            <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
               Fill Color
             </p>
             <div className="flex items-center justify-between">
@@ -513,9 +513,9 @@ export function BackgroundPanel({
             </div>
           </div>
 
-          {/* Color palette – always visible */}
+          {/* Color palette � always visible */}
           <div>
-            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+            <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
               Color Palette
             </p>
             <div className="grid grid-cols-6 gap-1">
@@ -535,7 +535,7 @@ export function BackgroundPanel({
         </div>
       )}
 
-      {/* ── Gradient ───────────────────────────────────────────────────────── */}
+      {/* -- Gradient --------------------------------------------------------- */}
       {fillType === "gradient" && (
         <div className="space-y-3">
           <div>
@@ -572,7 +572,7 @@ export function BackgroundPanel({
                 className="flex-1"
                 disabled={gradientType === "radial"}
               />
-              <span className="text-xs text-muted-foreground w-12 text-right">{gradientAngle}°</span>
+              <span className="text-xs text-muted-foreground w-12 text-right">{gradientAngle}�</span>
             </div>
           </div>
 
@@ -737,9 +737,9 @@ export function BackgroundPanel({
 
       <Separator />
 
-      {/* ── Saved Combinations ─────────────────────────────────────────────── */}
+      {/* -- Saved Combinations ----------------------------------------------- */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
           Saved Combinations
         </p>
         {savedFills.length === 0 ? (
@@ -767,7 +767,7 @@ export function BackgroundPanel({
                 {/* Label */}
                 <button
                   onClick={() => applySavedFill(fill)}
-                  className="flex-1 text-left text-[10px] text-muted-foreground font-mono truncate leading-none hover:text-foreground transition-colors"
+                  className="flex-1 min-w-0 text-left text-[10px] text-muted-foreground font-mono break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full leading-snug hover:text-foreground transition-colors"
                   title={fill.value}
                 >
                   {fill.label}
@@ -792,9 +792,9 @@ export function BackgroundPanel({
 
       <Separator />
 
-      {/* ── Background (no bg / clear) ─────────────────────────────────────── */}
+      {/* -- Background (no bg / clear) --------------------------------------- */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
           Background
         </p>
         <button
@@ -816,9 +816,9 @@ export function BackgroundPanel({
 
       <Separator />
 
-      {/* ── Image ──────────────────────────────────────────────────────────── */}
+      {/* -- Image ------------------------------------------------------------ */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
           Image
         </p>
         <Button
@@ -851,12 +851,12 @@ export function BackgroundPanel({
         </p>
       </div>
 
-      {/* ── Image Fit Mode (if image is active) ────────────────────────────── */}
+      {/* -- Image Fit Mode (if image is active) ------------------------------ */}
       {(currentBg === "image" || currentBg === "svg") && (
         <>
           <Separator />
           <div>
-            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+            <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
               Fit Mode
             </p>
             <div className="grid grid-cols-2 gap-1.5">
@@ -888,12 +888,12 @@ export function BackgroundPanel({
             </p>
           </div>
 
-          {/* ── Position Controls (both modes) ────────────────────────────── */}
+          {/* -- Position Controls (both modes) ------------------------------ */}
           {(imageFitMode === "contain" || imageFitMode === "cover") && (
             <>
               <Separator />
               <div>
-                <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+                <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
                   Position
                 </p>
                 <div className="grid grid-cols-3 gap-1 mb-2">
@@ -904,7 +904,7 @@ export function BackgroundPanel({
                     onClick={() => onMoveBackground?.(0, -10)}
                     title="Move up"
                   >
-                    ↑
+                    ?
                   </Button>
                   <Button
                     variant="outline"
@@ -922,7 +922,7 @@ export function BackgroundPanel({
                     onClick={() => onMoveBackground?.(0, 10)}
                     title="Move down"
                   >
-                    ↓
+                    ?
                   </Button>
                 </div>
                 <div className="grid grid-cols-3 gap-1">
@@ -933,7 +933,7 @@ export function BackgroundPanel({
                     onClick={() => onMoveBackground?.(-10, 0)}
                     title="Move left"
                   >
-                    ←
+                    ?
                   </Button>
                   <Button
                     variant="outline"
@@ -941,7 +941,7 @@ export function BackgroundPanel({
                     className="h-7 text-[10px]"
                     disabled
                   >
-                    •
+                    �
                   </Button>
                   <Button
                     variant="outline"
@@ -950,7 +950,7 @@ export function BackgroundPanel({
                     onClick={() => onMoveBackground?.(10, 0)}
                     title="Move right"
                   >
-                    →
+                    ?
                   </Button>
                 </div>
                 <p className="text-[9px] text-muted-foreground mt-1.5">
@@ -964,9 +964,9 @@ export function BackgroundPanel({
 
       <Separator />
 
-      {/* ── SVG ────────────────────────────────────────────────────────────── */}
+      {/* -- SVG -------------------------------------------------------------- */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
           SVG Background
         </p>
         <Button

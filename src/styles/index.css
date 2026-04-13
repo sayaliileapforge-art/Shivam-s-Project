@@ -34,3 +34,101 @@ aside {
 .scroll-area {
   transition: all 0.3s ease-in-out;
 }
+
+/* ── Designer Studio: Text Rendering & Responsive Typography ────────────────
+   Scoped via data-dsid attributes set on the DesignerStudio root and right
+   panel. Rules apply word-wrap, overflow protection and clamp()-based
+   responsive font sizing so text never clips, overflows, or falls below
+   a legible minimum size across mobile/tablet/desktop viewports.
+
+   KEY UPGRADE: overflow-wrap:anywhere + word-break:break-word are used
+   instead of the weaker break-word-only variants. This ensures long
+   continuous strings (IDs, emails, no-space text) always wrap inside the
+   container without horizontal overflow.
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* 1. Root scope: force-break ANY unbreakable string anywhere in the studio  */
+[data-dsid="designer"] {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  word-wrap: break-word;
+}
+
+/* 2. ALL text-bearing elements inside the panel: enforce wrapping            */
+[data-dsid="designer-panel"] p,
+[data-dsid="designer-panel"] span,
+[data-dsid="designer-panel"] label,
+[data-dsid="designer-panel"] .ds-panel-desc,
+[data-dsid="designer-panel"] textarea,
+[data-dsid="designer-panel"] input[type="text"],
+[data-dsid="designer-panel"] input:not([type="color"]):not([type="range"]):not([type="number"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  word-wrap: break-word;
+  max-width: 100%;
+}
+
+/* 3. CSS custom properties for clamped font sizes used in panel sections.
+      Min = smallest legible size, preferred scales with viewport width,
+      max = design cap. Applied where .ds-label-auto is set on a container. */
+[data-dsid="designer-panel"] {
+  --ds-font-xxs: clamp(9px, 0.5vw + 7.5px, 10.5px);
+  --ds-font-xs:  clamp(10px, 0.6vw + 8.5px, 12px);
+  --ds-font-sm:  clamp(12px, 0.7vw + 10px, 14px);
+}
+
+/* 4. Utility: responsive label sizing (apply .ds-label-auto in JSX)         */
+[data-dsid="designer-panel"] .ds-label-auto {
+  font-size: var(--ds-font-xxs);
+  line-height: 1.35;
+}
+
+/* 5. Utility: explicit force-break class (apply .ds-break in JSX)           */
+[data-dsid="designer"] .ds-break {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  word-wrap: break-word;
+  white-space: normal;
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* 6. Flex/grid containers: prevent children from escaping width bounds       */
+[data-dsid="designer-panel"] .min-w-0 {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  word-wrap: break-word;
+  max-width: 100%;
+}
+
+/* 7. Prevent intentional single-line UI controls from wrapping              */
+[data-dsid="designer"] button,
+[data-dsid="designer"] .ds-nowrap {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 8. Layer list & named labels: strong break without truncation              */
+[data-dsid="designer"] .ds-layer-label {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  word-wrap: break-word;
+  white-space: normal;
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* 9. Canvas property input values: must never overflow their input box       */
+[data-dsid="designer-panel"] input[type="text"],
+[data-dsid="designer-panel"] textarea {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 10. Undo rule 9 overflow:hidden for multi-line textarea (let it scroll)   */
+[data-dsid="designer-panel"] textarea {
+  overflow: auto;
+  text-overflow: clip;
+}

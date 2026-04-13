@@ -1,7 +1,7 @@
 /**
  * ContextToolbar - floats below the main toolbar when an element is selected.
  */
-import type { ReactElement, ReactNode, RefObject } from "react";
+import { useState, useEffect, type ReactElement, type ReactNode, type RefObject } from "react";
 import * as fabric from "fabric";
 import {
   AlignCenter,
@@ -77,6 +77,17 @@ function VSep() {
 }
 
 export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Props) {
+  // ── Hooks (must be before any early returns) ─────────────────────────────
+  // Local editing state lets the user type freely without each keystroke
+  // immediately clamping & re-applying the value.
+  const [isEditingFontSize, setIsEditingFontSize] = useState(false);
+  const [fontSizeInputVal, setFontSizeInputVal] = useState("16");
+
+  // Reset editing state when selection changes so stale input is discarded.
+  useEffect(() => {
+    setIsEditingFontSize(false);
+  }, [selected]);
+
   if (!selected) return null;
 
   const fc = canvasRef.current?.getCanvas();
@@ -88,21 +99,35 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
   const textObj = selected as fabric.IText;
   const rectObj = selected as fabric.Rect;
 
-  // Central update helper so every mutation path applies the same clamp+refresh flow.
+  // Central update helper.
+  // Calls initDimensions() for text objects so coordinates are correct before
+  // the object:modified event fires. Does NOT call constrainSelectedToSafeArea
+  // (which uses fitText=true and would override manual font-size changes);
+  // position clamping is already handled by the object:modified → clampToMargin
+  // listener registered inside FabricCanvas.
   const applyProps = (props: Record<string, unknown>) => {
     selected.set(props);
+    if (selected instanceof fabric.IText) {
+      (selected as any).initDimensions?.();
+    }
     selected.setCoords();
-    canvasRef.current?.constrainSelectedToSafeArea();
     fc.fire("object:modified", { target: selected });
     fc.renderAll();
     onRefresh();
+  };
+
+  // Apply a font size clamped to [6, 200] without triggering auto-fit overrides.
+  const applyFontSize = (size: number) => {
+    const clamped = Math.min(200, Math.max(6, Math.round(size) || 6));
+    applyProps({ fontSize: clamped });
+    setIsEditingFontSize(false);
+    setFontSizeInputVal(String(clamped));
   };
 
   const applyText = (nextText: string) => {
     textObj.set({ text: nextText });
     (textObj as any).initDimensions?.();
     textObj.setCoords();
-    canvasRef.current?.constrainSelectedToSafeArea();
     fc.fire("object:modified", { target: textObj });
     fc.renderAll();
     onRefresh();
@@ -111,6 +136,9 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
   const fontSize = isText ? (textObj.fontSize ?? 16) : 0;
   const fontFamily = isText ? (textObj.fontFamily ?? "Inter") : "Inter";
   const fillColor = (selected.fill as string) ?? "#000000";
+  // While user is actively editing the input show their local text; otherwise
+  // reflect the live canvas value so external changes (undo, auto-fit) are visible.
+  const fontSizeDisplay = isEditingFontSize ? fontSizeInputVal : String(fontSize);
 
   return (
     <TooltipProvider delayDuration={300}>
@@ -157,7 +185,7 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
                 variant="ghost"
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => applyProps({ fontSize: Math.max(6, fontSize - 1) })}
+                onClick={() => applyFontSize(fontSize - 1)}
               >
                 <Minus className="h-3 w-3" />
               </Button>
@@ -166,9 +194,27 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
             <Input
               type="number"
               min={6}
-              max={300}
-              value={fontSize}
-              onChange={(e) => applyProps({ fontSize: Math.max(6, parseInt(e.target.value, 10) || 6) })}
+              max={200}
+              value={fontSizeDisplay}
+              onChange={(e) => {
+                setIsEditingFontSize(true);
+                setFontSizeInputVal(e.target.value);
+              }}
+              onBlur={() => {
+                const parsed = parseInt(fontSizeInputVal, 10);
+                applyFontSize(isNaN(parsed) ? fontSize : parsed);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const parsed = parseInt(fontSizeInputVal, 10);
+                  applyFontSize(isNaN(parsed) ? fontSize : parsed);
+                  (e.target as HTMLInputElement).blur();
+                }
+                if (e.key === "Escape") {
+                  setIsEditingFontSize(false);
+                  setFontSizeInputVal(String(fontSize));
+                }
+              }}
               className="h-7 w-14 shrink-0 px-1 text-center text-xs"
             />
 
@@ -177,7 +223,7 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
                 variant="ghost"
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => applyProps({ fontSize: Math.min(300, fontSize + 1) })}
+                onClick={() => applyFontSize(fontSize + 1)}
               >
                 <Plus className="h-3 w-3" />
               </Button>

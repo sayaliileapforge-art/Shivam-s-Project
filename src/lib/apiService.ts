@@ -97,9 +97,12 @@ async function parseApiResponse<T>(response: Response): Promise<ApiResponse<T>> 
 //  Projects API
 // ─────────────────────────────────────────────────────────────
 
-export async function fetchProjects() {
+export async function fetchProjects(clientId?: string) {
   try {
-    const response = await fetch(`${API_BASE}/projects`);
+    const url = clientId
+      ? `${API_BASE}/projects?clientId=${encodeURIComponent(clientId)}`
+      : `${API_BASE}/projects`;
+    const response = await fetch(url);
     const result = await response.json() as ApiResponse<any[]>;
     return result.data || [];
   } catch (error) {

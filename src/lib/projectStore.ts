@@ -216,6 +216,8 @@ export function deleteProjectFile(id: string): void {
 export interface ProjectTemplate {
   id: string;
   projectId: string;
+  /** Client that owns this template — used to show all same-client templates across projects */
+  clientId?: string;
   templateName: string;
   templateType: "id_card" | "certificate" | "poster" | "custom";
   canvas: { width: number; height: number };
@@ -241,8 +243,47 @@ export function loadAllProjectTemplates(): ProjectTemplate[] {
   }
 }
 
-export function loadProjectTemplates(projectId: string): ProjectTemplate[] {
-  return loadAllProjectTemplates().filter((t) => t.projectId === projectId);
+/**
+ * Load templates visible in a project:
+ *   1. Same-client templates (any project belonging to the same client)
+ *   2. The project's own templates (in case clientId is missing on legacy records)
+ *   3. Globally public templates from any other client
+ * Results are deduped and ordered: own-client first, then public.
+ */
+export function loadProjectTemplates(projectId: string, clientId?: string): ProjectTemplate[] {
+  // Resolve clientId from local project store when not provided
+  const resolvedClientId = clientId
+    || loadProjects().find((p) => p.id === projectId)?.clientId
+    || "";
+
+  const all = loadAllProjectTemplates();
+  const seen = new Set<string>();
+  const result: ProjectTemplate[] = [];
+
+  // Pass 1: same-client templates (own project first, then sibling projects)
+  for (const t of all) {
+    if (t.projectId === projectId) {
+      seen.add(t.id);
+      result.push(t);
+    }
+  }
+  if (resolvedClientId) {
+    for (const t of all) {
+      if (!seen.has(t.id) && t.clientId === resolvedClientId) {
+        seen.add(t.id);
+        result.push(t);
+      }
+    }
+  }
+
+  // Pass 2: public templates from other clients
+  for (const t of all) {
+    if (!seen.has(t.id) && t.isPublic === true) {
+      result.push(t);
+    }
+  }
+
+  return result;
 }
 
 export function addProjectTemplate(data: Omit<ProjectTemplate, "id" | "createdAt">): ProjectTemplate {
@@ -250,7 +291,7 @@ export function addProjectTemplate(data: Omit<ProjectTemplate, "id" | "createdAt
   const all: ProjectTemplate[] = raw ? JSON.parse(raw) : [];
   const item: ProjectTemplate = {
     ...data,
-    isPublic: data.isPublic ?? true,
+    isPublic: data.isPublic ?? false,
     id: `TMPL-${Date.now()}`,
     createdAt: new Date().toLocaleDateString("en-IN"),
   };

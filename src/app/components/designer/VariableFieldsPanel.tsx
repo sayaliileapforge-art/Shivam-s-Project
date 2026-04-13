@@ -49,8 +49,8 @@ export function VariableFieldsPanel({ onAddField }: Props) {
   return (
     <div className="space-y-3 p-3">
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Dynamic Fields</p>
-        <p className="mt-1 text-[11px] text-muted-foreground">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Dynamic Fields</p>
+        <p className="mt-1 text-[11px] text-muted-foreground break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full">
           Click to add, or drag a field onto the canvas.
         </p>
       </div>
@@ -88,15 +88,15 @@ export function VariableFieldsPanel({ onAddField }: Props) {
             <GripVertical className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
             <FieldTypeIcon type={field.type} />
             <div className="min-w-0 flex-1">
-              <p className="truncate text-xs font-medium leading-4">{field.label}</p>
-              <p className="truncate text-[10px] text-muted-foreground">{"{{"}{field.key}{"}}"}</p>
+              <p className="break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full text-xs font-medium leading-4">{field.label}</p>
+              <p className="break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full text-[10px] text-muted-foreground">{"{{"}{field.key}{"}}"}</p>
             </div>
           </button>
         ))}
       </div>
 
       <div className="rounded-md border border-dashed p-2">
-        <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Custom Field</p>
+        <p className="mb-1 ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Custom Field</p>
         <div className="flex gap-1.5">
           <Input
             value={customKey}

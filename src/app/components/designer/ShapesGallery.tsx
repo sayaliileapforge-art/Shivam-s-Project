@@ -108,7 +108,7 @@ function GalleryItemCard({
       )}
 
       {/* Label */}
-      <span className="text-[11px] font-medium text-center line-clamp-2 text-muted-foreground group-hover:text-foreground">
+      <span className="text-[11px] font-medium text-center line-clamp-2 break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full text-muted-foreground group-hover:text-foreground">
         {item.label}
       </span>
 
@@ -247,7 +247,7 @@ export function ShapesGallery({
                           : "text-muted-foreground hover:bg-accent hover:text-foreground"
                       }`}
                     >
-                      <span className="truncate">{cat.label}</span>
+                      <span className="break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full">{cat.label}</span>
                       <span className="text-xs ml-2 opacity-70">{cat.count}</span>
                     </button>
                   ))}
@@ -306,11 +306,11 @@ export function ShapesGallery({
 
                         {/* Info */}
                         <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium truncate">
+                          <p className="text-sm font-medium break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full">
                             {item.label}
                           </p>
                           {item.description && (
-                            <p className="text-xs text-muted-foreground truncate">
+                            <p className="text-xs text-muted-foreground break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full line-clamp-2">
                               {item.description}
                             </p>
                           )}
@@ -391,7 +391,7 @@ export function ShapesGallery({
                         dangerouslySetInnerHTML={{ __html: normalizeShapePreviewSvg(preset.preview) }}
                       />
                     </div>
-                    <span className="text-[11px] font-medium text-center line-clamp-2 text-muted-foreground group-hover:text-foreground">
+                    <span className="text-[11px] font-medium text-center line-clamp-2 break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full text-muted-foreground group-hover:text-foreground">
                       {preset.label}
                     </span>
                     <span className="mt-1 text-[9px] px-1.5 py-0.5 rounded-full bg-primary/20 text-primary">

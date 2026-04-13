@@ -1,4 +1,4 @@
-﻿import { useState, useRef, useEffect, useCallback, type DragEvent } from "react";
+import { useState, useRef, useEffect, useCallback, type DragEvent } from "react";
 import { useNavigate } from "react-router";
 import * as fabric from "fabric";
 import jsPDF from "jspdf";
@@ -54,7 +54,7 @@ import {
 import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
 import { normalizeShapePreviewSvg, type ShapeItem } from "../../lib/shapesGallery";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// --- Types --------------------------------------------------------------------
 
 type DesignPage = { id: string; name: string; canvas: object };
 
@@ -251,7 +251,7 @@ function PagePreviewItem({
   );
 }
 
-// ─── Layers List ──────────────────────────────────────────────────────────────
+// --- Layers List --------------------------------------------------------------
 
 function LayersList({
   canvasRef, onRefresh,
@@ -280,7 +280,7 @@ function LayersList({
                 }`}
                 onClick={() => { fc?.setActiveObject(obj); fc?.renderAll(); onRefresh(); }}
               >
-                <span className="flex-1 truncate">{label}</span>
+                <span className="flex-1 min-w-0 break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full">{label}</span>
               </li>
             );
           })}
@@ -290,7 +290,7 @@ function LayersList({
   );
 }
 
-// ─── Alignment Tools ──────────────────────────────────────────────────────────
+// --- Alignment Tools ----------------------------------------------------------
 
 function AlignmentTools({
   canvasRef, onRefresh,
@@ -309,7 +309,7 @@ function AlignmentTools({
   ];
   return (
     <div className="p-3 space-y-3">
-      <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+      <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
         Align to Page
       </p>
       <div className="grid grid-cols-3 gap-1.5">
@@ -328,7 +328,7 @@ function AlignmentTools({
   );
 }
 
-// ─── ToolBtn ──────────────────────────────────────────────────────────────────
+// --- ToolBtn ------------------------------------------------------------------
 
 function ToolBtn({
   id, icon: Icon, label, activeTool, onClick,
@@ -357,7 +357,7 @@ function ToolBtn({
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+// --- Main Component -----------------------------------------------------------
 
 export function DesignerStudio() {
   const navigate = useNavigate();
@@ -367,7 +367,7 @@ export function DesignerStudio() {
   const loadTplInputRef = useRef<HTMLInputElement>(null);
   const canvasScrollRef = useRef<HTMLDivElement>(null);
 
-  // ── Core state ─────────────────────────────────────────────────────────────
+  // -- Core state -------------------------------------------------------------
   const [config, setConfig] = useState<TemplateConfig>(
     () => loadDesignerConfig() ?? DEFAULT_CONFIG
   );
@@ -381,17 +381,17 @@ export function DesignerStudio() {
   const [safeZoneWarn, setSafeZoneWarn] = useState(false);
   const [rightTab, setRightTab] = useState<"background" | "properties" | "mask" | "layers" | "alignment" | "variables">("background");
 
-  // ── Custom fonts ────────────────────────────────────────────────────────────
+  // -- Custom fonts ------------------------------------------------------------
   const [customFonts, setCustomFonts] = useState<CustomFont[]>([]);
 
-  // ── Tool state ─────────────────────────────────────────────────────────────
+  // -- Tool state -------------------------------------------------------------
   const [activeTool,      setActiveTool]      = useState<ToolId>("select");
   const [shapesPopupOpen, setShapesPopupOpen] = useState(false);
   const [galleryOpen,     setGalleryOpen]     = useState(false);
   const [canUndo,         setCanUndo]         = useState(false);
   const [canRedo,         setCanRedo]         = useState(false);
 
-  // ── Dialogs ────────────────────────────────────────────────────────────────
+  // -- Dialogs ----------------------------------------------------------------
   const [qrDialogOpen, setQrDialogOpen] = useState(false);
   const [qrText,       setQrText]       = useState("https://example.com");
   const [barcodeDialogOpen, setBarcodeDialogOpen] = useState(false);
@@ -399,7 +399,7 @@ export function DesignerStudio() {
   const [previewOpen,  setPreviewOpen]  = useState(false);
   const [previewUrl,   setPreviewUrl]   = useState("");
 
-  // ── Pages ──────────────────────────────────────────────────────────────────
+  // -- Pages ------------------------------------------------------------------
   const [pages, setPages] = useState<DesignPage[]>([
     { id: "page-1", name: "Page 1", canvas: EMPTY_CANVAS_JSON },
   ]);
@@ -415,13 +415,13 @@ export function DesignerStudio() {
   const lastPersistedHashRef = useRef("");
   const initialTemplateLoadDoneRef = useRef(false);
 
-  // ── Designer context ───────────────────────────────────────────────────────
+  // -- Designer context -------------------------------------------------------
   const [designerContext] = useState<DesignerContext | null>(() => {
     try { const raw = localStorage.getItem(DESIGNER_CONTEXT_KEY); return raw ? JSON.parse(raw) : null; }
     catch { return null; }
   });
 
-  // ── Save dialog ────────────────────────────────────────────────────────────
+  // -- Save dialog ------------------------------------------------------------
   const [saveDialogOpen,   setSaveDialogOpen]   = useState(false);
   const [projects, setProjects]                 = useState<Project[]>([]);
   const [saveProjectId,    setSaveProjectId]    = useState(() => designerContext?.projectId ?? "");
@@ -493,7 +493,7 @@ export function DesignerStudio() {
     };
   }, [designerContext?.projectId]);
 
-  // ── Canvas pixel dimensions ────────────────────────────────────────────────
+  // -- Canvas pixel dimensions ------------------------------------------------
   const canvasPxW  = mmToPx(config.canvas.width);
   const canvasPxH  = mmToPx(config.canvas.height);
   const MAX_W = 1100;
@@ -504,7 +504,7 @@ export function DesignerStudio() {
   const displayPxH     = Math.round(canvasPxH * effectiveScale);
   const rulerScale     = (96 / 25.4) * effectiveScale;
 
-  // ── Safe zone check ────────────────────────────────────────────────────────
+  // -- Safe zone check --------------------------------------------------------
   useEffect(() => {
     const fc = canvasRef.current?.getCanvas();
     if (!fc) return;
@@ -534,7 +534,7 @@ export function DesignerStudio() {
     };
   }, [config, effectiveScale, tick]);
 
-  // ── Tool mode ──────────────────────────────────────────────────────────────
+  // -- Tool mode --------------------------------------------------------------
   useEffect(() => {
     const fc = canvasRef.current?.getCanvas();
     if (!fc) return;
@@ -563,7 +563,7 @@ export function DesignerStudio() {
     fc.renderAll();
   }, [activeTool, tick]);
 
-  // ── Mouse-wheel / trackpad pinch zoom (Ctrl+scroll) ─────────────────────
+  // -- Mouse-wheel / trackpad pinch zoom (Ctrl+scroll) ---------------------
   useEffect(() => {
     const el = canvasScrollRef.current;
     if (!el) return;
@@ -578,7 +578,7 @@ export function DesignerStudio() {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  // ── Pan on scroll container when hand tool is active ──────────────────────
+  // -- Pan on scroll container when hand tool is active ----------------------
   useEffect(() => {
     if (activeTool !== "hand" || !canvasScrollRef.current) return;
     const el = canvasScrollRef.current;
@@ -600,7 +600,7 @@ export function DesignerStudio() {
     };
   }, [activeTool]);
 
-  // ── Tool click ─────────────────────────────────────────────────────────────
+  // -- Tool click -------------------------------------------------------------
   const handleToolClick = useCallback((id: ToolId) => {
     switch (id) {
       case "text":
@@ -635,7 +635,7 @@ export function DesignerStudio() {
     }
   }, [refresh]);
 
-  // ── Gallery item handler ───────────────────────────────────────────────────
+  // -- Gallery item handler ---------------------------------------------------
   const handleGalleryItemSelect = useCallback((item: ShapeItem) => {
     if (item.type === "shape") {
       canvasRef.current?.addShapeFromGallery(item.id);
@@ -663,9 +663,15 @@ export function DesignerStudio() {
     setActiveTool("select");
   }, [refresh]);
 
-  // ── Page helpers ───────────────────────────────────────────────────────────
+  // -- Page helpers -----------------------------------------------------------
   const buildPagesSnapshot = useCallback(() => {
-    const cur = canvasRef.current?.toJSON() ?? EMPTY_CANVAS_JSON;
+    const rawJson = canvasRef.current?.toJSON();
+    // When the canvas is disposed during unmount, FabricCanvas sets fabricRef.current = null
+    // and toJSON() returns {} (no 'objects' key). In that case fall back to the cached
+    // pages state that syncActive kept up-to-date while the canvas was alive.
+    const cur = (rawJson && 'objects' in rawJson)
+      ? rawJson
+      : (pages.find((p) => p.id === activePageId)?.canvas ?? EMPTY_CANVAS_JSON);
     return pages.map((p) => p.id === activePageId ? { ...p, canvas: cur } : p);
   }, [activePageId, pages]);
 
@@ -751,7 +757,7 @@ export function DesignerStudio() {
     });
   }, []);
 
-  // ── Effects ────────────────────────────────────────────────────────────────
+  // -- Effects ----------------------------------------------------------------
 
   useEffect(() => {
     if (!designerContext?.templateId) {
@@ -966,7 +972,10 @@ export function DesignerStudio() {
       templateName,
     });
 
-    const thumb = canvasRef.current?.toPNG() ?? existingTemplate.thumbnail;
+    // toPNG() returns "" when the canvas is disposed (during unmount).
+    // An empty string is not a valid thumbnail — keep the previously saved one.
+    const rawThumb = canvasRef.current?.toPNG();
+    const thumb = (rawThumb && rawThumb.startsWith('data:')) ? rawThumb : existingTemplate.thumbnail;
     updateProjectTemplate(designerContext.templateId, {
       templateName,
       templateType: config.templateType,
@@ -1006,7 +1015,7 @@ export function DesignerStudio() {
     };
   }, [autoSaveTemplateNow]);
 
-  // ── Image upload ────────────────────────────────────────────────────────────
+  // -- Image upload ------------------------------------------------------------
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
     const reader = new FileReader();
@@ -1014,7 +1023,7 @@ export function DesignerStudio() {
     reader.readAsDataURL(file); e.target.value = ""; setActiveTool("select");
   };
 
-  // ── SVG upload ──────────────────────────────────────────────────────────────
+  // -- SVG upload --------------------------------------------------------------
   const handleSVGUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
     const reader = new FileReader();
@@ -1026,7 +1035,7 @@ export function DesignerStudio() {
     reader.readAsText(file); e.target.value = ""; setActiveTool("select");
   };
 
-  // ── Save/export ─────────────────────────────────────────────────────────────
+  // -- Save/export -------------------------------------------------------------
   const handleSaveClick = () => {
     if (importMode) {
       setSaveTemplateName((config.templateName || "Template") + " Copy");
@@ -1162,12 +1171,12 @@ export function DesignerStudio() {
     if (url) { setPreviewUrl(url); setPreviewOpen(true); }
   };
 
-  // ── Derived values ─────────────────────────────────────────────────────────
+  // -- Derived values ---------------------------------------------------------
   const sizeLabel = (() => {
     const p = PAGE_PRESETS.find((p) =>
       p.id !== "custom" && p.width === config.canvas.width && p.height === config.canvas.height
     );
-    return p ? p.label : `${config.canvas.width}×${config.canvas.height}mm`;
+    return p ? p.label : `${config.canvas.width}�${config.canvas.height}mm`;
   })();
 
   // Auto-switch to properties tab when an element is selected
@@ -1194,7 +1203,7 @@ export function DesignerStudio() {
     { id: "hand",       icon: Hand,          label: "Hand / Pan Canvas (H)", sep: true },
     { id: "background", icon: Palette,       label: "Background" },
     { id: "layers",     icon: Layers,        label: "Layers", sep: true },
-    { id: "shapes",     icon: Square,        label: "Shapes (Rect, Circle…)" },
+    { id: "shapes",     icon: Square,        label: "Shapes (Rect, Circle�)" },
     { id: "text",       icon: Type,          label: "Text Tool (T)" },
     { id: "image",      icon: ImagePlus,     label: "Image Upload" },
     { id: "draw",       icon: Pen,           label: "Pen / Freehand Draw", sep: true },
@@ -1204,11 +1213,11 @@ export function DesignerStudio() {
     { id: "variables",  icon: Variable,      label: "Dynamic Variable Fields" },
   ];
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // -----------------------------------------------------------------------------
   return (
-    <div className="flex flex-col h-[calc(100vh-4rem)] min-h-[620px] bg-background overflow-hidden">
+    <div data-dsid="designer" className="flex flex-col h-[calc(100vh-4rem)] min-h-[620px] bg-background overflow-hidden">
 
-      {/* ══════ TOP ACTION BAR ══════ */}
+      {/* ------ TOP ACTION BAR ------ */}
       <header className="flex items-center gap-2 px-3 h-12 border-b bg-card shrink-0 z-30">
 
         <Button
@@ -1279,7 +1288,7 @@ export function DesignerStudio() {
                 if (w > 0 && h > 0) updateConfig({ canvas: { width: w, height: h } });
               }}
             >
-              Custom size…
+              Custom size�
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -1356,15 +1365,15 @@ export function DesignerStudio() {
         onDelete={() => { canvasRef.current?.deleteSelected(); setSelected(null); refresh(); }}
       />
 
-      {/* ══════ BODY ══════ */}
+      {/* ------ BODY ------ */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
 
-        {/* ══════ LEFT TOOLBAR ══════ */}
+        {/* ------ LEFT TOOLBAR ------ */}
         <aside className="w-14 border-r bg-card flex flex-col items-center py-2 gap-0.5 shrink-0 z-20 relative overflow-visible">
 
           {shapesPopupOpen && (
             <div className="absolute left-14 top-0 z-50 bg-popover border rounded-xl shadow-2xl p-2 w-44">
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground px-1 mb-2">
+              <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground px-1 mb-2">
                 Shapes
               </p>
               <div className="grid grid-cols-2 gap-1">
@@ -1396,7 +1405,7 @@ export function DesignerStudio() {
           ))}
         </aside>
 
-        {/* ══════ CENTER CANVAS AREA ══════ */}
+        {/* ------ CENTER CANVAS AREA ------ */}
         <main
           ref={canvasScrollRef}
           className={`min-w-0 flex-1 overflow-auto bg-muted/40 flex flex-col ${activeTool === "hand" ? "cursor-grab" : ""}`}
@@ -1429,7 +1438,7 @@ export function DesignerStudio() {
             )}
 
             <div className="text-xs text-muted-foreground font-mono shrink-0">
-              {config.canvas.width}×{config.canvas.height}mm &nbsp;|&nbsp; {userZoom}%
+              {config.canvas.width}�{config.canvas.height}mm &nbsp;|&nbsp; {userZoom}%
             </div>
           </div>
 
@@ -1484,8 +1493,8 @@ export function DesignerStudio() {
           </div>
         </main>
 
-        {/* ══════ RIGHT PROPERTIES PANEL ══════ */}
-        <aside className="w-[300px] min-w-[300px] max-w-[300px] border-l bg-card flex flex-col shrink-0 overflow-hidden">
+        {/* ------ RIGHT PROPERTIES PANEL ------ */}
+        <aside data-dsid="designer-panel" className="w-[300px] min-w-[300px] max-w-[300px] border-l bg-card flex flex-col shrink-0 overflow-hidden">
           <Tabs value={rightTab} onValueChange={(v) => setRightTab(v as typeof rightTab)} className="flex flex-col flex-1 min-h-0 overflow-hidden">
             <TabsList className="grid grid-cols-5 m-2 mb-0 shrink-0 h-8">
               <TabsTrigger value="background" className="text-[10px] gap-0.5 px-1">
@@ -1584,7 +1593,7 @@ export function DesignerStudio() {
           <div className="border-t p-2 min-h-0">
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-1">
-                <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Pages</span>
+                <span className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Pages</span>
                 <span className="text-[10px] text-muted-foreground/70">({pages.length})</span>
               </div>
               <div className="flex items-center gap-0.5">
@@ -1696,7 +1705,7 @@ export function DesignerStudio() {
         </aside>
       </div>
 
-      {/* ══════ BOTTOM CONTROL BAR ══════ */}
+      {/* ------ BOTTOM CONTROL BAR ------ */}
       <footer className="flex items-center gap-1.5 px-3 h-11 border-t bg-card shrink-0 z-20">
 
         <TooltipProvider delayDuration={400}>
@@ -1803,11 +1812,11 @@ export function DesignerStudio() {
         </Button>
       </footer>
 
-      {/* ══════ HIDDEN FILE INPUTS ══════ */}
+      {/* ------ HIDDEN FILE INPUTS ------ */}
       <input ref={imageInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
       <input ref={svgInputRef}   type="file" accept=".svg,image/svg+xml" className="hidden" onChange={handleSVGUpload} />
 
-      {/* ══════ QR CODE DIALOG ══════ */}
+      {/* ------ QR CODE DIALOG ------ */}
       <Dialog open={qrDialogOpen} onOpenChange={setQrDialogOpen}>
         <DialogContent className="sm:max-w-[360px]">
           <DialogHeader>
@@ -1878,12 +1887,12 @@ export function DesignerStudio() {
         </DialogContent>
       </Dialog>
 
-      {/* ══════ PREVIEW DIALOG ══════ */}
+      {/* ------ PREVIEW DIALOG ------ */}
       <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
         <DialogContent className="max-w-[90vw]">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <Eye className="h-4 w-4" /> Preview — {config.templateName || "Design"}
+              <Eye className="h-4 w-4" /> Preview � {config.templateName || "Design"}
             </DialogTitle>
           </DialogHeader>
           <div className="flex items-center justify-center py-4 min-h-[200px]">
@@ -1903,7 +1912,7 @@ export function DesignerStudio() {
         </DialogContent>
       </Dialog>
 
-      {/* ══════ SAVE TO PROJECT DIALOG ══════ */}
+      {/* ------ SAVE TO PROJECT DIALOG ------ */}
       <Dialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen}>
         <DialogContent className="sm:max-w-[420px]">
           <DialogHeader>
@@ -1916,7 +1925,7 @@ export function DesignerStudio() {
                 <p className="text-sm text-muted-foreground">No projects found. Create a project first.</p>
               ) : (
                 <Select value={saveProjectId} onValueChange={setSaveProjectId}>
-                  <SelectTrigger><SelectValue placeholder="Select a project…" /></SelectTrigger>
+                  <SelectTrigger><SelectValue placeholder="Select a project�" /></SelectTrigger>
                   <SelectContent>
                     {projects.map((p) => (
                       <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
@@ -1936,7 +1945,7 @@ export function DesignerStudio() {
             <div className="flex items-center gap-2">
               <Switch checked={saveIsPublic} onCheckedChange={setSaveIsPublic} id="save-pub" />
               <Label htmlFor="save-pub" className="cursor-pointer text-sm">
-                {saveIsPublic ? "Public — visible to all users" : "Private — only you can see this"}
+                {saveIsPublic ? "Public � visible to all users" : "Private � only you can see this"}
               </Label>
             </div>
           </div>
@@ -1946,13 +1955,13 @@ export function DesignerStudio() {
               onClick={() => saveToProject(saveProjectId, null, saveTemplateName)}
               disabled={isSaving || !saveProjectId}
             >
-              {isSaving ? "Saving…" : "Save Template"}
+              {isSaving ? "Saving�" : "Save Template"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* ══════ SHAPES GALLERY MODAL ══════ */}
+      {/* ------ SHAPES GALLERY MODAL ------ */}
       <ShapesGallery
         isOpen={galleryOpen}
         onClose={() => setGalleryOpen(false)}

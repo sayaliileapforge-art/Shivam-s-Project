@@ -105,7 +105,7 @@ function ShapePreview({ shape }: { shape: ImageMaskShape }) {
 
 function SLabel({ children }: { children: React.ReactNode }) {
   return (
-    <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+    <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
       {children}
     </p>
   );
@@ -310,7 +310,7 @@ export function MaskPanel({ selected, canvasRef, onRefresh }: Props) {
       {/* ── PNG Mask ──────────────────────────────────────────── */}
       <div>
         <SLabel>PNG Shape Mask</SLabel>
-        <p className="text-[10px] text-muted-foreground mb-2 leading-relaxed">
+        <p className="text-[10px] text-muted-foreground mb-2 leading-relaxed break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full">
           Upload a PNG with a transparent background. The image will be clipped to the opaque areas of the PNG.
         </p>
         <div className="flex gap-2">

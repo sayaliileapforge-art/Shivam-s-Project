@@ -53,7 +53,7 @@ export function ElementsPanel({ onAddText, onAddRect, onAddCircle, onAddLine, on
     <div className="p-3 space-y-4">
       {/* Shapes & Text */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
           Shapes & Text
         </p>
         <div className="grid grid-cols-2 gap-2">
@@ -70,7 +70,7 @@ export function ElementsPanel({ onAddText, onAddRect, onAddCircle, onAddLine, on
 
       {/* QR Code */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1">
           <QrCode className="h-3 w-3" /> QR Code
         </p>
         <Input
@@ -88,10 +88,10 @@ export function ElementsPanel({ onAddText, onAddRect, onAddCircle, onAddLine, on
 
       {/* Dynamic Fields */}
       <div>
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1">
+        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1">
           <Variable className="h-3 w-3" /> Dynamic Fields
         </p>
-        <p className="text-[10px] text-muted-foreground mb-2">
+        <p className="text-[10px] text-muted-foreground mb-2 break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full">
           Click to place a merge field on the canvas.
         </p>
         <div className="flex flex-wrap gap-1">

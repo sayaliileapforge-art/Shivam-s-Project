@@ -35,7 +35,8 @@ import { RadioGroup, RadioGroupItem } from "../components/ui/radio-group";
 import { Can } from "../../lib/rbac";
 import { Permission } from "../../lib/rbac";
 import { loadClients, updateClient, addTransaction, loadTransactions, type Client } from "../../lib/clientStore";
-import { loadProjects, addProject, type Project } from "../../lib/projectStore";
+import { type Project } from "../../lib/projectStore";
+import { fetchProjects, createProject } from "../../lib/apiService";
 import { STATE_DISTRICTS } from "../../lib/districts";
 
 const INDIAN_STATES = [
@@ -90,6 +91,7 @@ export function ClientProfile() {
   const [projectErrors, setProjectErrors] = useState<Partial<typeof emptyProjectForm>>({});
   const [clientVersion, setClientVersion] = useState(0); // used to force re-read after save
   const [districtSearch, setDistrictSearch] = useState("");
+  const [clientProjects, setClientProjects] = useState<Project[]>([]);
 
   useEffect(() => {
     let isMounted = true;
@@ -107,6 +109,47 @@ export function ClientProfile() {
       isMounted = false;
     };
   }, [clientVersion]);
+
+  // Load projects from API, filtered to this client
+  useEffect(() => {
+    if (!id) return;
+    let isMounted = true;
+    console.log('[ClientProfile] Loading projects for clientId:', id);
+    fetchProjects(id).then((data) => {
+      if (!isMounted) return;
+      const all: any[] = Array.isArray(data) ? data : [];
+      console.log('[ClientProfile] API returned', all.length, 'projects');
+      // Secondary safety filter: only include projects whose clientId matches this client.
+      // The populated clientId is an object; raw clientId may be a string or ObjectId.
+      const filtered = all.filter((p: any) => {
+        const rawCid =
+          typeof p.clientId === 'object' && p.clientId !== null
+            ? String(p.clientId._id ?? '')
+            : String(p.clientId ?? '');
+        console.log('[ClientProfile] project', String(p._id || p.id), '— clientId:', rawCid, '— matches:', rawCid === id);
+        return rawCid === id;
+      });
+      console.log('[ClientProfile] After safety filter:', filtered.length, 'projects match clientId', id);
+      const mapped: Project[] = filtered.map((p: any): Project => ({
+        id: String(p._id || p.id),
+        name: String(p.name || "Untitled"),
+        client: String(p.client || ""),
+        clientId: id,
+        stage: String(p.stage || p.status || "draft"),
+        priority: (p.priority || "medium") as Project["priority"],
+        dueDate: String(p.dueDate || ""),
+        assignee: String(p.assignee || ""),
+        amount: Number(p.amount || 0),
+        description: String(p.description || ""),
+        workflowType: (p.workflowType || "variable_data") as Project["workflowType"],
+        createdAt: String(p.createdAt || ""),
+      }));
+      setClientProjects(mapped);
+    }).catch(() => {
+      if (isMounted) setClientProjects([]);
+    });
+    return () => { isMounted = false; };
+  }, [id, clientVersion]);
 
   const found = allClients.find((c) => c.id === id);
   const emptyClient: Client = {
@@ -134,7 +177,6 @@ export function ClientProfile() {
   const clientData = found ?? emptyClient;
   const displayClientId = clientData.schoollogUniqueId || clientData.id;
   const walletTransactions = id ? loadTransactions(id) : [];
-  const clientProjects = id ? loadProjects().filter((p) => p.clientId === id) : [];
 
   const [editForm, setEditForm] = useState<Omit<Client, "id" | "status" | "createdAt">>({
     clientName: clientData.clientName,
@@ -205,7 +247,7 @@ export function ClientProfile() {
 
   const handleNewProject = () => {
     if (!validateProject() || !id) return;
-    addProject({
+    void createProject({
       name: projectForm.name,
       clientId: id,
       client: clientData.clientName,
@@ -216,11 +258,12 @@ export function ClientProfile() {
       amount: Number(projectForm.amount),
       description: projectForm.description,
       workflowType: projectForm.workflowType,
+    }).then(() => {
+      setProjectForm(emptyProjectForm);
+      setProjectErrors({});
+      setIsNewProjectOpen(false);
+      setClientVersion((v) => v + 1);
     });
-    setProjectForm(emptyProjectForm);
-    setProjectErrors({});
-    setIsNewProjectOpen(false);
-    setClientVersion((v) => v + 1);
   };
 
   const openEdit = () => {

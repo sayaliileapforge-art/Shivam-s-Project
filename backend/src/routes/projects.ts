@@ -1,12 +1,27 @@
 import { Router, Request, Response } from 'express';
+import mongoose from 'mongoose';
 import Project from '../models/Project';
 
 const router = Router();
 
-// Get all projects
+// Get all projects (optionally filtered by clientId)
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const projects = await Project.find().populate('clientId').populate('templateId');
+    const filter: Record<string, any> = {};
+    if (req.query.clientId) {
+      const rawId = req.query.clientId as string;
+      console.log('[Projects] GET / — filtering by clientId:', rawId);
+      try {
+        filter.clientId = new mongoose.Types.ObjectId(rawId);
+      } catch {
+        // If rawId is not a valid ObjectId, fall back to string match
+        filter.clientId = rawId;
+      }
+    } else {
+      console.log('[Projects] GET / — no clientId filter, returning all projects');
+    }
+    const projects = await Project.find(filter).populate('clientId').populate('templateId');
+    console.log(`[Projects] GET / — found ${projects.length} projects for filter:`, JSON.stringify(filter));
     res.json({ success: true, data: projects });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });

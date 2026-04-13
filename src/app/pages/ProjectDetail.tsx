@@ -1,12 +1,13 @@
 ﻿import { useParams, Link, useNavigate } from "react-router";
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import * as fabric from "fabric";
 import {
   ArrowLeft, Plus, Trash2, Edit, Upload, FileText,
   CheckCircle2, Circle, Clock, MoreVertical, Download,
   Package, ListTodo, FolderOpen, Database, Layers, Printer, Pencil, FilePlus, X,
   Filter, MoreHorizontal, UserCircle, FileSpreadsheet, Settings2, Users, GripVertical,
   Crop, Wand2, RotateCcw, ImageIcon, UserPlus, FileDown, Archive, Camera, Loader2,
-  QrCode, UserRound, AlertTriangle,
+  QrCode, UserRound, AlertTriangle, Globe,
 } from "lucide-react";
 import JSZip from "jszip";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -22,6 +23,7 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "../components/ui/select";
+import { Switch } from "../components/ui/switch";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuTrigger, DropdownMenuSeparator,
@@ -68,6 +70,7 @@ const emptyTemplateForm = {
   canvas: { width: 297, height: 210 },
   margin: { top: 1, left: 1, right: 1, bottom: 1 },
   applicableFor: "",
+  isPublic: false,
 };
 
 const STAGES = [
@@ -194,6 +197,117 @@ function formatFieldLabel(canonicalKey: string): string {
   if (!canonicalKey) return "";
   return canonicalKey.charAt(0).toUpperCase() + canonicalKey.slice(1);
 }
+
+// ─── Live Fabric.js canvas preview (fallback when thumbnail absent) ──────────
+const MM_TO_PX_PREVIEW = 96 / 25.4;
+
+function TemplatePreviewCanvas({
+  canvasJSON,
+  canvasConfig,
+  maxWidth = 320,
+  maxHeight = 320,
+}: {
+  canvasJSON: string;
+  canvasConfig: { width: number; height: number };
+  maxWidth?: number;
+  maxHeight?: number;
+}) {
+  const canvasElRef = useRef<HTMLCanvasElement>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [hasError, setHasError] = useState(false);
+
+  const canvasPxW = Math.round(canvasConfig.width * MM_TO_PX_PREVIEW);
+  const canvasPxH = Math.round(canvasConfig.height * MM_TO_PX_PREVIEW);
+  const scale = Math.min(maxWidth / canvasPxW, maxHeight / canvasPxH, 1);
+
+  // Stable JSON string ref so the effect deps don't churn on every render
+  const canvasJSONRef = useRef(canvasJSON);
+  canvasJSONRef.current = canvasJSON;
+
+  useEffect(() => {
+    const el = canvasElRef.current;
+    if (!el) return;
+
+    let fc: fabric.Canvas | null = null;
+    let cancelled = false;
+
+    let canvasData: object = {};
+    try {
+      const parsed = JSON.parse(canvasJSONRef.current) as Record<string, unknown>;
+      if (Array.isArray(parsed.pages) && parsed.pages.length > 0) {
+        canvasData = ((parsed.pages[0] as Record<string, unknown>).canvas as object | undefined) ?? {};
+      } else if (parsed.canvas && typeof parsed.canvas === "object") {
+        canvasData = parsed.canvas as object;
+      }
+    } catch {
+      setHasError(true);
+      setIsLoading(false);
+      return;
+    }
+
+    try {
+      fc = new fabric.Canvas(el, {
+        width: canvasPxW,
+        height: canvasPxH,
+        selection: false,
+        interactive: false,
+        renderOnAddRemove: false,
+      });
+
+      fc.loadFromJSON(JSON.stringify(canvasData)).then(() => {
+        if (cancelled || !fc) return;
+        fc.getObjects().forEach((obj) => {
+          obj.set({ selectable: false, evented: false, hasControls: false });
+        });
+        fc.renderAll();
+        setIsLoading(false);
+      }).catch(() => {
+        if (!cancelled) { setHasError(true); setIsLoading(false); }
+      });
+    } catch {
+      setHasError(true);
+      setIsLoading(false);
+    }
+
+    return () => {
+      cancelled = true;
+      try { fc?.dispose(); } catch { /* ignore */ }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasPxW, canvasPxH]);
+
+  if (hasError) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
+        <Layers className="h-8 w-8 text-muted-foreground" />
+        <p className="text-sm text-muted-foreground">Preview unavailable</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative flex items-center justify-center">
+      {isLoading && (
+        <div
+          className="absolute inset-0 flex items-center justify-center z-10 bg-white/60 rounded"
+          style={{ width: Math.round(canvasPxW * scale), height: Math.round(canvasPxH * scale) }}
+        >
+          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        </div>
+      )}
+      <div
+        className="shadow-md rounded border border-border overflow-hidden bg-white"
+        style={{ width: Math.round(canvasPxW * scale), height: Math.round(canvasPxH * scale) }}
+      >
+        <div style={{ transform: `scale(${scale})`, transformOrigin: "top left", width: canvasPxW, height: canvasPxH }}>
+          <canvas ref={canvasElRef} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function parseTemplateLayoutJSON(template: ProjectTemplate): Record<string, unknown> | null {
   if (!template.canvasJSON) return null;
@@ -481,7 +595,7 @@ export function ProjectDetail() {
   const products = id ? loadProjectProducts(id) : [];
   const tasks = id ? loadProjectTasks(id) : [];
   const files = id ? loadProjectFiles(id) : [];
-  const templates = id ? loadProjectTemplates(id) : [];
+  const templates = id ? loadProjectTemplates(id, project?.clientId ?? "") : [];
 
   const availableTemplateFieldKeys = useMemo(() => {
     const keys = new Set<string>();
@@ -571,13 +685,14 @@ export function ProjectDetail() {
     const thumb = createBlankTemplateThumbnail(templateForm.canvas.width, templateForm.canvas.height);
     addProjectTemplate({
       projectId: id,
+      clientId: project?.clientId ?? "",
       templateName: templateForm.templateName,
       templateType: templateForm.templateType,
       canvas: templateForm.canvas,
       margin: templateForm.margin,
       applicableFor: templateForm.applicableFor,
       thumbnail: thumb,
-      isPublic: true,
+      isPublic: templateForm.isPublic,
     });
     setTemplateForm(emptyTemplateForm);
     setTemplateErrors({});
@@ -1734,6 +1849,19 @@ export function ProjectDetail() {
                   <Label>Applicable for</Label>
                   <Input placeholder="e.g. All Students, Class 10, Staff..." value={templateForm.applicableFor} onChange={(e) => setTemplateForm((f) => ({ ...f, applicableFor: e.target.value }))} />
                 </div>
+                <div className="flex items-center justify-between rounded-lg border px-3 py-2.5">
+                  <div className="space-y-0.5">
+                    <Label className="text-sm font-medium flex items-center gap-1.5">
+                      <Globe className="h-3.5 w-3.5 text-muted-foreground" />
+                      Public template
+                    </Label>
+                    <p className="text-xs text-muted-foreground">Visible across all client projects in the system</p>
+                  </div>
+                  <Switch
+                    checked={templateForm.isPublic}
+                    onCheckedChange={(v) => setTemplateForm((f) => ({ ...f, isPublic: v }))}
+                  />
+                </div>
                 <div className="flex justify-end gap-2 pt-2">
                   <Button variant="outline" onClick={() => setIsCreateTemplateOpen(false)}>Cancel</Button>
                   <Button onClick={handleCreateTemplate}>Create Template</Button>
@@ -1744,29 +1872,33 @@ export function ProjectDetail() {
 
           {/* Template Preview Dialog */}
           <Dialog open={!!previewTemplate} onOpenChange={(o) => { if (!o) setPreviewTemplate(null); }}>
-            <DialogContent className="max-w-sm">
+            <DialogContent className="max-w-md">
               <DialogHeader><DialogTitle>Template Preview</DialogTitle></DialogHeader>
               {previewTemplate && (
                 <div className="space-y-4">
-                  <div className="bg-muted/40 rounded-lg p-6 flex items-center justify-center">
-                    <div className="bg-white shadow-md rounded border border-border relative overflow-hidden flex items-center justify-center"
-                      style={{ width: Math.min(220, previewTemplate.canvas.width * 0.6), height: Math.min(280, previewTemplate.canvas.height * 0.6) }}>
-                      {canRenderSelectedTemplateImage ? (
-                        <img
-                          src={previewTemplate.thumbnail}
-                          alt={previewTemplate.templateName}
-                          className="h-full w-full object-contain"
-                          onError={() => markTemplatePreviewBroken(previewTemplate.id)}
-                        />
-                      ) : (
-                        <div className="h-full w-full bg-muted/30 flex flex-col items-center justify-center gap-1.5 px-3 text-center">
-                          <Layers className="h-6 w-6 text-muted-foreground" />
-                          <p className="text-[11px] text-muted-foreground leading-snug">
-                            {selectedPreviewTemplateDiagnostics?.fallbackMessage || "Preview image unavailable for this template."}
-                          </p>
-                        </div>
-                      )}
-                    </div>
+                  <div className="bg-muted/40 rounded-lg p-4 flex items-center justify-center min-h-[200px]">
+                    {canRenderSelectedTemplateImage ? (
+                      <img
+                        src={previewTemplate.thumbnail}
+                        alt={previewTemplate.templateName}
+                        className="max-w-full max-h-[320px] object-contain rounded shadow-md border border-border"
+                        onError={() => markTemplatePreviewBroken(previewTemplate.id)}
+                      />
+                    ) : selectedPreviewTemplateDiagnostics?.hasDesignElements && previewTemplate.canvasJSON ? (
+                      <TemplatePreviewCanvas
+                        canvasJSON={previewTemplate.canvasJSON}
+                        canvasConfig={previewTemplate.canvas}
+                        maxWidth={352}
+                        maxHeight={320}
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
+                        <Layers className="h-8 w-8 text-muted-foreground" />
+                        <p className="text-sm text-muted-foreground">
+                          {selectedPreviewTemplateDiagnostics?.fallbackMessage || "No preview available for this template."}
+                        </p>
+                      </div>
+                    )}
                   </div>
 
                   {!selectedPreviewTemplateDiagnostics?.hasDesignElements && (
@@ -1787,9 +1919,6 @@ export function ProjectDetail() {
                     <div className="flex justify-between"><span className="text-muted-foreground">Margin T/L/R/B</span><span className="font-medium">{previewTemplate.margin.top}/{previewTemplate.margin.left}/{previewTemplate.margin.right}/{previewTemplate.margin.bottom} mm</span></div>
                     {previewTemplate.applicableFor && <div className="flex justify-between"><span className="text-muted-foreground">For</span><span className="font-medium">{previewTemplate.applicableFor}</span></div>}
                   </div>
-                  <pre className="bg-muted rounded p-3 text-[10px] overflow-auto max-h-40">
-                    {JSON.stringify({ templateName: previewTemplate.templateName, templateType: previewTemplate.templateType, canvas: previewTemplate.canvas, margin: previewTemplate.margin }, null, 2)}
-                  </pre>
                 </div>
               )}
             </DialogContent>
@@ -1827,6 +1956,16 @@ export function ProjectDetail() {
                       && previewDiagnostics?.hasDesignElements
                       && !brokenTemplatePreviewIds[tmpl.id]
                     );
+                    const currentClientId = project?.clientId ?? "";
+                    // Own project's template
+                    const isOwnTemplate = tmpl.projectId === id;
+                    // Same client but different project
+                    const isSameClientTemplate = !isOwnTemplate
+                      && Boolean(currentClientId)
+                      && (tmpl.clientId === currentClientId);
+                    // Public template from a different client — read-only, clone only
+                    const isPublicOtherClient = !isOwnTemplate && !isSameClientTemplate && tmpl.isPublic === true;
+
                     return (
                       <div key={tmpl.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow space-y-3">
                         <div className="bg-muted/30 rounded flex items-center justify-center h-28 relative overflow-hidden">
@@ -1851,6 +1990,16 @@ export function ProjectDetail() {
                           <div className="flex gap-1 mt-1 flex-wrap">
                             <Badge variant="secondary" className="text-[10px] capitalize">{tmpl.templateType.replace("_"," ")}</Badge>
                             <Badge variant="outline" className="text-[10px]">{tmpl.canvas.width}x{tmpl.canvas.height}mm</Badge>
+                            {isSameClientTemplate && (
+                              <Badge variant="outline" className="text-[10px] gap-0.5 text-emerald-700 border-emerald-300 bg-emerald-50">
+                                Client
+                              </Badge>
+                            )}
+                            {(isPublicOtherClient || (tmpl.isPublic && isOwnTemplate)) && (
+                              <Badge variant="outline" className="text-[10px] gap-0.5 text-primary border-primary/40 bg-primary/5">
+                                <Globe className="h-2.5 w-2.5" />Global
+                              </Badge>
+                            )}
                           </div>
                           {!previewDiagnostics?.hasDesignElements && (
                             <p className="text-[11px] text-destructive mt-1">
@@ -1869,41 +2018,70 @@ export function ProjectDetail() {
                           <Button size="sm" variant="outline" className="flex-1 text-xs gap-1" onClick={() => setPreviewTemplate(tmpl)}>
                             <Download className="h-3 w-3" />Preview
                           </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="flex-1 text-xs gap-1 text-primary hover:text-primary"
-                            onClick={() => {
-                              const rawMargin = (tmpl as any).margin ?? {};
-                              const normalizedMargin = {
-                                top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
-                                left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
-                                right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
-                                bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
-                              };
-                              // Save template config to designer storage key so DesignerStudio picks it up
-                              const designerConfig = {
-                                templateName: tmpl.templateName,
-                                templateType: tmpl.templateType,
-                                canvas: tmpl.canvas,
-                                margin: normalizedMargin,
-                              };
-                              localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
-                              // Write context so DesignerStudio can save back to this exact template
-                              localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-                                projectId: project.id,
-                                templateId: tmpl.id,
-                                projectName: project.name,
-                                templateName: tmpl.templateName,
-                              }));
-                              navigate("/designer-studio");
-                            }}
-                          >
-                            <Pencil className="h-3 w-3" />Edit
-                          </Button>
-                          <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
-                            <Trash2 className="h-3 w-3" />
-                          </Button>
+                          {(isOwnTemplate || isSameClientTemplate) ? (
+                            <>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="flex-1 text-xs gap-1 text-primary hover:text-primary"
+                                onClick={() => {
+                                  const rawMargin = (tmpl as any).margin ?? {};
+                                  const normalizedMargin = {
+                                    top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
+                                    left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
+                                    right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
+                                    bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
+                                  };
+                                  const designerConfig = {
+                                    templateName: tmpl.templateName,
+                                    templateType: tmpl.templateType,
+                                    canvas: tmpl.canvas,
+                                    margin: normalizedMargin,
+                                  };
+                                  localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
+                                  localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+                                    projectId: project.id,
+                                    templateId: tmpl.id,
+                                    projectName: project.name,
+                                    templateName: tmpl.templateName,
+                                  }));
+                                  navigate("/designer-studio");
+                                }}
+                              >
+                                <Pencil className="h-3 w-3" />Edit
+                              </Button>
+                              {isOwnTemplate && (
+                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
+                                  <Trash2 className="h-3 w-3" />
+                                </Button>
+                              )}
+                            </>
+                          ) : (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="flex-1 text-xs gap-1"
+                              title="Copy this global template to your project"
+                              onClick={() => {
+                                if (!id) return;
+                                addProjectTemplate({
+                                  projectId: id,
+                                  clientId: currentClientId,
+                                  templateName: `${tmpl.templateName} (Copy)`,
+                                  templateType: tmpl.templateType,
+                                  canvas: tmpl.canvas,
+                                  margin: tmpl.margin,
+                                  applicableFor: tmpl.applicableFor,
+                                  canvasJSON: tmpl.canvasJSON,
+                                  thumbnail: tmpl.thumbnail,
+                                  isPublic: false,
+                                });
+                                refresh();
+                              }}
+                            >
+                              <FilePlus className="h-3 w-3" />Use
+                            </Button>
+                          )}
                         </div>
                       </div>
                     );
