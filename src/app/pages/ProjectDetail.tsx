@@ -1400,7 +1400,10 @@ export function ProjectDetail() {
             templateType: selectedTemplate.templateType,
             canvas: selectedTemplate.canvas,
             thumbnail: selectedTemplate.thumbnail,
-            layoutJSON: selectedTemplate.canvasJSON,
+            // Send pre-computed diagnostics instead of the full canvasJSON
+            // (canvasJSON can be several MB which makes the request very slow).
+            hasValidLayout: selectedTemplateDiagnostics.hasValidLayoutJson,
+            elementCount: selectedTemplateDiagnostics.elementCount,
           },
         }),
       });

@@ -42,7 +42,9 @@ import { MaskPanel } from "../components/designer/MaskPanel";
 import { ContextToolbar } from "../components/designer/ContextToolbar";
 import { ShapesGallery } from "../components/designer/ShapesGallery";
 import { VariableFieldsPanel } from "../components/designer/VariableFieldsPanel";
+import { CsvDataPanel } from "../components/designer/CsvDataPanel";
 import { HRuler, VRuler, RULER_THICKNESS } from "../components/designer/Ruler";
+import { rowToRenderInput, type ParsedCsv, type CsvRow } from "../../lib/csvBinding";
 import {
   loadDesignerConfig, DEFAULT_CONFIG, DESIGNER_SAVE_KEY, DESIGNER_CONTEXT_KEY,
   mmToPx, PAGE_PRESETS, type TemplateConfig, type DesignerContext,
@@ -62,7 +64,7 @@ type ToolId =
   | "select" | "zoom" | "hand"
   | "background" | "layers"
   | "shapes" | "text" | "image" | "draw"
-  | "qrcode" | "barcode" | "alignment" | "variables";
+  | "qrcode" | "barcode" | "alignment" | "variables" | "csv";
 
 const EMPTY_CANVAS_JSON = { objects: [] as object[] };
 const DESIGNER_IMPORT_MODE_KEY = "vendor_designer_import_mode";
@@ -379,7 +381,14 @@ export function DesignerStudio() {
   const [currentBg, setCurrentBg] = useState<string>("#ffffff");
   const [userZoom, setUserZoom] = useState(100);
   const [safeZoneWarn, setSafeZoneWarn] = useState(false);
-  const [rightTab, setRightTab] = useState<"background" | "properties" | "mask" | "layers" | "alignment" | "variables">("background");
+  const [rightTab, setRightTab] = useState<"background" | "properties" | "mask" | "layers" | "alignment" | "variables" | "csv">("background");
+
+  // -- CSV variable data binding -----------------------------------------------
+  const [csvData, setCsvData] = useState<ParsedCsv | null>(null);
+  const [csvPreviewRowIndex, setCsvPreviewRowIndex] = useState(-1);
+  const [csvIsRendering, setCsvIsRendering] = useState(false);
+  // Snapshot of template canvas JSON before preview so we can restore it
+  const csvTemplateSnapshotRef = useRef<object | null>(null);
 
   // -- Custom fonts ------------------------------------------------------------
   const [customFonts, setCustomFonts] = useState<CustomFont[]>([]);
@@ -626,6 +635,11 @@ export function DesignerStudio() {
         break;
       case "variables":
         setRightTab("variables");
+        setActiveTool("select");
+        setShapesPopupOpen(false);
+        break;
+      case "csv":
+        setRightTab("csv");
         setActiveTool("select");
         setShapesPopupOpen(false);
         break;
@@ -1171,6 +1185,111 @@ export function DesignerStudio() {
     if (url) { setPreviewUrl(url); setPreviewOpen(true); }
   };
 
+  // -- CSV preview row handler -----------------------------------------------
+  const handleCsvPreviewRow = useCallback(async (row: CsvRow, index: number) => {
+    const fc = canvasRef.current;
+    if (!fc) return;
+
+    // Snapshot the current template canvas state before first preview
+    if (csvPreviewRowIndex < 0) {
+      csvTemplateSnapshotRef.current = fc.toJSON();
+    }
+
+    setCsvIsRendering(true);
+    setCsvPreviewRowIndex(index);
+    try {
+      const canvas = fc.getCanvas();
+      if (!canvas) return;
+
+      // Always restore the clean template before rendering a row,
+      // so previous row's data doesn't bleed through.
+      if (csvTemplateSnapshotRef.current) {
+        await canvas.loadFromJSON(csvTemplateSnapshotRef.current as any);
+      }
+
+      const renderInput = rowToRenderInput(row);
+      await fc.renderTemplateWithData(null, renderInput);
+      refresh();
+    } catch (err) {
+      toast.error("Preview failed");
+    } finally {
+      setCsvIsRendering(false);
+    }
+  }, [csvPreviewRowIndex, refresh]);
+
+  // -- CSV exit preview -------------------------------------------------------
+  const handleCsvExitPreview = useCallback(() => {
+    if (csvTemplateSnapshotRef.current) {
+      const fc = canvasRef.current;
+      if (fc) {
+        fc.loadFromJSON(csvTemplateSnapshotRef.current);
+        refresh();
+      }
+    }
+    setCsvPreviewRowIndex(-1);
+    csvTemplateSnapshotRef.current = null;
+  }, [refresh]);
+
+  // -- Bulk export for all CSV rows ------------------------------------------
+  const handleBulkExport = useCallback(async (rows: CsvRow[], format: "png" | "pdf") => {
+    const fc = canvasRef.current;
+    if (!fc || rows.length === 0) return;
+
+    // Snapshot template before bulk render
+    const templateSnapshot = fc.toJSON();
+    setCsvIsRendering(true);
+    toast.info(`Generating ${rows.length} ${format.toUpperCase()} files…`);
+
+    try {
+      const canvas = fc.getCanvas();
+      if (!canvas) return;
+
+      const templateName = config.templateName || "template";
+      const canvasW = config.canvas.width * 2.8346;
+      const canvasH = config.canvas.height * 2.8346;
+
+      for (let i = 0; i < rows.length; i++) {
+        // Restore clean template for each row
+        await canvas.loadFromJSON(templateSnapshot as any);
+
+        const renderInput = rowToRenderInput(rows[i]);
+        const dataUrl = await fc.renderTemplateWithData(null, renderInput);
+
+        const rowLabel = rows[i]["name"] || rows[i]["roll_no"] || String(i + 1);
+        const filename = `${templateName}_${String(i + 1).padStart(3, "0")}_${rowLabel.replace(/[^a-z0-9]/gi, "_")}`;
+
+        if (format === "png") {
+          const a = document.createElement("a");
+          a.href = dataUrl;
+          a.download = `${filename}.png`;
+          a.click();
+        } else {
+          const doc = new jsPDF({
+            orientation: canvasW > canvasH ? "l" : "p",
+            unit: "pt",
+            format: [canvasW, canvasH],
+          });
+          doc.addImage(dataUrl, "PNG", 0, 0, canvasW, canvasH);
+          doc.save(`${filename}.pdf`);
+        }
+
+        // Small delay to let browser handle the download
+        await new Promise((r) => setTimeout(r, 80));
+      }
+
+      // Restore template after bulk render
+      await canvas.loadFromJSON(templateSnapshot as any);
+      setCsvPreviewRowIndex(-1);
+      csvTemplateSnapshotRef.current = null;
+      refresh();
+      toast.success(`${rows.length} ${format.toUpperCase()} files exported`);
+    } catch {
+      toast.error("Bulk export failed");
+    } finally {
+      setCsvIsRendering(false);
+    }
+  }, [config, refresh]);
+
   // -- Derived values ---------------------------------------------------------
   const sizeLabel = (() => {
     const p = PAGE_PRESETS.find((p) =>
@@ -1195,6 +1314,7 @@ export function DesignerStudio() {
     if (activeTool === "background") setRightTab("background");
     if (activeTool === "alignment")  setRightTab("alignment");
     if (activeTool === "variables")  setRightTab("variables");
+    if (activeTool === "csv")        setRightTab("csv");
   }, [activeTool]);
 
   const TOOLS: { id: ToolId; icon: React.ElementType; label: string; sep?: boolean }[] = [
@@ -1211,6 +1331,7 @@ export function DesignerStudio() {
     { id: "barcode",    icon: Barcode,       label: "Barcode" },
     { id: "alignment",  icon: Grid3x3,       label: "Alignment / Grid" },
     { id: "variables",  icon: Variable,      label: "Dynamic Variable Fields" },
+    { id: "csv",        icon: FileImage,     label: "CSV Data Binding" },
   ];
 
   // -----------------------------------------------------------------------------
@@ -1366,7 +1487,7 @@ export function DesignerStudio() {
       />
 
       {/* ------ BODY ------ */}
-      <div className="flex flex-1 min-h-0 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-x-auto overflow-y-hidden">
 
         {/* ------ LEFT TOOLBAR ------ */}
         <aside className="w-14 border-r bg-card flex flex-col items-center py-2 gap-0.5 shrink-0 z-20 relative overflow-visible">
@@ -1408,7 +1529,7 @@ export function DesignerStudio() {
         {/* ------ CENTER CANVAS AREA ------ */}
         <main
           ref={canvasScrollRef}
-          className={`min-w-0 flex-1 overflow-auto bg-muted/40 flex flex-col ${activeTool === "hand" ? "cursor-grab" : ""}`}
+          className={`min-w-[320px] flex-1 overflow-auto bg-muted/40 flex flex-col ${activeTool === "hand" ? "cursor-grab" : ""}`}
           onClick={() => shapesPopupOpen && setShapesPopupOpen(false)}
         >
           <div className="shrink-0 px-4 pt-3 pb-1 flex items-center justify-between gap-3 flex-wrap">
@@ -1434,6 +1555,22 @@ export function DesignerStudio() {
               <div className="flex items-center gap-2 bg-amber-500 text-white text-xs px-3 py-1.5 rounded-lg font-medium shadow-lg">
                 <span className="font-bold">WARNING:</span>
                 Keep elements in the safe zone for best print results.
+              </div>
+            )}
+
+            {csvPreviewRowIndex >= 0 && csvData && (
+              <div className="flex items-center gap-2 bg-primary text-primary-foreground text-xs px-3 py-1.5 rounded-lg font-medium shadow-lg">
+                <Eye className="h-3.5 w-3.5 shrink-0" />
+                <span>
+                  Preview: Row {csvPreviewRowIndex + 1} of {csvData.rows.length}
+                </span>
+                {csvIsRendering && <span className="opacity-70">(rendering…)</span>}
+                <button
+                  onClick={handleCsvExitPreview}
+                  className="ml-1 h-4 w-4 rounded flex items-center justify-center hover:bg-white/20 transition-colors"
+                >
+                  <X className="h-3 w-3" />
+                </button>
               </div>
             )}
 
@@ -1494,27 +1631,33 @@ export function DesignerStudio() {
         </main>
 
         {/* ------ RIGHT PROPERTIES PANEL ------ */}
-        <aside data-dsid="designer-panel" className="w-[300px] min-w-[300px] max-w-[300px] border-l bg-card flex flex-col shrink-0 overflow-hidden">
-          <Tabs value={rightTab} onValueChange={(v) => setRightTab(v as typeof rightTab)} className="flex flex-col flex-1 min-h-0 overflow-hidden">
-            <TabsList className="grid grid-cols-5 m-2 mb-0 shrink-0 h-8">
-              <TabsTrigger value="background" className="text-[10px] gap-0.5 px-1">
+        <aside data-dsid="designer-panel" className="w-[300px] min-w-[280px] max-w-[300px] border-l bg-card flex flex-col shrink-0 overflow-y-auto">
+          <Tabs value={rightTab} onValueChange={(v) => setRightTab(v as typeof rightTab)} className="flex flex-col">
+            <TabsList className="grid grid-cols-6 m-2 mb-0 shrink-0 h-8 sticky top-0 z-10 bg-card">
+              <TabsTrigger value="background" className="text-[10px] gap-0.5 px-0.5">
                 <Palette className="h-3 w-3" /> BG
               </TabsTrigger>
-              <TabsTrigger value="properties" className="text-[10px] gap-0.5 px-1">
+              <TabsTrigger value="properties" className="text-[10px] gap-0.5 px-0.5">
                 <SlidersHorizontal className="h-3 w-3" /> Props
               </TabsTrigger>
-              <TabsTrigger value="mask" className="text-[10px] gap-0.5 px-1">
+              <TabsTrigger value="mask" className="text-[10px] gap-0.5 px-0.5">
                 <Square className="h-3 w-3" /> Mask
               </TabsTrigger>
-              <TabsTrigger value="layers" className="text-[10px] gap-0.5 px-1">
+              <TabsTrigger value="layers" className="text-[10px] gap-0.5 px-0.5">
                 <Layers className="h-3 w-3" /> Layers
               </TabsTrigger>
-              <TabsTrigger value="variables" className="text-[10px] gap-0.5 px-1">
+              <TabsTrigger value="variables" className="text-[10px] gap-0.5 px-0.5">
                 <Variable className="h-3 w-3" /> Vars
+              </TabsTrigger>
+              <TabsTrigger value="csv" className="text-[10px] gap-0.5 px-0.5 relative">
+                <FileImage className="h-3 w-3" /> Data
+                {csvData && (
+                  <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-emerald-500" />
+                )}
               </TabsTrigger>
             </TabsList>
 
-            <ScrollArea className="flex-1 min-h-0">
+            <div>
               <TabsContent value="background" className="mt-2 p-0">
                 <BackgroundPanel
                   currentBg={currentBg}
@@ -1580,17 +1723,38 @@ export function DesignerStudio() {
 
               <TabsContent value="variables" className="mt-2 p-0">
                 <VariableFieldsPanel
+                  csvFields={csvData?.fields}
                   onAddField={(fieldKey) => {
                     canvasRef.current?.addDynamicField(fieldKey);
                     refresh();
                   }}
                 />
               </TabsContent>
-            </ScrollArea>
+
+              <TabsContent value="csv" className="mt-2 p-0 flex flex-col flex-1 min-h-0" style={{ height: "100%" }}>
+                <CsvDataPanel
+                  csv={csvData}
+                  previewRowIndex={csvPreviewRowIndex}
+                  isRendering={csvIsRendering}
+                  onCsvChange={(parsed) => {
+                    setCsvData(parsed);
+                    // Reset preview when CSV changes
+                    handleCsvExitPreview();
+                  }}
+                  onPreviewRow={handleCsvPreviewRow}
+                  onExitPreview={handleCsvExitPreview}
+                  onBulkExport={handleBulkExport}
+                  onAddField={(fieldKey) => {
+                    canvasRef.current?.addDynamicField(fieldKey);
+                    refresh();
+                  }}
+                />
+              </TabsContent>
+            </div>
           </Tabs>
 
           {/* Pages manager at bottom of right panel */}
-          <div className="border-t p-2 min-h-0">
+          <div className="border-t p-2 pb-4">
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-1">
                 <span className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Pages</span>

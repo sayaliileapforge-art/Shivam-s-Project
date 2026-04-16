@@ -20,6 +20,9 @@ import type { ProjectDataField, ProjectDataRecord } from "../../lib/projectStore
 import type { DataCategory } from "../../lib/projectStore";
 import {
   CORE_IMPORT_FIELDS,
+  FIELD_DISPLAY_ORDER,
+  AUTO_GENERATED_FIELDS,
+  getSessionYear,
   SKIP_MAPPING_VALUE,
   autoMap,
   buildProjectFields,
@@ -192,7 +195,9 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
     return dupes;
   }, [mappedRecords]);
 
-  const unmappedRequired = projectFields.filter((f) => f.required && !isMappedColumn(mapping[f.key]));
+  const unmappedRequired = projectFields.filter(
+    (f) => f.required && !AUTO_GENERATED_FIELDS.has(f.key) && !isMappedColumn(mapping[f.key]),
+  );
   const duplicateMappedColumns = getDuplicateMappedColumns(mapping);
   const mappedCount      = projectFields.filter((f) => isMappedColumn(mapping[f.key])).length;
   const visiblePreviewFields = useMemo(
@@ -207,16 +212,23 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
   );
 
   const basicInfoFields = useMemo(() => {
-    const prioritized = BASIC_INFO_KEYS
+    // Build an ordered list following FIELD_DISPLAY_ORDER exactly,
+    // then append any remaining non-additional, non-auto fields.
+    const ordered: ImportSystemField[] = FIELD_DISPLAY_ORDER
       .map((key) => projectFieldByKey.get(key))
       .filter((field): field is ImportSystemField => Boolean(field));
-    const prioritizedKeys = new Set(prioritized.map((field) => field.key));
+
+    const orderedKeys = new Set(ordered.map((f) => f.key));
 
     const remaining = projectFields.filter(
-      (field) => !ADDITIONAL_DETAIL_KEY_SET.has(field.key) && !prioritizedKeys.has(field.key)
+      (field) =>
+        !ADDITIONAL_DETAIL_KEY_SET.has(field.key) &&
+        !orderedKeys.has(field.key) &&
+        !AUTO_GENERATED_FIELDS.has(field.key) &&
+        field.key !== "other",
     );
 
-    return [...prioritized, ...remaining];
+    return [...ordered, ...remaining];
   }, [projectFields, projectFieldByKey]);
 
   const parentDetailsFields = useMemo(
@@ -324,7 +336,30 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
     );
   };
 
-  const renderMappingTable = (fields: ImportSystemField[]) => (
+  /**
+   * Session Year info row — always shown at the bottom of the Basic Info table.
+   * Not mappable: value is auto-generated from the current date.
+   */
+  const renderSessionYearRow = () => (
+    <TableRow key="sessionYear">
+      <TableCell className="font-medium text-muted-foreground">
+        Session Year
+      </TableCell>
+      <TableCell>
+        <div className="flex items-center gap-2 h-8 px-3 rounded-md bg-muted/50 border text-sm text-muted-foreground select-none">
+          Auto-generated
+        </div>
+      </TableCell>
+      <TableCell className="text-sm text-muted-foreground italic">
+        {getSessionYear()}
+      </TableCell>
+      <TableCell className="text-center">
+        <CheckCircle className="h-4 w-4 text-success mx-auto" />
+      </TableCell>
+    </TableRow>
+  );
+
+  const renderMappingTable = (fields: ImportSystemField[], showSessionYear = false) => (
     <div className="rounded-md border overflow-hidden">
       <Table>
         <TableHeader>
@@ -345,6 +380,7 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
               </TableCell>
             </TableRow>
           )}
+          {showSessionYear && renderSessionYearRow()}
         </TableBody>
       </Table>
     </div>
@@ -384,9 +420,13 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
 
   // ── Download template ─────────────────────────────────────────────────────
   const downloadTemplate = () => {
+    // Use FIELD_DISPLAY_ORDER for the template header (session_year excluded — auto-generated)
+    const templateFields = FIELD_DISPLAY_ORDER
+      .map((key) => CORE_IMPORT_FIELDS.find((f) => f.key === key))
+      .filter((f): f is ImportSystemField => Boolean(f));
     const ws = XLSX.utils.aoa_to_sheet([
-      CORE_IMPORT_FIELDS.map((f) => f.label),
-      CORE_IMPORT_FIELDS.map((f) => (f.required ? "REQUIRED" : "optional")),
+      templateFields.map((f) => f.label),
+      templateFields.map((f) => (f.required ? "REQUIRED" : "optional")),
     ]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Template");
@@ -497,7 +537,7 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
             <CardContent className="space-y-3">
               <div className="space-y-2">
                 <h3 className="text-sm font-semibold">Basic Info</h3>
-                {renderMappingTable(basicInfoFields)}
+                {renderMappingTable(basicInfoFields, /* showSessionYear */ true)}
               </div>
 
               <Accordion type="single" collapsible>

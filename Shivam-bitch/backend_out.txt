@@ -1,0 +1,18 @@
+[Server] ✅ Form routes registered at /api/form
+[Server] User indexes synced
+MongoDB Connected
+Server running on http://localhost:5000
+[promoteClass] Created new class "2 - a" for principalId=principal_001
+[promoteClass] "1 - a" → "2 - a": 1 student(s) promoted
+[2026-03-31T11:15:16.311Z] POST /api/principal/promote-class → 200 (70ms) — IP: ::1
+[2026-03-31T11:17:10.229Z] GET /api/principal/classes?principalId=principal_001 → 200 (10ms) — IP: ::ffff:127.0.0.1
+[2026-03-31T11:17:10.259Z] GET /api/principal/members?principalId=principal_001&type=teacher → 200 (10ms) — IP: ::ffff:127.0.0.1
+[2026-03-31T11:17:10.264Z] GET /api/principal/members?principalId=principal_001&type=student → 200 (13ms) — IP: ::ffff:127.0.0.1
+[2026-03-31T11:17:10.265Z] GET /api/principal/members?principalId=principal_001&type=staff → 200 (11ms) — IP: ::ffff:127.0.0.1
+[promoteClass] Created new class "2 – a" for principalId=principal_001
+[promoteClass] "1 – a" → "2 – a": 1 student(s) promoted
+[2026-03-31T11:17:52.586Z] POST /api/principal/promote-class → 200 (48ms) — IP: ::ffff:127.0.0.1
+[2026-03-31T11:17:52.809Z] GET /api/principal/classes?principalId=principal_001 → 200 (11ms) — IP: ::ffff:127.0.0.1
+[2026-03-31T11:17:52.811Z] GET /api/principal/members?principalId=principal_001&type=teacher → 200 (10ms) — IP: ::ffff:127.0.0.1
+[2026-03-31T11:17:52.825Z] GET /api/principal/members?principalId=principal_001&type=student → 200 (9ms) — IP: ::ffff:127.0.0.1
+[2026-03-31T11:17:52.830Z] GET /api/principal/members?principalId=principal_001&type=staff → 200 (9ms) — IP: ::ffff:127.0.0.1

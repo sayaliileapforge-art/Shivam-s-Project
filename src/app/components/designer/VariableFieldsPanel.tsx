@@ -1,7 +1,9 @@
 import { useMemo, useState } from "react";
-import { Search, Type, ImageIcon, Barcode, GripVertical } from "lucide-react";
+import { Search, Type, ImageIcon, Barcode, GripVertical, FileText } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { Badge } from "../ui/badge";
+import type { CsvField } from "../../../lib/csvBinding";
 
 export type VariableFieldType = "text" | "image" | "barcode";
 
@@ -9,6 +11,7 @@ export interface VariableField {
   key: string;
   label: string;
   type: VariableFieldType;
+  fromCsv?: boolean;
 }
 
 const DEFAULT_FIELDS: VariableField[] = [
@@ -26,6 +29,8 @@ const DEFAULT_FIELDS: VariableField[] = [
 
 interface Props {
   onAddField: (fieldKey: string) => void;
+  /** Optional CSV-derived fields to show above defaults. When provided, defaults are hidden unless no CSV field matches. */
+  csvFields?: CsvField[];
 }
 
 function FieldTypeIcon({ type }: { type: VariableFieldType }) {
@@ -34,24 +39,49 @@ function FieldTypeIcon({ type }: { type: VariableFieldType }) {
   return <Type className="h-3.5 w-3.5 text-violet-600" />;
 }
 
-export function VariableFieldsPanel({ onAddField }: Props) {
+export function VariableFieldsPanel({ onAddField, csvFields }: Props) {
   const [query, setQuery] = useState("");
   const [customKey, setCustomKey] = useState("");
 
+  // When CSV fields are provided, use them + any default fields not already in CSV.
+  // When no CSV, fall back to DEFAULT_FIELDS.
+  const allFields: VariableField[] = useMemo(() => {
+    if (!csvFields || csvFields.length === 0) return DEFAULT_FIELDS;
+    const csvKeys = new Set(csvFields.map((f) => f.key.toLowerCase()));
+    const csvMapped: VariableField[] = csvFields.map((f) => ({
+      key: f.key,
+      label: f.label,
+      type: f.type,
+      fromCsv: true,
+    }));
+    const extras = DEFAULT_FIELDS.filter((d) => !csvKeys.has(d.key.toLowerCase()));
+    return [...csvMapped, ...extras];
+  }, [csvFields]);
+
   const fields = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return DEFAULT_FIELDS;
-    return DEFAULT_FIELDS.filter(
+    if (!q) return allFields;
+    return allFields.filter(
       (field) => field.key.toLowerCase().includes(q) || field.label.toLowerCase().includes(q)
     );
-  }, [query]);
+  }, [query, allFields]);
 
   return (
     <div className="space-y-3 p-3">
       <div>
-        <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Dynamic Fields</p>
+        <div className="flex items-center justify-between gap-1">
+          <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Dynamic Fields</p>
+          {csvFields && csvFields.length > 0 && (
+            <Badge variant="secondary" className="text-[9px] h-4 px-1.5 gap-1 shrink-0">
+              <FileText className="h-2.5 w-2.5" />
+              {csvFields.length} from CSV
+            </Badge>
+          )}
+        </div>
         <p className="mt-1 text-[11px] text-muted-foreground break-words [overflow-wrap:anywhere] [word-break:break-word] whitespace-normal max-w-full">
-          Click to add, or drag a field onto the canvas.
+          {csvFields && csvFields.length > 0
+            ? "Fields from your CSV. Upload CSV in the Data tab."
+            : "Click to add, or drag a field onto the canvas."}
         </p>
       </div>
 
@@ -83,7 +113,11 @@ export function VariableFieldsPanel({ onAddField }: Props) {
               );
               event.dataTransfer.effectAllowed = "copy";
             }}
-            className="flex w-full items-center gap-2 rounded-md border border-border/80 bg-card px-2.5 py-2 text-left transition-colors hover:bg-accent"
+            className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors hover:bg-accent ${
+              field.fromCsv
+                ? "border-primary/30 bg-primary/5 hover:border-primary/50"
+                : "border-border/80 bg-card"
+            }`}
           >
             <GripVertical className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
             <FieldTypeIcon type={field.type} />

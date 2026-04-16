@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import * as fabric from "fabric";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -16,7 +16,10 @@ import {
   AlignLeft, AlignCenter, AlignRight, Bold, Italic, Underline, ImagePlus,
   Lock, Unlock, ChevronsUp, ChevronsDown, ArrowUp, ArrowDown, Maximize2,
   WrapText, RefreshCw, Upload, CaseUpper, CaseLower, CaseSensitive, Trash2,
+  Rows3, MoveHorizontal, RectangleHorizontal,
 } from "lucide-react";
+import { Badge } from "../ui/badge";
+import { ToggleGroup, ToggleGroupItem } from "../ui/toggle-group";
 import { pxToMm, MM_TO_PX } from "../../../lib/fabricUtils";
 import type { FabricCanvasHandle } from "./FabricCanvas";
 
@@ -245,6 +248,71 @@ function SLabel({ children }: { children: React.ReactNode }) {
     <p className="ds-label-auto text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
       {children}
     </p>
+  );
+}
+
+/** Reusable numeric input paired with a slider. Shows [ value ] unit inline. */
+function NumericInput({
+  value,
+  onChange,
+  min = 0,
+  max = 999,
+  step = 1,
+  unit = "px",
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+}) {
+  const [raw, setRaw] = useState<string>(() =>
+    String(Number.isFinite(value) ? value : 0)
+  );
+  const editingRef = useRef(false);
+
+  // Sync from external changes (slider movement) while not being edited
+  useEffect(() => {
+    if (!editingRef.current) {
+      setRaw(String(Number.isFinite(value) ? value : 0));
+    }
+  }, [value]);
+
+  const commit = (str: string) => {
+    editingRef.current = false;
+    const n = parseFloat(str);
+    if (!Number.isFinite(n)) {
+      setRaw(String(Number.isFinite(value) ? value : 0));
+      return;
+    }
+    const clamped = clamp(n, min, max);
+    setRaw(String(clamped));
+    onChange(clamped);
+  };
+
+  return (
+    <div className="flex items-center gap-0.5 shrink-0">
+      <input
+        type="number"
+        className="w-10 h-6 text-[11px] text-center bg-background border rounded px-1 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none focus:outline-none focus:ring-1 focus:ring-ring"
+        value={raw}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(e) => {
+          editingRef.current = true;
+          setRaw(e.target.value);
+        }}
+        onBlur={(e) => commit(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit((e.target as HTMLInputElement).value);
+        }}
+      />
+      {unit && (
+        <span className="text-[10px] text-muted-foreground leading-none">{unit}</span>
+      )}
+    </div>
   );
 }
 
@@ -503,30 +571,108 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                   <Slider min={6} max={120} step={1}
                     value={[(selected as fabric.IText).fontSize ?? 16]}
                     onValueChange={([v]) => set({ fontSize: v })} className="flex-1" />
-                  <span className="text-xs text-muted-foreground w-10 text-right">
-                    {(selected as fabric.IText).fontSize ?? 16}px
-                  </span>
+                  <NumericInput
+                    value={(selected as fabric.IText).fontSize ?? 16}
+                    onChange={(v) => set({ fontSize: v })}
+                    min={6} max={120} unit="px"
+                  />
                 </div>
 
-                {/* Auto-fit + Word Wrap buttons */}
-                <div className="grid grid-cols-2 gap-1.5 mb-2">
-                  <Button variant="outline" className="h-8 text-xs gap-1" title="Shrink text to fit inside the current text box"
-                    onClick={() => { canvasRef.current?.autoFitText(); onRefresh(); }}>
-                    <Maximize2 className="h-3 w-3" /> Auto Size
-                  </Button>
-                  <Button variant={isTextbox ? "secondary" : "outline"} className="h-8 text-xs gap-1" title={isTextbox ? "Word wrap is ON — click to disable" : "Word wrap is OFF — click to enable"}
-                    onClick={() => {
-                      if (isTextbox) canvasRef.current?.disableWordWrap();
-                      else canvasRef.current?.enableWordWrap();
-                      onRefresh();
-                    }}>
-                    <WrapText className="h-3 w-3" /> Word Wrap
-                  </Button>
-                  <Button variant="outline" className="h-8 text-xs gap-1 col-span-2" title="Auto-shrink font + word wrap so text fits inside the textbox"
-                    onClick={() => { canvasRef.current?.autoFitTextToBox(); onRefresh(); }}>
-                    <RefreshCw className="h-3 w-3" /> Auto Fit to Box
-                  </Button>
+                {/* Line height + letter spacing */}
+                <div className="grid grid-cols-2 gap-2 mb-2">
+                  <div>
+                    <Label className="text-[10px] text-muted-foreground flex items-center gap-1 mb-0.5">
+                      <Rows3 className="h-3 w-3" /> Line Height
+                    </Label>
+                    <div className="flex items-center gap-1">
+                      <Slider
+                        min={0.5} max={4} step={0.05}
+                        value={[(selected as fabric.IText).lineHeight ?? 1.16]}
+                        onValueChange={([v]) => set({ lineHeight: +v.toFixed(2) })}
+                        className="flex-1"
+                      />
+                      <NumericInput
+                        value={+((selected as fabric.IText).lineHeight ?? 1.16).toFixed(2)}
+                        onChange={(v) => set({ lineHeight: v })}
+                        min={0.5} max={4} step={0.05} unit=""
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <Label className="text-[10px] text-muted-foreground flex items-center gap-1 mb-0.5">
+                      <MoveHorizontal className="h-3 w-3" /> Spacing
+                    </Label>
+                    <div className="flex items-center gap-1">
+                      <Slider
+                        min={-200} max={1000} step={10}
+                        value={[(selected as fabric.IText).charSpacing ?? 0]}
+                        onValueChange={([v]) => set({ charSpacing: v })}
+                        className="flex-1"
+                      />
+                      <NumericInput
+                        value={(selected as fabric.IText).charSpacing ?? 0}
+                        onChange={(v) => set({ charSpacing: v })}
+                        min={-200} max={1000} step={10} unit=""
+                      />
+                    </div>
+                  </div>
                 </div>
+
+                {/* Text mode selector */}
+                {(() => {
+                  const rawMode = (selected as any).__textMode as string | undefined;
+                  // "none" or undefined = new object, no mode chosen yet → nothing highlighted.
+                  // "auto" = IText (Auto Size). "wrap" / "auto_wrap" = Textbox variants.
+                  const textMode =
+                    rawMode === "wrap" || rawMode === "auto_wrap" || rawMode === "auto"
+                      ? rawMode
+                      : ""; // empty string → ToggleGroup shows nothing selected
+                  return (
+                    <div className="mb-2">
+                      <span className="text-[10px] text-muted-foreground font-medium block mb-1.5">Text Mode</span>
+                      <ToggleGroup
+                        type="single"
+                        value={textMode}
+                        onValueChange={(val) => {
+                          if (!val) return; // deselect click — keep current mode
+                          const mode = val as "auto" | "wrap" | "auto_wrap";
+                          if (mode === "auto") {
+                            if (isTextbox) canvasRef.current?.disableWordWrap();
+                            else (selected as any).__textMode = "auto"; // stamp IText
+                          } else if (mode === "wrap") {
+                            if (!isTextbox) canvasRef.current?.enableWordWrap();
+                            else canvasRef.current?.setTextMode("wrap");
+                          } else {
+                            canvasRef.current?.setTextMode("auto_wrap");
+                          }
+                          onRefresh();
+                        }}
+                        className="grid grid-cols-3 gap-1 w-full">
+                        <ToggleGroupItem
+                          value="auto"
+                          className="h-8 flex-col gap-0.5 text-[9px] px-1 w-full"
+                          title="Auto-size: text expands to fit content, single line">
+                          <Maximize2 className="h-3 w-3" />
+                          Auto Size
+                        </ToggleGroupItem>
+                        <ToggleGroupItem
+                          value="wrap"
+                          className="h-8 flex-col gap-0.5 text-[9px] px-1 w-full"
+                          title="Word Wrap: fixed width, height grows with text">
+                          <WrapText className="h-3 w-3" />
+                          Word Wrap
+                        </ToggleGroupItem>
+                        <ToggleGroupItem
+                          value="auto_wrap"
+                          className="h-8 flex-col gap-0.5 text-[9px] px-1 w-full"
+                          title="Auto+Wrap: fixed width, font shrinks to fit box">
+                          <RefreshCw className="h-3 w-3" />
+                          Auto+Wrap
+                        </ToggleGroupItem>
+                      </ToggleGroup>
+                    </div>
+                  );
+                })()}
 
                 <div className="flex gap-1 mb-2">
                   <Button
@@ -635,9 +781,11 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                       value={[((selected as any).backgroundPadding as number) ?? 0]}
                       onValueChange={(v) => set({ backgroundPadding: v[0] })}
                       className="flex-1" />
-                    <span className="text-xs font-mono w-10 text-right">
-                      {((selected as any).backgroundPadding as number) ?? 0}px
-                    </span>
+                    <NumericInput
+                      value={((selected as any).backgroundPadding as number) ?? 0}
+                      onChange={(v) => set({ backgroundPadding: v })}
+                      min={0} max={30} unit="px"
+                    />
                   </div>
                 </div>
 
@@ -682,9 +830,11 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                         onValueChange={([v]) => updateTextEffect({ strokeWidth: v })}
                         className="flex-1"
                       />
-                      <span className="text-xs font-mono w-10 text-right">
-                        {(textEffect?.strokeWidth ?? 0).toFixed(1)}
-                      </span>
+                      <NumericInput
+                        value={textEffect?.strokeWidth ?? 0}
+                        onChange={(v) => updateTextEffect({ strokeWidth: v })}
+                        min={0} max={10} step={0.1} unit="px"
+                      />
                     </div>
                   </div>
 
@@ -723,9 +873,11 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                           onValueChange={([v]) => updateTextEffect({ shadowOpacity: v })}
                           className="flex-1"
                         />
-                        <span className="text-xs font-mono w-10 text-right">
-                          {Math.round((textEffect?.shadowOpacity ?? 0.35) * 100)}%
-                        </span>
+                        <NumericInput
+                          value={Math.round((textEffect?.shadowOpacity ?? 0.35) * 100)}
+                          onChange={(v) => updateTextEffect({ shadowOpacity: v / 100 })}
+                          min={0} max={100} unit="%"
+                        />
                       </div>
                     </div>
                     <div>
@@ -739,9 +891,11 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                           onValueChange={([v]) => updateTextEffect({ shadowBlur: v })}
                           className="flex-1"
                         />
-                        <span className="text-xs font-mono w-10 text-right">
-                          {Math.round(textEffect?.shadowBlur ?? 0)}
-                        </span>
+                        <NumericInput
+                          value={textEffect?.shadowBlur ?? 0}
+                          onChange={(v) => updateTextEffect({ shadowBlur: v })}
+                          min={0} max={40} unit="px"
+                        />
                       </div>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
@@ -846,13 +1000,43 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                     <Input value={((selected as fabric.Rect).stroke as string) ?? "#000000"}
                       onChange={(e) => set({ stroke: e.target.value })}
                       className="h-8 text-xs font-mono" />
-                    <Input type="number" min={0} max={20} step={0.5}
-                      value={(selected as fabric.Rect).strokeWidth ?? 1}
-                      onChange={(e) => set({ strokeWidth: parseFloat(e.target.value) || 0 })}
-                      className="h-7 text-xs" placeholder="Stroke width" />
+                    <div className="flex items-center gap-1.5">
+                      <Label className="text-[10px] text-muted-foreground shrink-0">Width</Label>
+                      <Slider
+                        min={0} max={20} step={0.5}
+                        value={[(selected as fabric.Rect).strokeWidth ?? 1]}
+                        onValueChange={([v]) => set({ strokeWidth: v })}
+                        className="flex-1"
+                      />
+                      <NumericInput
+                        value={(selected as fabric.Rect).strokeWidth ?? 1}
+                        onChange={(v) => set({ strokeWidth: v })}
+                        min={0} max={20} step={0.5} unit="px"
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
+              {/* Border radius — only for Rect */}
+              {selected instanceof fabric.Rect && (
+                <div>
+                  <SLabel>Border Radius</SLabel>
+                  <div className="flex items-center gap-2">
+                    <RectangleHorizontal className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <Slider
+                      min={0} max={200} step={1}
+                      value={[(selected as fabric.Rect).rx ?? 0]}
+                      onValueChange={([v]) => set({ rx: v, ry: v })}
+                      className="flex-1"
+                    />
+                    <NumericInput
+                      value={(selected as fabric.Rect).rx ?? 0}
+                      onChange={(v) => set({ rx: v, ry: v })}
+                      min={0} max={200} unit="px"
+                    />
+                  </div>
+                </div>
+              )}
               <Separator />
             </>
           )}
@@ -864,9 +1048,11 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
               <Slider min={0} max={1} step={0.01}
                 value={[selected.opacity ?? 1]}
                 onValueChange={([v]) => set({ opacity: v })} className="flex-1" />
-              <span className="text-xs text-muted-foreground w-8 text-right">
-                {Math.round((selected.opacity ?? 1) * 100)}%
-              </span>
+              <NumericInput
+                value={Math.round((selected.opacity ?? 1) * 100)}
+                onChange={(v) => set({ opacity: v / 100 })}
+                min={0} max={100} unit="%"
+              />
             </div>
           </div>
 
@@ -932,9 +1118,11 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
               <Slider min={-180} max={180} step={1}
                 value={[selected.angle ?? 0]}
                 onValueChange={([v]) => set({ angle: v })} className="flex-1" />
-              <span className="text-xs text-muted-foreground w-10 text-right">
-                {Math.round(selected.angle ?? 0)}°
-              </span>
+              <NumericInput
+                value={Math.round(selected.angle ?? 0)}
+                onChange={(v) => set({ angle: v })}
+                min={-180} max={180} unit="°"
+              />
             </div>
           </div>
         </>

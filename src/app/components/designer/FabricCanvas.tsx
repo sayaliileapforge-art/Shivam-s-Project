@@ -9,6 +9,12 @@ import * as fabric from "fabric";
 import QRCode from "qrcode";
 import { mmToPx, type TemplateConfig } from "../../../lib/fabricUtils";
 import {
+  detectAlignment,
+  detectEqualSpacing,
+  rectFromFabricObject,
+} from "../../../lib/alignmentUtils";
+import { AlignmentGuideManager } from "./AlignmentGuides";
+import {
   applyImageFit,
   applyMaskAndBorder,
   applyTextFit,
@@ -48,6 +54,13 @@ export interface FabricCanvasHandle {
   disableWordWrap: () => void;
   /** Auto-shrink font size so text fits the Textbox height (word-wrap + auto-size). */
   autoFitTextToBox: () => void;
+  /**
+   * Add a new Textbox in Word Wrap mode at the safe-area origin.
+   * Width is fixed, height grows with content, font size never auto-scales.
+   */
+  addWordWrapText: (text?: string, fixedWidth?: number) => void;
+  /** Set text display mode: 'auto' (IText), 'wrap' (Textbox fixed-width), 'auto_wrap' (Textbox+autofit). */
+  setTextMode: (mode: "auto" | "wrap" | "auto_wrap") => void;
   deleteSelected: () => void;
   duplicate: () => void;
   undo: () => void;
@@ -232,6 +245,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       "__boxHeight",
       "__maskOptions",
       "_originalSrc",
+      "__textMode",
     ] as const;
 
     const createHistorySnapshot = useCallback((fc: fabric.Canvas): string => {
@@ -765,6 +779,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       const safeHeight = safeRect.height;
 
       const getBounds = () => {
+        // Always flush the cached corner coordinates before reading them.
+        // During object:moving, Fabric updates obj.left/top but defers
+        // setCoords() until after the event — so aCoords are stale without this.
+        obj.setCoords();
         const coords = obj.getCoords();
         if (coords && coords.length > 0) {
           const xs = coords.map((p) => p.x);
@@ -823,23 +841,34 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
 
       let bounds = getBounds();
       // For Textbox, allow the height to exceed the safe area (content-driven height).
-      // Only check width overflow and skip the scale-down that would distort text.
+      // Only check width overflow — and reduce obj.width rather than applying
+      // scaleX, because a Textbox with scaleX < 1 renders scaled/distorted text.
       const overflowW = bounds.width > safeWidth;
       const overflowH = !(obj instanceof fabric.Textbox) && bounds.height > safeHeight;
       if (overflowW || overflowH) {
-        const scaleRatio = Math.min(
-          overflowW ? safeWidth / Math.max(bounds.width, 1) : 1,
-          overflowH ? safeHeight / Math.max(bounds.height, 1) : 1,
-          1
-        );
-
-        if (Number.isFinite(scaleRatio) && scaleRatio > 0 && scaleRatio < 1) {
-          obj.set({
-            scaleX: (obj.scaleX ?? 1) * scaleRatio,
-            scaleY: (obj.scaleY ?? 1) * scaleRatio,
-          });
+        if (obj instanceof fabric.Textbox && overflowW) {
+          // Clamp Textbox container width — leave scale at 1, let text reflow.
+          const clampedW = Math.max(40, safeWidth);
+          obj.set({ width: clampedW });
+          (obj as any).__boxWidth = clampedW;
+          (obj as any).initDimensions?.();
           obj.setCoords();
           bounds = getBounds();
+        } else {
+          // Non-Textbox objects: scale down proportionally.
+          const scaleRatio = Math.min(
+            overflowW ? safeWidth  / Math.max(bounds.width,  1) : 1,
+            overflowH ? safeHeight / Math.max(bounds.height, 1) : 1,
+            1
+          );
+          if (Number.isFinite(scaleRatio) && scaleRatio > 0 && scaleRatio < 1) {
+            obj.set({
+              scaleX: (obj.scaleX ?? 1) * scaleRatio,
+              scaleY: (obj.scaleY ?? 1) * scaleRatio,
+            });
+            obj.setCoords();
+            bounds = getBounds();
+          }
         }
       }
 
@@ -859,6 +888,111 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         });
         obj.setCoords();
       }
+    }, []);
+
+    // ── Apply correct handle controls for a Textbox based on its __textMode ─
+    // "wrap"      → fixed width, height auto → only side handles, lock Y scale
+    // "auto"      → IText, not a Textbox, so this only runs from auto_wrap path
+    // "auto_wrap" → font shrinks + wraps → side handles + bottom handle, lock Y scale
+    const applyTextboxControls = useCallback((tb: fabric.Textbox) => {
+      const mode = ((tb as any).__textMode as string | undefined) ?? "wrap";
+      // wrap:      height grows with content — lock vertical drag
+      // auto_wrap: user sets the max height box — allow vertical resize
+      // none:      user hasn't chosen a mode — treat like wrap for controls,
+      //            but preserve existing splitByGrapheme (don't force it)
+      const isAutoWrap = mode === "auto_wrap";
+      tb.set({
+        // Ensure origin is always top-left so left/top map directly to the
+        // top-left corner of the textbox.  Mismatched origins cause the object
+        // to jump when we restore prevLeft/prevTop in onObjectScaling.
+        originX: "left",
+        originY: "top",
+        // Explicitly own hasControls/selectable here so this function is self-contained.
+        hasControls: true,
+        selectable: true,
+        evented: true,
+        lockScalingFlip: true,
+        noScaleCache: true,
+        centeredScaling: false,
+        // X-axis scaling must be explicitly unlocked so the ml/mr/tl/tr/bl/br
+        // handles are not treated as locked by Fabric's control renderer.
+        lockScalingX: false,
+        // Lock Y scaling for all modes except auto_wrap (which lets the user
+        // set a fixed container height that shrinks the font).
+        lockScalingY: !isAutoWrap,
+        lockSkewingX: true,
+        lockSkewingY: true,
+        // Only force splitByGrapheme for explicit wrap modes.
+        // "none" keeps whatever the creator set (addText sets it to false so
+        // the default label stays on one line until the user enables wrapping).
+        ...(mode === "wrap" || mode === "auto_wrap" ? { splitByGrapheme: true } : {}),
+      });
+      tb.setControlsVisibility({
+        tl: true,   // top-left corner
+        tr: true,   // top-right corner
+        bl: true,   // bottom-left corner
+        br: true,   // bottom-right corner
+        mt: false,  // top-middle (no height drag except auto_wrap)
+        mb: isAutoWrap, // bottom-middle only for auto_wrap
+        ml: true,   // left-middle  ← width drag
+        mr: true,   // right-middle ← width drag
+        mtr: true,  // rotation
+      });
+
+      // ── Override cursor handlers on ml/mr ────────────────────────────────
+      // Fabric's default cursorStyleHandler for ml/mr is scaleSkewCursorStyleHandler,
+      // which delegates to scaleCursorStyleHandler, which checks lockScalingX and
+      // returns NOT_ALLOWED_CURSOR when it is true.  However, ml/mr on a Textbox
+      // use changeWidth (not scaleX) — lockScalingX is irrelevant to their action.
+      // Replacing the cursor handler with a simple directional handler guarantees
+      // the ew-resize (↔) cursor regardless of any locking flags.
+      const controls = (tb as any).controls as
+        | Record<string, { cursorStyleHandler?: unknown }>
+        | undefined;
+      if (controls) {
+        const ewResizeCursor = () => "ew-resize";
+        if (controls.ml) controls.ml.cursorStyleHandler = ewResizeCursor;
+        if (controls.mr) controls.mr.cursorStyleHandler = ewResizeCursor;
+      }
+
+      // Flush coordinate cache so Fabric paints controls at current position.
+      tb.setCoords();
+    }, []);
+
+    // ── Configure controls for an IText that is in AUTO_SIZE mode ─────────
+    // Shows ml/mr so the user can start a drag to switch to Word Wrap mode,
+    // but hides all other scale handles.  The cursor is forced to ew-resize
+    // so Fabric never shows not-allowed (changeWidth is not scale, but the
+    // Fabric cursor handler would check lockScalingX otherwise).
+    const applyITextAutoControls = useCallback((it: fabric.IText) => {
+      it.set({
+        hasControls: true,
+        selectable: true,
+        evented: true,
+        // Unlock X so Fabric allows the drag gesture to begin — we intercept
+        // it in onObjectScaling and immediately convert to Textbox.
+        lockScalingX: false,
+        lockScalingY: true,
+        lockSkewingX: true,
+        lockSkewingY: true,
+      });
+      it.setControlsVisibility({
+        tl: false, tr: false, bl: false, br: false,
+        mt: false, mb: false,
+        ml: true,   // ← shows left handle to invite drag → converts to wrap
+        mr: true,   // ← shows right handle
+        mtr: true,
+      });
+      // Override cursor so it always shows ↔ regardless of lock flags
+      const controls = (it as any).controls as
+        | Record<string, { cursorStyleHandler?: unknown }>
+        | undefined;
+      if (controls) {
+        const ewCursor = () => "ew-resize";
+        if (controls.ml) controls.ml.cursorStyleHandler = ewCursor;
+        if (controls.mr) controls.mr.cursorStyleHandler = ewCursor;
+      }
+      it.setCoords();
     }, []);
 
     // ── Init canvas once ────────────────────────────────────────────────────
@@ -886,7 +1020,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       // Use Fabric viewport zoom (vector rerender) instead of CSS bitmap scaling.
       fc.setViewportTransform([displayScale, 0, 0, displayScale, 0, 0]);
 
-      // Disable resize controls on all objects
+      // Enable/configure controls for every newly-selected object.
       fc.on("selection:created", (e) => {
         if (e.selected) {
           e.selected.forEach((obj) => {
@@ -899,27 +1033,16 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             });
 
             if (!isLocked && obj instanceof fabric.Textbox) {
-              obj.set({
-                centeredScaling: false,
-                lockScalingY: false,
-                lockSkewingX: true,
-                lockSkewingY: true,
-              });
-              obj.setControlsVisibility({
-                tl: false,
-                tr: false,
-                bl: false,
-                br: false,
-                mt: false,
-                mb: true,
-                ml: true,
-                mr: true,
-                mtr: true,
-              });
+              applyTextboxControls(obj);
+            } else if (!isLocked && obj instanceof fabric.IText) {
+              // IText is AUTO_SIZE mode: show ml/mr as "click to switch to Word Wrap"
+              applyITextAutoControls(obj);
             }
           });
         }
         onSelectionChangeRef.current(e.selected?.[0] ?? null);
+        // Flush control visibility changes to the upper canvas immediately.
+        fc.requestRenderAll();
       });
       fc.on("selection:updated", (e) => {
         if (e.selected) {
@@ -933,27 +1056,15 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             });
 
             if (!isLocked && obj instanceof fabric.Textbox) {
-              obj.set({
-                centeredScaling: false,
-                lockScalingY: false,
-                lockSkewingX: true,
-                lockSkewingY: true,
-              });
-              obj.setControlsVisibility({
-                tl: false,
-                tr: false,
-                bl: false,
-                br: false,
-                mt: false,
-                mb: true,
-                ml: true,
-                mr: true,
-                mtr: true,
-              });
+              applyTextboxControls(obj);
+            } else if (!isLocked && obj instanceof fabric.IText) {
+              applyITextAutoControls(obj);
             }
           });
         }
         onSelectionChangeRef.current(e.selected?.[0] ?? null);
+        // Flush control visibility changes to the upper canvas immediately.
+        fc.requestRenderAll();
       });
       fc.on("selection:cleared", () => onSelectionChangeRef.current(null));
       
@@ -965,23 +1076,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           e.target.set({ hasControls: !isLocked });
 
           if (!isLocked && e.target instanceof fabric.Textbox) {
-            e.target.set({
-              centeredScaling: false,
-              lockScalingY: false,
-              lockSkewingX: true,
-              lockSkewingY: true,
-            });
-            e.target.setControlsVisibility({
-              tl: false,
-              tr: false,
-              bl: false,
-              br: false,
-              mt: false,
-              mb: true,
-              ml: true,
-              mr: true,
-              mtr: true,
-            });
+            applyTextboxControls(e.target);
+          } else if (!isLocked && e.target instanceof fabric.IText) {
+            applyITextAutoControls(e.target);
           }
 
           // For Textbox, skip fitText — auto-shrinking font on add undoes wrapping.
@@ -1011,35 +1108,288 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         if (!obj) return;
 
         if (obj instanceof fabric.Textbox) {
-          const center = obj.getCenterPoint();
           const anyObj = obj as any;
-          const rawWidth = Number(obj.width || anyObj.__boxWidth || obj.getScaledWidth() || 80);
-          const rawHeight = Number(anyObj.__boxHeight || obj.height || obj.getScaledHeight() || 20);
 
-          const nextWidth = Math.max(40, rawWidth * Math.max(0.01, Number(obj.scaleX || 1)));
-          const nextHeight = Math.max(20, rawHeight * Math.max(0.01, Number(obj.scaleY || 1)));
+          // Snapshot position NOW — after Fabric has already adjusted left/top
+          // for the active handle's anchor (right-edge pinned for ml, left-edge
+          // pinned for mr, etc.).  Restoring these after our width bake keeps
+          // the correct anchor without fighting Fabric's own anchor math.
+          const prevLeft = obj.left ?? 0;
+          const prevTop  = obj.top  ?? 0;
 
+          // ── Stable pre-drag dimensions ─────────────────────────────────────
+          const transform = (e as any).transform as {
+            original?: { width?: number; height?: number };
+          } | undefined;
+
+          if (anyObj.__scalingOrigW == null) {
+            anyObj.__scalingOrigW = Math.max(1, Number(
+              transform?.original?.width  ?? obj.width  ?? anyObj.__boxWidth  ?? 80));
+            anyObj.__scalingOrigH = Math.max(1, Number(
+              transform?.original?.height ?? obj.height ?? anyObj.__boxHeight ?? 20));
+          }
+
+          const startWidth  = Math.max(1, Number(transform?.original?.width  ?? anyObj.__scalingOrigW));
+          const startHeight = Math.max(1, Number(transform?.original?.height ?? anyObj.__scalingOrigH));
+
+          const sx = Math.max(0.01, Number(obj.scaleX ?? 1));
+          const sy = Math.max(0.01, Number(obj.scaleY ?? 1));
+
+          let nextWidth  = Math.max(40, startWidth  * sx);
+          const nextHeight = Math.max(20, startHeight * sy);
+
+          const isAutoWrap = anyObj.__textMode === "auto_wrap";
+
+          // ── Auto-size guard ("none" mode) ─────────────────────────────────
+          // In the default "none" mode the box should behave like auto-size:
+          // the user can widen it freely but narrowing below the natural text
+          // width would force a line-break.  Floor nextWidth at the measured
+          // text width so the text stays on one line.
+          if (anyObj.__textMode === "none" || anyObj.__textMode == null) {
+            // calcTextWidth() returns the width of the longest line in model px
+            const naturalW: number = (obj as any).calcTextWidth?.() ?? 0;
+            if (naturalW > 0 && nextWidth < naturalW + 4) {
+              nextWidth = naturalW + 4; // 4 px end-padding so text doesn't clip
+            }
+          }
+
+          // Bake scale → width, reset transform to identity.
+          // originX/Y 'left'/'top' ensure that when Fabric recomputes the
+          // bounding box after initDimensions() it uses the top-left corner as
+          // the reference point, preventing any position drift from origin
+          // mismatches that accumulated during the drag.
           obj.set({
-            width: nextWidth,
+            originX: "left",
+            originY: "top",
+            width:   nextWidth,
+            ...(isAutoWrap ? { height: nextHeight } : {}),
             scaleX: 1,
             scaleY: 1,
+            dirty:  true,
           });
 
-          obj.setPositionByOrigin(center, "center", "center");
-
-          anyObj.__boxWidth = nextWidth;
-          anyObj.__boxHeight = nextHeight;
+          // Reflow text at the new width.
           (obj as any).initDimensions?.();
+
+          // Restore the anchor position that Fabric set before our override.
+          // This is the final, correct pin position for whatever handle is active.
+          obj.set({ left: prevLeft, top: prevTop });
+
           obj.setCoords();
+        } else if (obj instanceof fabric.IText) {
+          // AUTO_SIZE → WORD_WRAP on first resize drag.
+          // The user grabbed ml or mr on the IText.  Convert to a Textbox in
+          // "wrap" mode right now so the rest of this drag (and all future
+          // drags) go through the Textbox path with proper width baking.
+          const anyIt = obj as any;
+          const fc = fabricRef.current;
+          if (!fc) { constrainObjectToSafeArea(obj, false); return; }
+
+          // Measure current visual width as the initial box width.
+          const naturalW = Math.max(80, Number(anyIt.__boxWidth) || Math.round(obj.getScaledWidth()) || 80);
+
+          const tb = new fabric.Textbox(obj.text ?? "", {
+            left:        obj.left,
+            top:         obj.top,
+            width:       naturalW,
+            fontSize:    obj.fontSize,
+            fontFamily:  obj.fontFamily,
+            fontWeight:  obj.fontWeight as string,
+            fontStyle:   obj.fontStyle as any,
+            fill:        obj.fill,
+            textAlign:   obj.textAlign as any,
+            angle:       obj.angle,
+            opacity:     obj.opacity,
+            underline:   obj.underline,
+            splitByGrapheme: true,
+            scaleX: 1,
+            scaleY: 1,
+            lockScalingFlip: true,
+            noScaleCache: true,
+            selectable: true,
+            evented: true,
+            backgroundColor: anyIt.backgroundColor ?? "transparent",
+            backgroundPadding: anyIt.backgroundPadding ?? 0,
+          });
+          (tb as any).__uid         = anyIt.__uid;
+          (tb as any).__layerName   = anyIt.__layerName;
+          (tb as any).__fieldKey    = anyIt.__fieldKey;
+          (tb as any).__fieldKind   = anyIt.__fieldKind;
+          (tb as any).__isDynamicField = anyIt.__isDynamicField;
+          (tb as any).variableKey   = anyIt.variableKey;
+          (tb as any).__boxWidth    = naturalW;
+          (tb as any).__boxHeight   = anyIt.__boxHeight;
+          (tb as any).__textMode    = "wrap";
+          (tb as any).initDimensions?.();
+
+          ignoreSaveRef.current = true;
+          fc.remove(obj);
+          fc.add(tb);
+          fc.setActiveObject(tb);
+          ignoreSaveRef.current = false;
+
+          // Apply the correct handle set on the new Textbox immediately.
+          applyTextboxControls(tb);
+          fc.requestRenderAll();
+
+          // Notify the parent so the Properties Panel reflects "wrap" mode.
+          onSelectionChangeRef.current(tb);
+          fc.fire("object:modified", { target: tb });
         }
 
         constrainObjectToSafeArea(obj, false);
       };
+      // ── Auto-fit font size in real-time while typing (auto_wrap mode) ──
+      const onTextChanged = (e: { target?: fabric.FabricObject }) => {
+        const obj = e.target;
+        if (!obj || !(obj instanceof fabric.Textbox)) return;
+        const anyObj = obj as any;
+        if (anyObj.__textMode !== "auto_wrap") return;
+        const boxW = Math.max(40, Number(anyObj.__boxWidth) || Number(obj.width) || 80);
+        const boxH = Math.max(20, Number(anyObj.__boxHeight) || Number(obj.height) || 20);
+        applyTextFit(obj, boxW, boxH);
+        // renderAll is called by the canvas after text:changed automatically
+      };
+
+      // ── Alignment snapping & guide lines ────────────────────────────────
+      const alignGuides = new AlignmentGuideManager();
+
+      /**
+       * Called on every object:moving tick.
+       * 1. Collects bounding rects for all non-guide, non-background objects.
+       * 2. Runs alignment + equal-spacing detection.
+       * 3. Snaps the dragged object into alignment (if within threshold).
+       * 4. Renders the matching guide lines.
+       */
+      const onObjectMovingAlignment = (e: { target?: fabric.FabricObject }) => {
+        const obj = e.target;
+        if (!obj || (obj as any).isGuide) return;
+
+        // getBoundingRect() returns coordinates in VIEWPORT space
+        // (canvas-element pixels, after the displayScale viewport transform).
+        // obj.left / obj.top are in MODEL space.
+        // Relationship: viewport = model × displayScale.
+        // All alignment detection works in viewport space; we must convert
+        // the snap delta back to model space before writing obj.left / obj.top.
+        const ds = displayScaleRef.current || 1;
+
+        // Bounding rect of the dragged object in viewport space.
+        // setCoords() is called inside rectFromFabricObject to flush the
+        // current transform into the coord cache before reading getBoundingRect().
+        const currentRect = rectFromFabricObject(obj);
+
+        // Bounding rects of all other interactive objects (exclude guides/bg).
+        const objectRects = fc
+          .getObjects()
+          .filter((o) => {
+            const ao = o as any;
+            return (
+              o !== obj &&
+              !ao.isGuide &&
+              !ao.isBgImage &&
+              !ao.excludeFromExport
+            );
+          })
+          .map((o) => rectFromFabricObject(o));
+
+        // Add the canvas itself as a virtual target so objects snap to the
+        // canvas center and all four canvas edges.
+        //
+        // IMPORTANT: all object rects come from getBoundingRect() which returns
+        // MODEL-SPACE coordinates (before the viewport transform).  We must use
+        // the same model-space canvas dimensions here, NOT fc.getWidth() (which
+        // is viewport-space = model × displayScale).
+        const vpt = (fc as any).viewportTransform as number[] | undefined;
+        const vptX = vpt ? vpt[0] : 1;
+        const vptY = vpt ? vpt[3] : 1;
+        const canvasRect = {
+          left:   0,
+          top:    0,
+          width:  fc.getWidth()  / vptX,   // model canvas width
+          height: fc.getHeight() / vptY,   // model canvas height
+        };
+        const otherRects = [canvasRect, ...objectRects];
+
+        // Run detection (all coordinates are viewport-space throughout)
+        const alignResult   = detectAlignment(currentRect, otherRects);
+        const spacingGuides = detectEqualSpacing(currentRect, objectRects);
+
+        // Apply snap:
+        //   delta_viewport = snapTarget - currentBoundingRect edge
+        //   delta_model    = delta_viewport / displayScale
+        //   obj.left      += delta_model
+        if (alignResult.snapLeft !== null || alignResult.snapTop !== null) {
+          if (alignResult.snapLeft !== null) {
+            obj.left = (obj.left ?? 0) + (alignResult.snapLeft - currentRect.left) / ds;
+          }
+          if (alignResult.snapTop !== null) {
+            obj.top = (obj.top ?? 0) + (alignResult.snapTop - currentRect.top) / ds;
+          }
+          obj.setCoords();
+        }
+
+        // Render guides (replaces previous guides without extra repaints)
+        alignGuides.showGuides(fc, alignResult.lines, spacingGuides);
+      };
+
+      /** Clear all guide lines when dragging ends. */
+      const clearAlignmentGuides = () => alignGuides.clearGuides(fc);
+
+      // ── Selection vs Edit mode ────────────────────────────────────────────
+      // Single click  → select → bounding box + resize handles visible.
+      // Double click  → enter editing → hide resize handles to avoid overlap.
+      // Exit editing  → restore handles.
+      const onTextEditingEntered = (e: { target?: fabric.FabricObject }) => {
+        const obj = e.target;
+        if (!obj) return;
+        // Hide all controls while the user types; the text cursor takes over.
+        obj.set({ hasControls: false, hasBorders: false });
+        fc.requestRenderAll();
+      };
+
+      const onTextEditingExited = (e: { target?: fabric.FabricObject }) => {
+        const obj = e.target;
+        if (!obj) return;
+        // Restore controls and border after editing ends.
+        obj.set({ hasControls: true, hasBorders: true, borderColor: "#999" });
+        if (obj instanceof fabric.Textbox) {
+          // Word Wrap / Auto+Wrap — apply the mode-correct handle set
+          applyTextboxControls(obj);
+        } else if (obj instanceof fabric.IText) {
+          // Auto Size (IText): content-driven size, no manual resize handles.
+          // Re-hide all scale handles; keep only the rotation handle.
+          obj.set({ lockScalingX: true, lockScalingY: true, lockSkewingX: true, lockSkewingY: true });
+          obj.setControlsVisibility({ tl: false, tr: false, bl: false, br: false, mt: false, mb: false, ml: false, mr: false, mtr: true });
+        }
+        fc.requestRenderAll();
+      };
+
       fc.on("object:moving",  clampToMargin);
+      fc.on("object:moving",  onObjectMovingAlignment);
       fc.on("object:scaling", onObjectScaling);
       fc.on("object:rotating", clampToMargin);
       fc.on("object:modified", clampToMargin);
+      fc.on("object:modified", clearAlignmentGuides);
+      // After any resize gesture completes, sync the stored box dimensions to the
+      // object's actual final dimensions.  This keeps __boxWidth/__boxHeight
+      // accurate as the baseline for the NEXT drag, including after ml/mr side
+      // handle resizes (which change obj.width directly via Fabric's changeWidth
+      // action and never pass through onObjectScaling).
+      fc.on("object:modified", (e) => {
+        const obj = e.target;
+        if (!obj || !(obj instanceof fabric.Textbox)) return;
+        const anyObj = obj as any;
+        anyObj.__boxWidth  = obj.width;
+        anyObj.__boxHeight = obj.height;
+        // Clear the drag-start sentinels so the next gesture captures them fresh.
+        delete anyObj.__scalingOrigW;
+        delete anyObj.__scalingOrigH;
+      });
+      fc.on("mouse:up",        clearAlignmentGuides);
       fc.on("text:changed", clampToMargin);
+      fc.on("text:changed", onTextChanged);
+      fc.on("text:editing:entered", onTextEditingEntered);
+      fc.on("text:editing:exited",  onTextEditingExited);
 
       // Save initial blank canvas snapshot for history
       const initialSnapshot = createHistorySnapshot(fc);
@@ -1342,20 +1692,107 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const sl = mmToPx(margin.left) * ds;
         const st = mmToPx(margin.top)  * ds;
         const uid = `layer-${++layerCounterRef.current}`;
-        const t = new fabric.IText("Double-click to edit", {
+
+        // Default label text
+        const label = "Double-click to edit";
+        const fontSize = 16;
+        const fontFamily = "Inter, sans-serif";
+
+        // Measure the natural text width via an offscreen canvas so the Textbox
+        // starts on a single line. The box is sized exactly to the text so no
+        // wrapping occurs until the user manually narrows it (the auto-size guard
+        // in onObjectScaling will prevent narrowing below this width in none mode).
+        const measureCanvas = document.createElement("canvas");
+        const mctx = measureCanvas.getContext("2d");
+        let measured = 100;
+        if (mctx) {
+          mctx.font = `${fontSize}px ${fontFamily}`;
+          measured = Math.ceil(mctx.measureText(label).width);
+        }
+
+        // Always place the textbox at the safe-area origin (margin boundary).
+        // Using safeArea.x / safeArea.y directly is more explicit than deriving
+        // from margin * ds and avoids any rounding divergence.
+        const safeArea = getSafeAreaRectPx(configRef.current, ds);
+        const padding = 12;
+        // Cap at safe area width so the right edge never escapes the margin.
+        const boxW = Math.max(80, Math.min(
+          Math.floor(safeArea.width),          // hard ceiling = safe area width
+          measured + padding,                  // preferred = text + padding
+        ));
+
+        const t = new fabric.Textbox(label, {
+          left: safeArea.x,  // ← explicit safe-area origin, not margin * ds
+          top:  safeArea.y,
+          width: boxW,
+          fontFamily,
+          fontSize,
+          fill: "#1f2937",
+          textAlign: "left",
+          // Default: no forced grapheme-splitting so words behave naturally.
+          splitByGrapheme: false,
+          backgroundColor: "transparent",
+          backgroundPadding: 0,
+          scaleX: 1,
+          scaleY: 1,
+          lockScalingX: false,
+          lockScalingFlip: true,
+          noScaleCache: true,
+          selectable: true,
+          evented: true,
+        });
+        (t as any).__uid = uid;
+        (t as any).__layerName = "Text";
+        (t as any).__textMode = "none"; // no mode pre-selected in the UI
+        (t as any).__boxWidth  = boxW;
+        // Ensure Fabric computes lines (none expected) before first render
+        (t as any).initDimensions?.();
+        t.setCoords();
+        fc.add(t);
+        fc.setActiveObject(t);
+        fc.renderAll();
+      },
+
+      // ── Add a Textbox in Word Wrap mode ──────────────────────────────────
+      addWordWrapText(text?: string, fixedWidth?: number) {
+        const fc = fabricRef.current;
+        if (!fc) return;
+        const { margin } = configRef.current;
+        const ds = displayScaleRef.current;
+        const sl = mmToPx(margin.left) * ds;
+        const st = mmToPx(margin.top) * ds;
+        const uid = `layer-${++layerCounterRef.current}`;
+
+        // Default width = safe area width or explicit param
+        const safeArea = getSafeAreaRectPx(configRef.current, ds);
+        const wrapWidth = Math.max(80, fixedWidth ?? Math.round(safeArea.width * 0.7));
+
+        const tb = new fabric.Textbox(text ?? "Type your text here", {
           left: sl,
           top: st,
+          width: wrapWidth,
+          fontSize: 24,
           fontFamily: "Inter, sans-serif",
-          fontSize: 16,
           fill: "#1f2937",
+          textAlign: "left",
+          // splitByGrapheme wraps at every character boundary — handles long
+          // continuous strings that have no spaces (URLs, IDs, etc.).
+          splitByGrapheme: true,
+          scaleX: 1,
+          scaleY: 1,
           hasControls: false,
           backgroundColor: "transparent",
           backgroundPadding: 0,
         });
-        (t as any).__uid = uid;
-        (t as any).__layerName = "Text";
-        fc.add(t);
-        fc.setActiveObject(t);
+        (tb as any).__uid = uid;
+        (tb as any).__layerName = "Word Wrap Text";
+        (tb as any).__textMode = "wrap";
+        (tb as any).__boxWidth = wrapWidth;
+        // Force Fabric to compute initial wrapped lines before first render
+        (tb as any).initDimensions?.();
+        tb.setCoords();
+        fc.add(tb);
+        fc.setActiveObject(tb);
         fc.renderAll();
       },
 
@@ -2516,12 +2953,14 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
 
         if (active instanceof fabric.Textbox) {
           const tb = active as fabric.Textbox;
-          tb.set({ width: boxW, scaleX: 1 });
+          tb.set({ width: boxW, scaleX: 1, splitByGrapheme: true });
           (tb as any).__boxWidth = boxW;
           (tb as any).__boxHeight = boxH;
+          (tb as any).__textMode = "wrap";
           // Force Fabric to re-compute wrapped lines after property changes.
           (tb as any).initDimensions?.();
           tb.setCoords();
+          applyTextboxControls(tb);
           fc.fire("object:modified", { target: active });
           fc.renderAll();
           return;
@@ -2553,10 +2992,12 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           angle:      it.angle,
           opacity:    it.opacity,
           underline:  it.underline,
+          splitByGrapheme: true,
           scaleX: 1,
           scaleY: it.scaleY,
           ...extraProps,
         });
+        (tb as any).__textMode = "wrap";
         // Re-compute wrapped lines in the new Textbox before rendering.
         (tb as any).initDimensions?.();
         ignoreSaveRef.current = true;
@@ -2600,6 +3041,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           variableKey: anyTb.variableKey,
           __boxWidth: boxW,
           __boxHeight: boxH,
+          __textMode: "auto",
         });
         ignoreSaveRef.current = true;
         fc.remove(active);
@@ -2607,6 +3049,97 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         fc.setActiveObject(it);
         ignoreSaveRef.current = false;
         fc.fire("object:modified", { target: it });
+        // Apply auto-mode controls (ml/mr visible for drag-to-wrap)
+        applyITextAutoControls(it);
+        fc.renderAll();
+      },
+
+      // ── Set text mode programmatically ──────────────────────────────────
+      setTextMode(mode: "auto" | "wrap" | "auto_wrap") {
+        const fc = fabricRef.current;
+        const active = fc?.getActiveObject();
+        if (!fc || !active) return;
+
+        if (mode === "auto") {
+          // auto = IText (no fixed width, no wrapping)
+          if (active instanceof fabric.Textbox) {
+            const tb = active as fabric.Textbox;
+            const anyTb = tb as any;
+            const it = new fabric.IText(tb.text ?? "", {
+              left: tb.left, top: tb.top,
+              fontSize: tb.fontSize, fontFamily: tb.fontFamily,
+              fontWeight: tb.fontWeight as string, fontStyle: tb.fontStyle as any,
+              fill: tb.fill, textAlign: tb.textAlign as any,
+              angle: tb.angle, opacity: tb.opacity, underline: tb.underline,
+              backgroundColor: anyTb.backgroundColor ?? "transparent",
+              backgroundPadding: anyTb.backgroundPadding ?? 0,
+              scaleX: 1, scaleY: 1,
+              __uid: anyTb.__uid, __layerName: anyTb.__layerName,
+              __fieldKey: anyTb.__fieldKey, __fieldKind: anyTb.__fieldKind,
+              __isDynamicField: anyTb.__isDynamicField, variableKey: anyTb.variableKey,
+              __boxWidth: anyTb.__boxWidth, __boxHeight: anyTb.__boxHeight,
+              __textMode: "auto",
+            });
+            ignoreSaveRef.current = true;
+            fc.remove(active);
+            fc.add(it);
+            fc.setActiveObject(it);
+            ignoreSaveRef.current = false;
+            fc.fire("object:modified", { target: it });
+            fc.renderAll();
+          } else {
+            // Already IText — stamp the mode and show ml/mr for drag-to-wrap
+            (active as any).__textMode = "auto";
+            applyITextAutoControls(active as fabric.IText);
+            fc.fire("object:modified", { target: active });
+            fc.renderAll();
+          }
+          return;
+        }
+
+        // "wrap" or "auto_wrap" — both use Textbox
+        const anyActive = active as any;
+        const existingBoxW = Math.max(80, Number(anyActive.__boxWidth) || 200);
+
+        if (active instanceof fabric.Textbox) {
+          // Already a Textbox: just update mode and re-apply controls
+          const tb = active as fabric.Textbox;
+          anyActive.__textMode = mode;
+          anyActive.__boxWidth = Number(tb.width) || existingBoxW;
+          tb.set({ width: anyActive.__boxWidth, scaleX: 1, splitByGrapheme: true });
+          (tb as any).initDimensions?.();
+          tb.setCoords();
+          applyTextboxControls(tb);
+          fc.fire("object:modified", { target: tb });
+          fc.renderAll();
+          return;
+        }
+
+        // IText → Textbox conversion
+        if (!(active instanceof fabric.IText)) return;
+        const it = active as fabric.IText;
+        const tb = new fabric.Textbox(it.text ?? "", {
+          left: it.left, top: it.top, width: existingBoxW,
+          fontSize: it.fontSize, fontFamily: it.fontFamily,
+          fontWeight: it.fontWeight as string, fontStyle: it.fontStyle as any,
+          fill: it.fill, textAlign: it.textAlign as any,
+          angle: it.angle, opacity: it.opacity, underline: it.underline,
+          splitByGrapheme: true,
+          scaleX: 1, scaleY: it.scaleY,
+          __uid: anyActive.__uid, __layerName: anyActive.__layerName,
+          __fieldKey: anyActive.__fieldKey, __fieldKind: anyActive.__fieldKind,
+          __isDynamicField: anyActive.__isDynamicField, variableKey: anyActive.variableKey,
+          __boxWidth: existingBoxW, __boxHeight: anyActive.__boxHeight,
+          backgroundColor: anyActive.backgroundColor, backgroundPadding: anyActive.backgroundPadding,
+          __textMode: mode,
+        });
+        (tb as any).initDimensions?.();
+        ignoreSaveRef.current = true;
+        fc.remove(active);
+        fc.add(tb);
+        fc.setActiveObject(tb);
+        ignoreSaveRef.current = false;
+        fc.fire("object:modified", { target: tb });
         fc.renderAll();
       },
 
@@ -2636,6 +3169,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             angle:      it.angle,
             opacity:    it.opacity,
             underline:  it.underline,
+            splitByGrapheme: true,
             __uid: anyIt.__uid,
             __layerName: anyIt.__layerName,
             __fieldKey: anyIt.__fieldKey,
@@ -2644,6 +3178,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             variableKey: anyIt.variableKey,
             __boxWidth: boxW,
             __boxHeight: boxH,
+            __textMode: "auto_wrap",
           });
           ignoreSaveRef.current = true;
           fc.remove(active);
@@ -2661,8 +3196,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const targetH = Math.max(20, Number(anyTb.__boxHeight) || Number(tb.getScaledHeight()) || 20);
         anyTb.__boxWidth = targetW;
         anyTb.__boxHeight = targetH;
+        anyTb.__textMode = "auto_wrap";
 
-        tb.set({ scaleX: 1, scaleY: 1, width: targetW });
+        tb.set({ scaleX: 1, scaleY: 1, width: targetW, splitByGrapheme: true });
+        applyTextboxControls(tb);
         applyTextFit(tb, targetW, targetH);
         fc.fire("object:modified", { target: tb });
         fc.renderAll();

@@ -16,6 +16,9 @@ interface TemplatePayload {
   thumbnail?: string;
   previewImageUrl?: string;
   layoutJSON?: string;
+  /** Pre-computed from client diagnostics — skips server-side JSON parsing of canvasJSON. */
+  hasValidLayout?: boolean;
+  elementCount?: number;
 }
 
 interface PreviewRequestBody {
@@ -182,7 +185,16 @@ router.post('/generate', async (req: Request, res: Response) => {
       return;
     }
 
-    const { hasValidLayout, elementCount } = parseLayoutAndCountElements(template.layoutJSON);
+    // Use pre-computed diagnostics from client if available (avoids parsing large layoutJSON).
+    // Falls back to server-side parsing for backward compatibility.
+    let hasValidLayout: boolean;
+    let elementCount: number;
+    if (typeof template.hasValidLayout === 'boolean' && typeof template.elementCount === 'number') {
+      hasValidLayout = template.hasValidLayout;
+      elementCount = template.elementCount;
+    } else {
+      ({ hasValidLayout, elementCount } = parseLayoutAndCountElements(template.layoutJSON));
+    }
     if (!hasValidLayout || elementCount === 0) {
       res.status(400).json({ success: false, error: 'No preview available. Please configure the template.' });
       return;
@@ -230,6 +242,13 @@ router.post('/generate', async (req: Request, res: Response) => {
     const rows = Math.max(1, Math.floor((availableHeightMm + rowMarginMm) / (cardHeightMm + rowMarginMm)));
     const pageCapacity = columns * rows;
 
+    // Fetch thumbnail buffer before creating the PDFDocument so we can
+    // call doc.openImage() immediately after construction.
+    const previewSource = template.thumbnail || template.previewImageUrl;
+    const previewImageBuffer = await loadTemplatePreviewBuffer(previewSource);
+
+    const safeName = sanitizeFileName(configuration.fileName);
+
     const doc = new PDFDocument({
       autoFirstPage: false,
       compress: true,
@@ -237,11 +256,20 @@ router.post('/generate', async (req: Request, res: Response) => {
       size: [mmToPt(sheetWidthMm), mmToPt(sheetHeightMm)],
     });
 
-    const chunks: Buffer[] = [];
-    doc.on('data', (chunk) => chunks.push(chunk as Buffer));
+    // Register the thumbnail image once. PDFKit reuses the same PDF image
+    // object for every card — no re-encoding per card.
+    const previewImage = previewImageBuffer ? doc.openImage(previewImageBuffer) : null;
 
-    const previewSource = template.thumbnail || template.previewImageUrl;
-    const previewImageBuffer = await loadTemplatePreviewBuffer(previewSource);
+    // Stream PDF bytes directly to the response — no in-memory buffering.
+    // Browser starts receiving data immediately instead of waiting for all
+    // pages to be generated.
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}.pdf"`);
+    res.setHeader('x-preview-template-id', requestedTemplateId);
+    res.setHeader('x-preview-has-layout', hasValidLayout ? '1' : '0');
+    res.setHeader('x-preview-layout-elements', String(elementCount));
+    res.setHeader('x-preview-record-count', String(selectedRecords.length));
+    doc.pipe(res);
 
     const addPage = (records: Array<Record<string, unknown>>, pageIndex: number) => {
       doc.addPage({
@@ -286,9 +314,9 @@ router.post('/generate', async (req: Request, res: Response) => {
           { width: mmToPt(cardWidthMm - 4), lineBreak: false }
         );
 
-        if (previewImageBuffer) {
+        if (previewImage) {
           try {
-            doc.image(previewImageBuffer, mmToPt(xMm + 2), mmToPt(yMm + headerHeightMm + 1), {
+            doc.image(previewImage as any, mmToPt(xMm + 2), mmToPt(yMm + headerHeightMm + 1), {
               fit: [mmToPt(cardWidthMm - 4), mmToPt(cardHeightMm * 0.45)],
               align: 'center',
               valign: 'center',
@@ -331,18 +359,7 @@ router.post('/generate', async (req: Request, res: Response) => {
     }
 
     doc.end();
-
-    doc.on('end', () => {
-      const pdfBuffer = Buffer.concat(chunks);
-      const safeName = sanitizeFileName(configuration.fileName);
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `inline; filename="${safeName}.pdf"`);
-      res.setHeader('x-preview-template-id', requestedTemplateId);
-      res.setHeader('x-preview-has-layout', hasValidLayout ? '1' : '0');
-      res.setHeader('x-preview-layout-elements', String(elementCount));
-      res.setHeader('x-preview-record-count', String(selectedRecords.length));
-      res.status(200).send(pdfBuffer);
-    });
+    // doc.pipe(res) handles flushing and closing the response stream.
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message || 'Failed to generate preview PDF' });
   }

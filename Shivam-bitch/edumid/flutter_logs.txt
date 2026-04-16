@@ -1,0 +1,37 @@
+Launching lib\main.dart on vivo 1901 in debug mode...
+Running Gradle task 'assembleDebug'...                              5.3s
+√ Built build\app\outputs\flutter-apk\app-debug.apk
+Installing build\app\outputs\flutter-apk\app-debug.apk...          13.6s
+D/FlutterJNI(19599): Beginning load of flutter...
+D/FlutterJNI(19599): flutter (null) was loaded normally!
+I/flutter (19599): [IMPORTANT:flutter/shell/platform/android/android_context_gl_impeller.cc(104)] Using the Impeller rendering backend (OpenGLES).
+Syncing files to device vivo 1901...                               154ms
+
+Flutter run key commands.
+r Hot reload. 
+R Hot restart.
+h List all available interactive commands.
+d Detach (terminate "flutter run" but leave application running).
+c Clear the screen
+q Quit (terminate the application on the device).
+
+A Dart VM Service on vivo 1901 is available at: http://127.0.0.1:63419/dBNP0cmK2Vs=/
+The Flutter DevTools debugger and profiler on vivo 1901 is available at: http://127.0.0.1:9104?uri=http://127.0.0.1:63419/dBNP0cmK2Vs=/
+I/Choreographer(19599): Skipped 536 frames!  The application may be doing too much work on its main thread.
+D/libMEOW (19599): applied 1 plugins for [com.example.edumid]:
+D/libMEOW (19599):   plugin 1: [libMEOW_gift.so]:
+I/libMEOW_gift(19599): ctx:0xb4000071dd4a4b00, ARC not Enabled.
+E/ion     (19599): ioctl c0044901 failed with code -1: Invalid argument
+I/Choreographer(19599): Skipped 193 frames!  The application may be doing too much work on its main thread.
+I/OpenGLRenderer(19599): Davey! duration=3289ms; Flags=1, IntendedVsync=555438786109863, Vsync=555442002776594, OldestInputEvent=9223372036854775807, NewestInputEvent=0, HandleInputStart=555442004221336, AnimationStart=555442004232874, PerformTraversalsStart=555442004237105, DrawStart=555442032555259, SyncQueued=555442035540413, SyncStart=555442040590951, IssueDrawCommandsStart=555442041110566, SwapBuffers=555442077428874, FrameCompleted=555442080251336, DequeueBufferDuration=0, QueueBufferDuration=1606693, GpuCompleted=0, 
+D/ProfileInstaller(19599): Installing profile for com.example.edumid
+D/InputConnectionAdaptor(19599): The input method toggled cursor monitoring on
+D/InsetsController(19599): default animation onReady types: 8 mShow=true mHasAnimationCallbacks=true mRequestedTypes=8
+D/InsetsAnimationCtrlImpl(19599): notify control request finished for types: 8
+D/InsetsController(19599): onAnimationFinish showOnFinish: true mRequestedTypes=8
+D/InputConnectionAdaptor(19599): The input method toggled cursor monitoring off
+D/InsetsController(19599): default animation onReady types: 8 mShow=false mHasAnimationCallbacks=true mRequestedTypes=8
+D/InsetsAnimationCtrlImpl(19599): notify control request finished for types: 8
+D/InsetsController(19599): onAnimationFinish showOnFinish: false mRequestedTypes=8
+I/Choreographer(19599): Skipped 38 frames!  The application may be doing too much work on its main thread.
+Lost connection to device.

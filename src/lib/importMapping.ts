@@ -13,34 +13,69 @@ const OTHER_FIELD: ImportSystemField = {
 };
 
 export const CORE_IMPORT_FIELDS: ImportSystemField[] = [
-  { key: "schoolCode", label: "School Code", required: true },
-  { key: "admissionNo", label: "Admission Number", required: false },
-  { key: "rollNo", label: "Roll Number", required: false },
-  { key: "name", label: "Name", required: true },
-  { key: "photo", label: "Student Photo", required: false },
-  { key: "fatherName", label: "Father Name", required: false },
-  { key: "motherName", label: "Mother Name", required: false },
-  { key: "fatherMobile", label: "Father Mobile Number", required: false },
-  { key: "fatherWhatsapp", label: "Father WhatsApp Number", required: false },
-  { key: "address", label: "Address", required: false },
-  { key: "modeOfTransport", label: "Mode of Transport", required: false },
-  { key: "schoolHouse", label: "School House", required: false },
-  { key: "bloodGroup", label: "Blood Group", required: false },
+  // Order enforced by FIELD_DISPLAY_ORDER — always shown in this sequence.
+  { key: "photo",          label: "Profile Picture",             required: false },
+  { key: "name",           label: "Full Name",                   required: true  },
+  { key: "schoolCode",     label: "School Code",                 required: true  },
+  { key: "admissionNo",   label: "Admission Number",            required: false },
+  { key: "rollNo",         label: "Roll Number",                 required: false },
+  { key: "classCourse",   label: "Class / Course",              required: false },
+  { key: "section",        label: "Section / Stream / Semester", required: false },
+  { key: "dob",            label: "Date of Birth",               required: false },
+  { key: "fatherName",     label: "Father Name",                 required: false },
+  { key: "motherName",     label: "Mother Name",                 required: false },
+  { key: "fatherMobile",   label: "Father Mobile Number",        required: false },
+  { key: "address",        label: "Address",                     required: false },
+  { key: "schoolHouse",   label: "School House",                required: false },
+  { key: "modeOfTransport", label: "Mode of Transport",         required: false },
+  // Additional fields (shown in accordion)
+  { key: "fatherWhatsapp", label: "Father WhatsApp Number",      required: false },
+  { key: "bloodGroup",     label: "Blood Group",                 required: false },
 ];
+
+/**
+ * Canonical field display order for the mapping screen UI.
+ * session_year is intentionally excluded — it is auto-generated, not mapped from CSV.
+ */
+export const FIELD_DISPLAY_ORDER: ReadonlyArray<string> = [
+  "photo", "name", "schoolCode",
+  "admissionNo", "rollNo",
+  "classCourse", "section", "dob",
+  "fatherName", "motherName", "fatherMobile",
+  "address", "schoolHouse", "modeOfTransport",
+] as const;
+
+/**
+ * Fields that are auto-generated at import time and must NOT appear
+ * in the CSV column-mapping UI.
+ */
+export const AUTO_GENERATED_FIELDS = new Set<string>(["sessionYear"]);
+
+/** Auto-generate academic session string based on the April-1 boundary. */
+export function getSessionYear(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  // New session starts on April 1
+  const april = new Date(year, 3, 1); // month index 3 = April
+  return now >= april ? `${year}-${year + 1}` : `${year - 1}-${year}`;
+}
 
 export const FIELD_ALIAS_BY_KEY: Record<string, string[]> = {
   schoolCode: ["school code", "schoolcode"],
-  admissionNo: ["admission no", "admission number", "admissionnumber", "admission id", "admissionid", "adm no", "admno"],
-  rollNo: ["roll no", "roll number", "rollno"],
-  name: ["name", "full name", "student name", "first name", "firstname"],
-  photo: ["student photo", "photo", "profile pic", "profile picture", "profilepic", "link", "photo url", "photo_url", "student_photo", "image", "image url", "image_url", "avatar", "profile image", "profile_image", "picture", "picture url", "picture_path", "picture_url"],
-  fatherName: ["father name", "fathers name"],
-  motherName: ["mother name", "mothers name"],
-  fatherMobile: ["father mobile", "father mobile number", "father phone", "father number", "father mob no", "fathermobno", "mobile", "phone"],
+  admissionNo: ["admission no", "admission number", "admissionnumber", "admission id", "admissionid", "adm no", "admno", "admission_number"],
+  rollNo: ["roll no", "roll number", "rollno", "roll_number"],
+  name: ["name", "full name", "student name", "first name", "firstname", "full_name"],
+  photo: ["student photo", "photo", "profile pic", "profile picture", "profilepic", "link", "photo url", "photo_url", "student_photo", "image", "image url", "image_url", "avatar", "profile image", "profile_image", "picture", "picture url", "picture_path", "picture_url", "profile_picture"],
+  classCourse: ["class", "class course", "course", "classcourse", "grade", "class_course", "std", "standard"],
+  section: ["section", "stream", "semester", "section stream", "stream semester", "sec", "section_stream_semester", "div", "division"],
+  dob: ["date of birth", "dob", "birthdate", "birth date", "dateofbirth", "date_of_birth", "born"],
+  fatherName: ["father name", "fathers name", "father_name"],
+  motherName: ["mother name", "mothers name", "mother_name"],
+  fatherMobile: ["father mobile", "father mobile number", "father phone", "father number", "father mob no", "fathermobno", "mobile", "phone", "father_mobile"],
   fatherWhatsapp: ["father whatsapp", "father whatsapp number", "whatsapp", "whatsapp number", "father whatsapp no"],
   address: ["address"],
-  modeOfTransport: ["mode of transport", "transport mode", "transport", "mode"],
-  schoolHouse: ["school house", "house"],
+  modeOfTransport: ["mode of transport", "transport mode", "transport", "mode", "transport_mode"],
+  schoolHouse: ["school house", "house", "school_house"],
   bloodGroup: ["blood group", "bloodgroup"],
   other: ["other", "others"],
 };
@@ -73,8 +108,10 @@ function canonicalCoreKeyFromHeader(header: string): string | null {
 }
 
 export function buildProjectFields(headers: string[]): ImportSystemField[] {
-  const seen = new Set(CORE_IMPORT_FIELDS.map((f) => normalise(f.key)));
+  const coreKeySet = new Set(CORE_IMPORT_FIELDS.map((f) => normalise(f.key)));
+  const seen = new Set(coreKeySet);
 
+  // Dynamic fields: CSV headers that don't map to any core field
   const dynamicFields: ImportSystemField[] = headers
     .map((header) => String(header || "").trim())
     .filter(Boolean)
@@ -88,7 +125,22 @@ export function buildProjectFields(headers: string[]): ImportSystemField[] {
     })
     .map((header) => ({ key: header, label: header, required: false }));
 
-  return [...CORE_IMPORT_FIELDS, ...dynamicFields, OTHER_FIELD];
+  // Apply FIELD_DISPLAY_ORDER: ordered core fields first, then remaining core, then dynamic
+  const orderedCore: ImportSystemField[] = [];
+  const coreByKey = new Map(CORE_IMPORT_FIELDS.map((f) => [f.key, f]));
+
+  for (const key of FIELD_DISPLAY_ORDER) {
+    const field = coreByKey.get(key);
+    if (field) orderedCore.push(field);
+  }
+  // Append any core fields not in FIELD_DISPLAY_ORDER (e.g. fatherWhatsapp, bloodGroup)
+  for (const field of CORE_IMPORT_FIELDS) {
+    if (!FIELD_DISPLAY_ORDER.includes(field.key)) {
+      orderedCore.push(field);
+    }
+  }
+
+  return [...orderedCore, ...dynamicFields, OTHER_FIELD];
 }
 
 function enforceMutualExclusion(mapping: Record<string, string>): Record<string, string> {
@@ -202,6 +254,12 @@ export function mapRowToRecord(
   } else if (mergedName && (rec.name === firstName || rec.name === lastName)) {
     rec.name = mergedName;
   }
+
+  // Fallback ID: prefer admission number; fall back to roll number.
+  rec.finalId = sanitizeCell(rec.admissionNo) || sanitizeCell(rec.rollNo) || "";
+
+  // Session year is always auto-generated — never taken from CSV.
+  rec.sessionYear = getSessionYear();
 
   return rec;
 }
