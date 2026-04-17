@@ -258,7 +258,7 @@ router.post('/generate', async (req: Request, res: Response) => {
 
     // Register the thumbnail image once. PDFKit reuses the same PDF image
     // object for every card — no re-encoding per card.
-    const previewImage = previewImageBuffer ? doc.openImage(previewImageBuffer) : null;
+    const previewImage = previewImageBuffer ? (doc as any).openImage(previewImageBuffer) : null;
 
     // Stream PDF bytes directly to the response — no in-memory buffering.
     // Browser starts receiving data immediately instead of waiting for all
