@@ -7,7 +7,7 @@ import {
   Package, ListTodo, FolderOpen, Database, Layers, Printer, Pencil, FilePlus, X,
   Filter, MoreHorizontal, UserCircle, FileSpreadsheet, Settings2, Users, GripVertical,
   Crop, Wand2, RotateCcw, ImageIcon, UserPlus, FileDown, Archive, Camera, Loader2,
-  QrCode, UserRound, AlertTriangle, Globe,
+  QrCode, UserRound, AlertTriangle, Globe, ChevronDown,
 } from "lucide-react";
 import JSZip from "jszip";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -537,7 +537,17 @@ export function ProjectDetail() {
 
   // ── Data action dialog state ──
   const photoUploadRef = useRef<HTMLInputElement>(null);
+  const bulkImageFolderRef = useRef<HTMLInputElement>(null);
+  const bulkImageZipRef = useRef<HTMLInputElement>(null);
   const [imageUploadTarget, setImageUploadTarget] = useState("selection");
+  const [isBulkImageUploadOpen, setIsBulkImageUploadOpen] = useState(false);
+
+  const [bulkImageProcessing, setBulkImageProcessing] = useState(false);
+  const [bulkImageResults, setBulkImageResults] = useState<{
+    matched: { userId: string; name: string; filename: string; dataUrl: string }[];
+    unmatched: { filename: string; reason: string }[];
+    duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[];
+  } | null>(null);
   const [isAddDataOpen, setIsAddDataOpen] = useState(false);
   const [addDataDraft, setAddDataDraft] = useState<Record<string, string>>({});
   const [isBulkEditOpen, setIsBulkEditOpen] = useState(false);
@@ -1220,6 +1230,241 @@ export function ProjectDetail() {
       setImageUploadTarget("selection");
     });
     e.target.value = "";
+  };
+
+  // ── Bulk Image Upload (ZIP or folder) ────────────────────────────────────
+  const processBulkImageFiles = async (files: File[]) => {
+    const imageFiles = files.filter((f) => /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.name));
+    if (!imageFiles.length || !id) return;
+    setBulkImageProcessing(true);
+    setBulkImageResults(null);
+
+    // Read all images as data URLs
+    const loaded = await Promise.all(
+      imageFiles.map(
+        (file) =>
+          new Promise<{ file: File; dataUrl: string }>((resolve) => {
+            const r = new FileReader();
+            r.onload = (ev) => resolve({ file, dataUrl: ev.target!.result as string });
+            r.readAsDataURL(file);
+          })
+      )
+    );
+
+    // Normalize a value: lowercase, trim, strip trailing Excel ".0" artifacts (e.g. "145.0" → "145")
+    const normVal = (s: unknown) =>
+      String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "");
+
+    // Normalize a field key for comparison: lowercase, trim, collapse ALL
+    // separators (underscore, dot, multiple spaces) into a single space.
+    // Effect: "school_code" → "school code", "School Code" → "school code"  ← they now match!
+    const normKey = (k: string) =>
+      k.toLowerCase().trim().replace(/[_.\s]+/g, " ");
+
+    // Find a record field value by trying multiple key spellings.
+    // Matching strategy per key k:
+    //   1. Exact key match (rec[k])
+    //   2. normKey-equal match (unifies underscore/space/case differences)
+    const getField = (rec: ProjectDataRecord, ...keys: string[]): string => {
+      for (const k of keys) {
+        if (rec[k] !== undefined && rec[k] !== null) return normVal(rec[k]);
+        const nk = normKey(k);
+        const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
+        if (entry && entry[1] !== undefined && entry[1] !== null) return normVal(entry[1]);
+      }
+      return "";
+    };
+
+    const getName = (rec: ProjectDataRecord) =>
+      String(rec["Name"] ?? rec["name"] ?? rec["full_name"] ?? rec["Full Name"] ?? rec["Student Name"] ?? rec.id);
+
+    const matched: { userId: string; name: string; filename: string; dataUrl: string }[] = [];
+    const unmatched: { filename: string; reason: string }[] = [];
+    const duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[] = [];
+    const usedUserIds = new Set<string>();
+
+    // Internal fields that are never data-column values
+    const META_KEYS = new Set(["id", "projectId", "category", "photo"]);
+
+    /**
+     * Find matching records using TWO strategies (in order):
+     *
+     * 1. Named-field strategy — looks for well-known school-code and
+     *    roll/admission-number column names. Fast and precise.
+     *
+     * 2. Value-scan fallback — if strategy 1 returns nothing, scan every
+     *    field of every record looking for a record that has BOTH
+     *    fileSchoolCode and fileRollNumber as values in separate columns.
+     *    This is column-name-agnostic and handles any CSV format.
+     */
+    const findMatches = (fileSchoolCode: string, fileRollNumber: string): ProjectDataRecord[] => {
+      // ── Strategy 1: named fields ──────────────────────────────────────────
+      const byName = dataRecords.filter((rec) => {
+        const recSchoolCode = getField(
+          rec,
+          "school_code", "School Code", "schoolCode", "school_id", "School Id",
+          "Sch Code", "sch_code",
+        );
+        const recRoll = getField(
+          rec,
+          "roll_number", "Roll Number", "roll_no", "Roll No",
+          "rollNumber", "rollNo", "Roll_No", "Roll_Number",
+        );
+        const recAdm = getField(
+          rec,
+          "admission_number", "Admission Number", "admission_no", "Admission No",
+          "adm_no", "Adm No", "adm_number", "Adm Number", "Adm. No",
+          "admNo", "admissionNumber", "admissionNo",
+        );
+        const schoolMatch = recSchoolCode === fileSchoolCode;
+        const idMatch =
+          (recRoll !== "" && recRoll === fileRollNumber) ||
+          (recAdm  !== "" && recAdm  === fileRollNumber);
+        return schoolMatch && idMatch;
+      });
+
+      if (byName.length > 0) return byName;
+
+      // ── Strategy 2: value-scan (column-name-agnostic) ────────────────────
+      // For each record, collect data-column values (skip meta keys + long text
+      // like addresses).  A record matches if it has BOTH fileSchoolCode and
+      // fileRollNumber as values in DIFFERENT columns.
+      return dataRecords.filter((rec) => {
+        const values = Object.entries(rec)
+          .filter(([k]) => !META_KEYS.has(k))
+          .map(([, v]) => normVal(v))
+          .filter((v) => v.length > 0 && v.length <= 20); // ignore long text fields
+        const hasSchool = values.includes(fileSchoolCode);
+        const hasRoll   = values.includes(fileRollNumber);
+        return hasSchool && hasRoll && fileSchoolCode !== fileRollNumber;
+      });
+    };
+
+    loaded.forEach(({ file: f, dataUrl }) => {
+      // Strip extension
+      const basename = f.name.replace(/\.[^.]+$/, "");
+      const parts = basename.split("_");
+
+      // Filenames with at least 2 underscore-separated parts are matched using
+      // the format:  <school_code>_<roll_number>_[...rest]
+      // e.g.  145_3_Yash_katiyar.jpg  →  school_code=145, roll_number=3
+      if (parts.length < 2) {
+        unmatched.push({
+          filename: f.name,
+          reason: 'Invalid filename format — must contain underscore separator (e.g. 145_3_Name.jpg)',
+        });
+        return;
+      }
+
+      const fileSchoolCode = normVal(parts[0]);
+      const fileRollNumber = normVal(parts[1]);
+
+      // Both parts must be non-empty to attempt matching
+      if (!fileSchoolCode || !fileRollNumber) {
+        unmatched.push({
+          filename: f.name,
+          reason: 'Could not extract school code or roll number from filename',
+        });
+        return;
+      }
+
+      const hits = findMatches(fileSchoolCode, fileRollNumber);
+
+      if (hits.length === 0) {
+        // Build a debug hint showing the actual field keys in the first record
+        const sampleKeys = dataRecords.length > 0
+          ? Object.keys(dataRecords[0])
+              .filter((k) => !META_KEYS.has(k))
+              .slice(0, 6)
+              .join(", ")
+          : "no records loaded";
+        unmatched.push({
+          filename: f.name,
+          reason: `No match for school_code="${fileSchoolCode}" + id="${fileRollNumber}". ` +
+                  `Available columns: [${sampleKeys}]`,
+        });
+      } else if (hits.length > 1) {
+        const allMatchNames = hits.map(getName);
+        const rec = hits[0];
+        duplicates.push({ filename: f.name, allMatchNames, appliedName: getName(rec) });
+        // Still apply to first match
+        if (!usedUserIds.has(rec.id)) {
+          usedUserIds.add(rec.id);
+          matched.push({
+            userId: rec.id,
+            name: getName(rec),
+            filename: f.name,
+            dataUrl,
+          });
+        }
+      } else {
+        const rec = hits[0];
+        if (usedUserIds.has(rec.id)) {
+          duplicates.push({
+            filename: f.name,
+            allMatchNames: [getName(rec)],
+            appliedName: '(already assigned to another file)',
+          });
+        } else {
+          usedUserIds.add(rec.id);
+          matched.push({
+            userId: rec.id,
+            name: getName(rec),
+            filename: f.name,
+            dataUrl,
+          });
+        }
+      }
+    });
+
+    setBulkImageResults({ matched, unmatched, duplicates });
+    setBulkImageProcessing(false);
+  };
+
+  const handleBulkImageFolderChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    await processBulkImageFiles(files);
+  };
+
+  const handleBulkImageZipChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const zipFile = e.target.files?.[0];
+    e.target.value = "";
+    if (!zipFile) return;
+    setBulkImageProcessing(true);
+    setBulkImageResults(null);
+    try {
+      const zip = new JSZip();
+      const loaded = await zip.loadAsync(zipFile);
+      const imageEntries = Object.values(loaded.files).filter(
+        (entry) => !entry.dir && /\.(jpe?g|png|webp|gif|bmp)$/i.test(entry.name)
+      );
+      const files: File[] = await Promise.all(
+        imageEntries.map(async (entry) => {
+          const blob = await entry.async("blob");
+          // Use only the basename (not nested folder path)
+          const basename = entry.name.split("/").pop() ?? entry.name;
+          return new File([blob], basename, { type: blob.type || "image/jpeg" });
+        })
+      );
+      // processBulkImageFiles will handle setBulkImageProcessing(false)
+      await processBulkImageFiles(files);
+    } catch {
+      setBulkImageProcessing(false);
+    }
+  };
+
+  const handleApplyBulkImages = () => {
+    if (!id || !bulkImageResults) return;
+    const updated = [...dataRecords];
+    bulkImageResults.matched.forEach(({ userId, dataUrl }) => {
+      const i = updated.findIndex((r) => r.id === userId);
+      if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
+    });
+    saveDataRecords(id, dataCategory, updated);
+    setDataRecords(updated);
+    setIsBulkImageUploadOpen(false);
+    setBulkImageResults(null);
   };
 
   // ── Generate Bar Code (draws Code128-style bars onto a canvas per record) ──
@@ -2599,6 +2844,9 @@ export function ProjectDetail() {
                               <DropdownMenuItem onClick={() => { setImageUploadTarget("selection"); photoUploadRef.current?.click(); }}>
                                 <ImageIcon className="h-4 w-4 mr-2" /> Image Upload
                               </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => { setBulkImageResults(null); setIsBulkImageUploadOpen(true); }} disabled={!dataRecords.length}>
+                                <Archive className="h-4 w-4 mr-2" /> Bulk Image Upload
+                              </DropdownMenuItem>
                               <DropdownMenuSeparator />
                               <DropdownMenuItem onClick={() => { setBarcodeField(dataFields[0]?.key ?? ""); setIsGenerateBarcodeOpen(true); }}>
                                 <QrCode className="h-4 w-4 mr-2" /> Generate Bar Code
@@ -2737,6 +2985,25 @@ export function ProjectDetail() {
                         multiple
                         className="hidden"
                         onChange={handleImageUploadFiles}
+                      />
+                      {/* Bulk image upload — folder */}
+                      <input
+                        ref={bulkImageFolderRef}
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        // @ts-expect-error webkitdirectory is non-standard
+                        webkitdirectory=""
+                        className="hidden"
+                        onChange={handleBulkImageFolderChange}
+                      />
+                      {/* Bulk image upload — ZIP */}
+                      <input
+                        ref={bulkImageZipRef}
+                        type="file"
+                        accept=".zip,application/zip,application/x-zip-compressed"
+                        className="hidden"
+                        onChange={handleBulkImageZipChange}
                       />
                     </CardContent>
                   </Card>
@@ -3167,6 +3434,137 @@ export function ProjectDetail() {
                 <Button variant="outline" className="flex-1" onClick={() => setIsGenerateBarcodeOpen(false)}>Cancel</Button>
                 <Button className="flex-1 gap-1.5" disabled={!barcodeField} onClick={handleGenerateBarcodes}>
                   <QrCode className="h-4 w-4" /> Generate
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+
+          {/* ── Bulk Image Upload Dialog ── */}
+          <Dialog open={isBulkImageUploadOpen} onOpenChange={(o) => { setIsBulkImageUploadOpen(o); if (!o) setBulkImageResults(null); }}>
+            <DialogContent className="sm:max-w-[500px] max-h-[85vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <Archive className="h-5 w-5" />
+                  Bulk Image Upload
+                </DialogTitle>
+              </DialogHeader>
+
+              <div className="space-y-4 py-1">
+                {/* Upload buttons */}
+                <div className="grid grid-cols-2 gap-3">
+                  <Button
+                    variant="outline"
+                    className="gap-2 h-20 flex-col text-sm"
+                    disabled={bulkImageProcessing}
+                    onClick={() => bulkImageZipRef.current?.click()}
+                  >
+                    <Archive className="h-6 w-6 text-muted-foreground" />
+                    Upload ZIP File
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="gap-2 h-20 flex-col text-sm"
+                    disabled={bulkImageProcessing}
+                    onClick={() => bulkImageFolderRef.current?.click()}
+                  >
+                    <FolderOpen className="h-6 w-6 text-muted-foreground" />
+                    Upload Folder
+                  </Button>
+                </div>
+
+                {/* Processing indicator */}
+                {bulkImageProcessing && (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Processing images…
+                  </div>
+                )}
+
+                {/* Results */}
+                {bulkImageResults && !bulkImageProcessing && (
+                  <div className="space-y-2.5">
+
+                    {/* ── MATCHED ── */}
+                    <details className="rounded-lg border border-green-200 bg-green-50 overflow-hidden" open>
+                      <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-green-800 [list-style:none] [&::-webkit-details-marker]:hidden">
+                        <CheckCircle2 className="h-4 w-4 shrink-0" />
+                        <span>{bulkImageResults.matched.length} image{bulkImageResults.matched.length !== 1 ? 's' : ''} matched</span>
+                        <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
+                      </summary>
+                      {bulkImageResults.matched.length > 0 && (
+                        <ul className="text-xs text-green-700 space-y-0.5 max-h-36 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
+                          {bulkImageResults.matched.map((m) => (
+                            <li key={m.userId} className="flex gap-1.5 items-center">
+                              <img src={m.dataUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
+                              <span className="truncate">{m.filename} → <strong>{m.name}</strong></span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </details>
+
+                    {/* ── DUPLICATES ── */}
+                    {bulkImageResults.duplicates.length > 0 && (
+                      <details className="rounded-lg border border-amber-200 bg-amber-50 overflow-hidden">
+                        <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-amber-800 [list-style:none] [&::-webkit-details-marker]:hidden">
+                          <AlertTriangle className="h-4 w-4 shrink-0" />
+                          <span>{bulkImageResults.duplicates.length} duplicate match{bulkImageResults.duplicates.length !== 1 ? 'es' : ''}</span>
+                          <span className="text-xs font-normal ml-1 opacity-60">(applied to first)</span>
+                          <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
+                        </summary>
+                        <ul className="text-xs space-y-3 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-amber-200">
+                          {bulkImageResults.duplicates.map((d, i) => (
+                            <li key={i}>
+                              <p className="font-semibold text-amber-900 truncate mb-1">📄 {d.filename}</p>
+                              <ul className="pl-3 space-y-0.5">
+                                {d.allMatchNames.map((name, ni) => (
+                                  <li key={ni} className="flex items-center gap-1.5 text-amber-800">
+                                    <span className={ni === 0 ? 'font-semibold' : 'opacity-60'}>{ni + 1}. {name}</span>
+                                    {ni === 0 && (
+                                      <span className="text-[10px] font-bold bg-amber-300 text-amber-900 px-1.5 py-0.5 rounded">APPLIED</span>
+                                    )}
+                                  </li>
+                                ))}
+                              </ul>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+
+                    {/* ── UNMATCHED ── */}
+                    {bulkImageResults.unmatched.length > 0 && (
+                      <details className="rounded-lg border border-muted bg-muted/30 overflow-hidden">
+                        <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-muted-foreground [list-style:none] [&::-webkit-details-marker]:hidden">
+                          <X className="h-4 w-4 shrink-0" />
+                          <span>{bulkImageResults.unmatched.length} file{bulkImageResults.unmatched.length !== 1 ? 's' : ''} unmatched</span>
+                          <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
+                        </summary>
+                        <ul className="text-xs space-y-2 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-muted">
+                          {bulkImageResults.unmatched.map((u, i) => (
+                            <li key={i}>
+                              <p className="font-medium text-foreground/80 truncate">📄 {u.filename}</p>
+                              <p className="text-[11px] pl-3 text-muted-foreground mt-0.5">↳ {u.reason}</p>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+
+                  </div>
+                )}
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <Button variant="outline" className="flex-1" onClick={() => { setIsBulkImageUploadOpen(false); setBulkImageResults(null); }}>
+                  Cancel
+                </Button>
+                <Button
+                  className="flex-1"
+                  disabled={!bulkImageResults || bulkImageResults.matched.length === 0 || bulkImageProcessing}
+                  onClick={handleApplyBulkImages}
+                >
+                  Apply {bulkImageResults?.matched.length ? `(${bulkImageResults.matched.length})` : ""} Images
                 </Button>
               </div>
             </DialogContent>

@@ -16,7 +16,7 @@ import {
   AlignLeft, AlignCenter, AlignRight, Bold, Italic, Underline, ImagePlus,
   Lock, Unlock, ChevronsUp, ChevronsDown, ArrowUp, ArrowDown, Maximize2,
   WrapText, RefreshCw, Upload, CaseUpper, CaseLower, CaseSensitive, Trash2,
-  Rows3, MoveHorizontal, RectangleHorizontal,
+  Rows3, MoveHorizontal, RectangleHorizontal, Type,
 } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { ToggleGroup, ToggleGroupItem } from "../ui/toggle-group";
@@ -621,12 +621,12 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                 {/* Text mode selector */}
                 {(() => {
                   const rawMode = (selected as any).__textMode as string | undefined;
-                  // "none" or undefined = new object, no mode chosen yet → nothing highlighted.
-                  // "auto" = IText (Auto Size). "wrap" / "auto_wrap" = Textbox variants.
+                  // Default is "auto" (Auto Size). Legacy "none"/undefined objects
+                  // also get treated as "auto" so the Auto Size button stays lit.
                   const textMode =
-                    rawMode === "wrap" || rawMode === "auto_wrap" || rawMode === "auto"
+                    rawMode === "wrap" || rawMode === "auto_wrap"
                       ? rawMode
-                      : ""; // empty string → ToggleGroup shows nothing selected
+                      : "auto"; // auto, none, undefined → Auto Size highlighted
                   return (
                     <div className="mb-2">
                       <span className="text-[10px] text-muted-foreground font-medium block mb-1.5">Text Mode</span>
@@ -634,11 +634,17 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                         type="single"
                         value={textMode}
                         onValueChange={(val) => {
-                          if (!val) return; // deselect click — keep current mode
+                          // val is empty string when the active button is clicked again
+                          // (toggle OFF) → fall back to Normal ("none").
+                          if (!val) {
+                            canvasRef.current?.setTextMode("none");
+                            onRefresh();
+                            return;
+                          }
                           const mode = val as "auto" | "wrap" | "auto_wrap";
                           if (mode === "auto") {
                             if (isTextbox) canvasRef.current?.disableWordWrap();
-                            else (selected as any).__textMode = "auto"; // stamp IText
+                            else canvasRef.current?.setTextMode("auto");
                           } else if (mode === "wrap") {
                             if (!isTextbox) canvasRef.current?.enableWordWrap();
                             else canvasRef.current?.setTextMode("wrap");
@@ -651,21 +657,21 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                         <ToggleGroupItem
                           value="auto"
                           className="h-8 flex-col gap-0.5 text-[9px] px-1 w-full"
-                          title="Auto-size: text expands to fit content, single line">
+                          title="Auto Size: single line, font dynamically scales to fit width">
                           <Maximize2 className="h-3 w-3" />
                           Auto Size
                         </ToggleGroupItem>
                         <ToggleGroupItem
                           value="wrap"
                           className="h-8 flex-col gap-0.5 text-[9px] px-1 w-full"
-                          title="Word Wrap: fixed width, height grows with text">
+                          title="Word Wrap: fixed width, height grows with text, font fixed">
                           <WrapText className="h-3 w-3" />
                           Word Wrap
                         </ToggleGroupItem>
                         <ToggleGroupItem
                           value="auto_wrap"
                           className="h-8 flex-col gap-0.5 text-[9px] px-1 w-full"
-                          title="Auto+Wrap: fixed width, font shrinks to fit box">
+                          title="Auto+Wrap: shrink font first, wrap when font reaches minimum">
                           <RefreshCw className="h-3 w-3" />
                           Auto+Wrap
                         </ToggleGroupItem>
