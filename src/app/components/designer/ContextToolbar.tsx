@@ -348,10 +348,19 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
 
             <Tip label="UPPERCASE">
               <Button
-                variant="ghost"
+                variant={(textObj as any).__textTransform === "uppercase" ? "secondary" : "ghost"}
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => applyText((textObj.text ?? "").toUpperCase())}
+                onClick={() => {
+                  const isDynamic = !!(textObj as any).__isDynamicField;
+                  const next = (textObj as any).__textTransform === "uppercase" ? "none" : "uppercase";
+                  if (isDynamic) {
+                    applyProps({ __textTransform: next });
+                  } else {
+                    const txt = next === "uppercase" ? (textObj.text ?? "").toUpperCase() : (textObj.text ?? "");
+                    applyProps({ text: txt, __textTransform: next });
+                  }
+                }}
               >
                 <CaseUpper className="h-3.5 w-3.5" />
               </Button>
@@ -359,10 +368,19 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
 
             <Tip label="lowercase">
               <Button
-                variant="ghost"
+                variant={(textObj as any).__textTransform === "lowercase" ? "secondary" : "ghost"}
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => applyText((textObj.text ?? "").toLowerCase())}
+                onClick={() => {
+                  const isDynamic = !!(textObj as any).__isDynamicField;
+                  const next = (textObj as any).__textTransform === "lowercase" ? "none" : "lowercase";
+                  if (isDynamic) {
+                    applyProps({ __textTransform: next });
+                  } else {
+                    const txt = next === "lowercase" ? (textObj.text ?? "").toLowerCase() : (textObj.text ?? "");
+                    applyProps({ text: txt, __textTransform: next });
+                  }
+                }}
               >
                 <CaseLower className="h-3.5 w-3.5" />
               </Button>
@@ -370,10 +388,21 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
 
             <Tip label="Capitalize">
               <Button
-                variant="ghost"
+                variant={(textObj as any).__textTransform === "capitalize" ? "secondary" : "ghost"}
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => applyText((textObj.text ?? "").replace(/\b\w/g, (c) => c.toUpperCase()))}
+                onClick={() => {
+                  const isDynamic = !!(textObj as any).__isDynamicField;
+                  const next = (textObj as any).__textTransform === "capitalize" ? "none" : "capitalize";
+                  if (isDynamic) {
+                    applyProps({ __textTransform: next });
+                  } else {
+                    const txt = next === "capitalize"
+                      ? (textObj.text ?? "").replace(/\b\w/g, (c) => c.toUpperCase())
+                      : (textObj.text ?? "");
+                    applyProps({ text: txt, __textTransform: next });
+                  }
+                }}
               >
                 <CaseSensitive className="h-3.5 w-3.5" />
               </Button>

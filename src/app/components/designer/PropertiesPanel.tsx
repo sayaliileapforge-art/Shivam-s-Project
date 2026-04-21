@@ -420,8 +420,12 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
     text.set({
       stroke: effect.stroke,
       strokeWidth: Math.max(0, effect.strokeWidth),
+      // paintFirst: "stroke" renders the stroke layer first, then fill on top.
+      // This gives a clean outer outline — fill is never obscured by the stroke.
+      // When there is no stroke, restore "fill" so there is no rendering change.
+      paintFirst: effect.strokeWidth > 0 ? "stroke" : "fill",
       shadow,
-    });
+    } as any);
     (text as any).initDimensions?.();
     text.setCoords();
     canvasRef.current?.constrainSelectedToSafeArea();

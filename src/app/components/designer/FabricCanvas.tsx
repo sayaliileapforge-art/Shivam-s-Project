@@ -45,7 +45,7 @@ export interface FabricCanvasHandle {
   addImage: (dataUrl: string) => void;
   addQRCode: (text: string) => void;
   addBarcode: (text: string) => void;
-  addDynamicField: (fieldKey: string, placement?: { x: number; y: number }) => void;
+  addDynamicField: (fieldKey: string, fieldType?: string, placement?: { x: number; y: number }) => void;
   renderTemplateWithData: (template: Record<string, any> | null, data: VariableRenderInput) => Promise<string>;
   applyMaskAndBorderToSelected: (options?: MaskBorderOptions) => void;
   /** Add a scalable SVG from an SVG string. */
@@ -112,6 +112,14 @@ export interface FabricCanvasHandle {
     height: number;
     rotation: number;
   }>;
+  /**
+   * Apply (or clear) a designer-time image for an image variable placeholder.
+   * - imageDataUrl truthy → replaces the dashed placeholder Group with a live
+   *   FabricImage so the canvas shows a real preview.  The original placeholder
+   *   JSON is cached internally so it can be restored on clear.
+   * - imageDataUrl null/empty → restores the original dashed placeholder Group.
+   */
+  applyVariableImage: (fieldKey: string, imageDataUrl: string | null) => Promise<void>;
 }
 
 export type ImageMaskShape =
@@ -180,6 +188,26 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     const layerLockedRef = useRef<Map<string, boolean>>(new Map());
     // Layer counter for generating unique IDs
     const layerCounterRef = useRef(0);
+    // Last-used text style — captured on every object:modified for text objects.
+    // Applied when a new text or variable field is added so users don't have to
+    // re-style every element they create.
+    const lastUsedTextStyleRef = useRef<{
+      fontFamily?: string;
+      fontSize?: number;
+      fill?: string;
+      fontWeight?: string;
+      fontStyle?: string;
+      stroke?: string;
+      strokeWidth?: number;
+      paintFirst?: string;
+      shadow?: fabric.Shadow | null;
+      textAlign?: string;
+      underline?: boolean;
+      _isSet?: boolean;
+    }>({});
+    // Cache original placeholder JSON for image-variable live preview so we can
+    // restore the dashed placeholder when the user clears an uploaded image.
+    const variableImageOriginalsRef = useRef<Map<string, object>>(new Map());
 
     const canvasPxW = Math.round(mmToPx(config.canvas.width));
     const canvasPxH = Math.round(mmToPx(config.canvas.height));
@@ -364,8 +392,14 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     }, [restoreHistorySnapshot]);
 
     const normalizeFieldKey = (key: string): string => key.trim().replace(/[{}\s]+/g, "_").toLowerCase();
+    // Mirror the IMAGE_KEY_PATTERNS from csvBinding.ts so any field inferred as
+    // "image" there is also treated as an image placeholder here.
+    const IMAGE_FIELD_PATTERNS = [
+      /photo/i, /image/i, /img/i, /picture/i, /pic/i, /avatar/i, /logo/i,
+      /signature/i, /seal/i,
+    ];
     const isImageFieldKey = (key: string): boolean =>
-      ["photo", "avatar", "image", "picture", "student_photo", "profile_image"].includes(key);
+      IMAGE_FIELD_PATTERNS.some((re) => re.test(key));
     const isBarcodeFieldKey = (key: string): boolean =>
       ["barcode", "bar_code", "qr", "qrcode", "qr_code"].includes(key);
 
@@ -450,7 +484,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     const addDynamicFieldObject = useCallback((
       fc: fabric.Canvas,
       rawFieldKey: string,
-      placement?: { x: number; y: number }
+      placement?: { x: number; y: number },
+      /** Explicit field type from drag-data; overrides key-pattern inference. */
+      fieldTypeOverride?: string,
     ) => {
       const fieldKey = normalizeFieldKey(rawFieldKey || "field");
       if (!fieldKey) return;
@@ -459,8 +495,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       const ds = displayScaleRef.current;
       const left = placement?.x ?? mmToPx(margin.left) * ds;
       const top = placement?.y ?? mmToPx(margin.top) * ds;
-      const isImageField = isImageFieldKey(fieldKey);
-      const isBarcodeField = isBarcodeFieldKey(fieldKey);
+      const isImageField = fieldTypeOverride === "image" || (!fieldTypeOverride && isImageFieldKey(fieldKey));
+      const isBarcodeField = fieldTypeOverride === "barcode" || (!fieldTypeOverride && isBarcodeFieldKey(fieldKey));
       const label = `{{${fieldKey}}}`;
 
       if (isImageField || isBarcodeField) {
@@ -531,6 +567,25 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       (textField as any).variableKey = fieldKey;
       (textField as any).__boxWidth = textBoxWidth;
       (textField as any).__boxHeight = textBoxHeight;
+      // Inherit the last-used text style so consecutive variable additions
+      // keep the same font, color, outline and shadow without requiring the
+      // user to reapply styles on every new field.
+      const lusV = lastUsedTextStyleRef.current;
+      if (lusV._isSet) {
+        textField.set({
+          fontFamily:  lusV.fontFamily  ?? textField.fontFamily,
+          fontSize:    lusV.fontSize    ?? textField.fontSize,
+          fill:        lusV.fill        ?? textField.fill,
+          fontWeight:  lusV.fontWeight  ?? textField.fontWeight,
+          fontStyle:   lusV.fontStyle   ?? textField.fontStyle,
+          stroke:      lusV.stroke      ?? "",
+          strokeWidth: lusV.strokeWidth ?? 0,
+          paintFirst:  lusV.paintFirst  ?? "fill",
+          shadow:      lusV.shadow      ?? null,
+          textAlign:   lusV.textAlign   ?? textField.textAlign,
+          underline:   lusV.underline   ?? false,
+        } as any);
+      }
       fc.add(textField);
       fc.setActiveObject(textField);
       fc.renderAll();
@@ -936,33 +991,26 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         tr: true,   // top-right corner
         bl: true,   // bottom-left corner
         br: true,   // bottom-right corner
-        mt: false,  // top-middle (no height drag except auto_wrap)
-        mb: isAutoWrap, // bottom-middle only for auto_wrap
-        ml: true,   // left-middle  ← width drag
-        mr: true,   // right-middle ← width drag
+        mb: true,   // bottom-center — height-only drag
+        mt: false,  // no top/side handles
+        ml: false,
+        mr: false,
         mtr: true,  // rotation
       });
 
-      // ── Override cursors on all handles ───────────────────────────────────
-      // Set both cursorStyle (static fallback) and cursorStyleHandler (called
-      // at pointer-move time) so no locking flag can turn any handle cursor
-      // into not-allowed.
+      // ── Cursor overrides ──────────────────────────────────────────────────
       const controls = (tb as any).controls as
         | Record<string, { cursorStyle?: string; cursorStyleHandler?: unknown }>
         | undefined;
       if (controls) {
-        const ew = () => "ew-resize";
-        const ns = () => "ns-resize";
         const nwse = () => "nwse-resize";
         const nesw = () => "nesw-resize";
-        if (controls.ml) { controls.ml.cursorStyle = "ew-resize";   controls.ml.cursorStyleHandler = ew;   }
-        if (controls.mr) { controls.mr.cursorStyle = "ew-resize";   controls.mr.cursorStyleHandler = ew;   }
-        if (controls.mt) { controls.mt.cursorStyle = "ns-resize";   controls.mt.cursorStyleHandler = ns;   }
-        if (controls.mb) { controls.mb.cursorStyle = "ns-resize";   controls.mb.cursorStyleHandler = ns;   }
+        const ns   = () => "ns-resize";
         if (controls.tl) { controls.tl.cursorStyle = "nwse-resize"; controls.tl.cursorStyleHandler = nwse; }
         if (controls.br) { controls.br.cursorStyle = "nwse-resize"; controls.br.cursorStyleHandler = nwse; }
         if (controls.tr) { controls.tr.cursorStyle = "nesw-resize"; controls.tr.cursorStyleHandler = nesw; }
         if (controls.bl) { controls.bl.cursorStyle = "nesw-resize"; controls.bl.cursorStyleHandler = nesw; }
+        if (controls.mb) { controls.mb.cursorStyle = "ns-resize";   controls.mb.cursorStyleHandler = ns;   }
       }
 
       // Flush coordinate cache so Fabric paints controls at current position.
@@ -970,39 +1018,67 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
     }, []);
 
     // ── Configure controls for an IText that is in AUTO_SIZE mode ─────────
-    // Shows ml/mr so the user can start a drag to switch to Word Wrap mode,
-    // but hides all other scale handles.  The cursor is forced to ew-resize
-    // so Fabric never shows not-allowed (changeWidth is not scale, but the
-    // Fabric cursor handler would check lockScalingX otherwise).
+    // Corner handles trigger conversion to Word Wrap Textbox on first drag.
     const applyITextAutoControls = useCallback((it: fabric.IText) => {
       it.set({
         hasControls: true,
         selectable: true,
         evented: true,
-        // Unlock X so Fabric allows the drag gesture to begin — we intercept
-        // it in onObjectScaling and immediately convert to Textbox.
         lockScalingX: false,
-        lockScalingY: true,
+        lockScalingY: false,
         lockSkewingX: true,
         lockSkewingY: true,
       });
       it.setControlsVisibility({
-        tl: false, tr: false, bl: false, br: false,
-        mt: false, mb: false,
-        ml: true,   // ← shows left handle to invite drag → converts to wrap
-        mr: true,   // ← shows right handle
+        tl: true, tr: true, bl: true, br: true,
+        mt: false, mb: false, ml: false, mr: false,
         mtr: true,
       });
-      // Override cursor so it always shows ↔ regardless of lock flags
       const controls = (it as any).controls as
         | Record<string, { cursorStyle?: string; cursorStyleHandler?: unknown }>
         | undefined;
       if (controls) {
-        const ew = () => "ew-resize";
-        if (controls.ml) { controls.ml.cursorStyle = "ew-resize"; controls.ml.cursorStyleHandler = ew; }
-        if (controls.mr) { controls.mr.cursorStyle = "ew-resize"; controls.mr.cursorStyleHandler = ew; }
+        const nwse = () => "nwse-resize";
+        const nesw = () => "nesw-resize";
+        if (controls.tl) { controls.tl.cursorStyle = "nwse-resize"; controls.tl.cursorStyleHandler = nwse; }
+        if (controls.br) { controls.br.cursorStyle = "nwse-resize"; controls.br.cursorStyleHandler = nwse; }
+        if (controls.tr) { controls.tr.cursorStyle = "nesw-resize"; controls.tr.cursorStyleHandler = nesw; }
+        if (controls.bl) { controls.bl.cursorStyle = "nesw-resize"; controls.bl.cursorStyleHandler = nesw; }
       }
       it.setCoords();
+    }, []);
+
+    // ── Apply 4-corner controls for non-text container objects ─────────────
+    // Shows only diagonal corner handles (tl, tr, bl, br). No side handles.
+    const applyContainerControls = useCallback((obj: fabric.FabricObject) => {
+      obj.set({
+        hasControls: true,
+        lockScalingFlip: true,
+        centeredScaling: false,
+      });
+      obj.setControlsVisibility({
+        tl:  true,  // top-left corner
+        tr:  true,  // top-right corner
+        bl:  true,  // bottom-left corner
+        br:  true,  // bottom-right corner
+        mt:  false, // no side handles
+        mb:  false,
+        ml:  false,
+        mr:  false,
+        mtr: true,  // rotation
+      });
+      const controls = (obj as any).controls as
+        | Record<string, { cursorStyle?: string; cursorStyleHandler?: unknown }>
+        | undefined;
+      if (controls) {
+        const nwse = () => "nwse-resize";
+        const nesw = () => "nesw-resize";
+        if (controls.tl) { controls.tl.cursorStyle = "nwse-resize"; controls.tl.cursorStyleHandler = nwse; }
+        if (controls.br) { controls.br.cursorStyle = "nwse-resize"; controls.br.cursorStyleHandler = nwse; }
+        if (controls.tr) { controls.tr.cursorStyle = "nesw-resize"; controls.tr.cursorStyleHandler = nesw; }
+        if (controls.bl) { controls.bl.cursorStyle = "nesw-resize"; controls.bl.cursorStyleHandler = nesw; }
+      }
+      obj.setCoords();
     }, []);
 
     // ── Init canvas once ────────────────────────────────────────────────────
@@ -1047,6 +1123,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             } else if (!isLocked && obj instanceof fabric.IText) {
               // IText is AUTO_SIZE mode: show ml/mr as "click to switch to Word Wrap"
               applyITextAutoControls(obj);
+            } else if (!isLocked) {
+              // All other elements (shapes, images, groups …): 4 directional handles only
+              applyContainerControls(obj);
             }
           });
         }
@@ -1069,6 +1148,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
               applyTextboxControls(obj);
             } else if (!isLocked && obj instanceof fabric.IText) {
               applyITextAutoControls(obj);
+            } else if (!isLocked) {
+              applyContainerControls(obj);
             }
           });
         }
@@ -1096,6 +1177,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             }
           } else if (!isLocked && e.target instanceof fabric.IText) {
             applyITextAutoControls(e.target);
+          } else if (!isLocked) {
+            applyContainerControls(e.target);
           }
 
           // For Textbox, skip fitText — auto-shrinking font on add undoes wrapping.
@@ -1127,76 +1210,173 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         if (obj instanceof fabric.Textbox) {
           const anyObj = obj as any;
 
-          // Snapshot position NOW — after Fabric has already adjusted left/top
-          // for the active handle's anchor (right-edge pinned for ml, left-edge
-          // pinned for mr, etc.).  Restoring these after our width bake keeps
-          // the correct anchor without fighting Fabric's own anchor math.
-          const prevLeft = obj.left ?? 0;
-          const prevTop  = obj.top  ?? 0;
-
-          // ── Stable pre-drag dimensions ─────────────────────────────────────
-          const transform = (e as any).transform as {
-            original?: { width?: number; height?: number };
-          } | undefined;
-
-          if (anyObj.__scalingOrigW == null) {
-            anyObj.__scalingOrigW = Math.max(1, Number(
-              transform?.original?.width  ?? obj.width  ?? anyObj.__boxWidth  ?? 80));
-            anyObj.__scalingOrigH = Math.max(1, Number(
-              transform?.original?.height ?? obj.height ?? anyObj.__boxHeight ?? 20));
+          // Auto Size mode: user is dragging a resize handle.
+          // Keep the mode as "auto" — do NOT switch to wrap.
+          // The reflow branch below handles font-fitting at the new width.
+          if (anyObj.__textMode === "auto") {
+            // Update stored box width so future drags use the correct baseline.
+            anyObj.__boxWidth = Math.max(40, Number(obj.width) || 80);
           }
 
-          const startWidth  = Math.max(1, Number(transform?.original?.width  ?? anyObj.__scalingOrigW));
-          const startHeight = Math.max(1, Number(transform?.original?.height ?? anyObj.__scalingOrigH));
+          // `transform.original` = exact state at drag start (set by Fabric).
+          // `corner` = which handle is being dragged: tl | tr | bl | br.
+          // We compute new width/height/left/top ourselves so anchor behaviour
+          // is deterministic regardless of originX/originY or scaleX/scaleY.
+          const t = (e as any).transform as {
+            corner?: string;
+            original?: { left?: number; top?: number; width?: number; height?: number; scaleX?: number; scaleY?: number };
+          } | undefined;
+          const corner = t?.corner ?? "";
 
+          // Initialise drag-start snapshot once per gesture.
+          if (anyObj.__scalingOrigW == null) {
+            anyObj.__scalingOrigW = Math.max(40, Number(t?.original?.width  ?? obj.width  ?? anyObj.__boxWidth  ?? 80));
+            anyObj.__scalingOrigH = Math.max(20, Number(t?.original?.height ?? obj.height ?? anyObj.__boxHeight ?? 20));
+            anyObj.__scalingOrigL = Number(t?.original?.left ?? obj.left ?? 0);
+            anyObj.__scalingOrigT = Number(t?.original?.top  ?? obj.top  ?? 0);
+          }
+
+          const origW = anyObj.__scalingOrigW as number;
+          const origH = anyObj.__scalingOrigH as number;
+          const origL = anyObj.__scalingOrigL as number;
+          const origT = anyObj.__scalingOrigT as number;
+
+          // Current scaled dimensions after Fabric applied the drag delta.
           const sx = Math.max(0.01, Number(obj.scaleX ?? 1));
           const sy = Math.max(0.01, Number(obj.scaleY ?? 1));
+          const draggedW = Math.max(40, origW * sx);
+          const draggedH = Math.max(20, origH * sy);
 
-          let nextWidth  = Math.max(40, startWidth  * sx);
-          const nextHeight = Math.max(20, startHeight * sy);
+          // ── Lock height for wrap/none/auto corner drags ──────────────────
+          // In wrap, none, and auto modes, corners only control width.
+          // Height is handled by its own dedicated mechanism:
+          //  - wrap/none: mb handle or __boxHeight
+          //  - auto: applyAutoFitFont recalculates single-line height
+          // Force newH = origH so that tl/tr anchor math never shifts newTop.
+          const isWrapLike = (
+            anyObj.__textMode === "wrap" ||
+            anyObj.__textMode === "none" ||
+            anyObj.__textMode === "auto" ||
+            !anyObj.__textMode
+          );
+          // For mb drag or auto_wrap, height is allowed to change freely.
+          const lockHeight = isWrapLike && corner !== "mb";
 
-          const isAutoWrap = anyObj.__textMode === "auto_wrap";
+          // ── Anchor logic per corner ────────────────────────────────────────
+          // mb: top-left-right-all fixed → only bottom edge moves (height only)
+          // tl: bottom-right fixed → left & top both change
+          // tr: bottom-left fixed → left FIXED, top changes
+          // bl: top-right fixed   → left changes, top FIXED
+          // br: top-left fixed    → left & top both FIXED
+          let newLeft = origL;
+          let newTop  = origT;
+          let newW    = draggedW;
+          // When height is locked (wrap/none corner drag), clamp newH to origH
+          // so the anchor math never moves the top edge vertically.
+          let newH    = lockHeight ? origH : draggedH;
 
-          // Bake scale → width, reset transform to identity.
+          if (corner === "mb") {
+            // Bottom-center handle: ONLY height changes.
+            // Width, X, and Y are all frozen.
+            newW    = origW;   // WIDTH FIXED
+            newLeft = origL;   // X FIXED
+            newTop  = origT;   // Y FIXED — top edge never moves
+            newH    = Math.max(20, draggedH);
+          } else if (corner === "tl") {
+            // top-left handle: right & bottom edges stay put
+            newLeft = origL + (origW - newW);
+            newTop  = origT + (origH - newH);
+          } else if (corner === "tr") {
+            // top-right handle: left & bottom edges stay put
+            newLeft = origL;                     // LEFT FIXED
+            newTop  = origT + (origH - newH);
+          } else if (corner === "bl") {
+            // bottom-left handle: right & top edges stay put
+            newLeft = origL + (origW - newW);
+            newTop  = origT;                     // TOP FIXED
+          } else {
+            // br (default): top-left corner fixed — both positions stay
+            newLeft = origL;                     // LEFT FIXED
+            newTop  = origT;                     // TOP FIXED
+          }
+
+          // ── Bake into object (scale always reset to 1) ────────────────────
+          // For the mb (bottom) handle, height is set explicitly.
+          // For all corner handles, height is left to Fabric/initDimensions.
           obj.set({
             originX: "left",
             originY: "top",
-            width:   nextWidth,
-            ...(isAutoWrap ? { height: nextHeight } : {}),
+            left:   newLeft,
+            top:    newTop,
+            width:  newW,
             scaleX: 1,
             scaleY: 1,
             dirty:  true,
           });
 
-          // Reflow text at the new width.
-          (obj as any).initDimensions?.();
+          // ── Text reflow ────────────────────────────────────────────────────
+          const isAutoWrap = anyObj.__textMode === "auto_wrap";
 
-          // ── Per-mode text reflowing after the new width is baked ───────────
-          // Must happen AFTER width is baked so measureText sees the right box.
-          if (anyObj.__textMode === "auto") {
-            // Auto Size: shrink font to keep text on a single line;
-            // if too long for min font, Fabric's _wrapLine is patched to clip.
+          if (corner === "mb") {
+            // Bottom-center drag: height-only. Width and font are untouched.
+            // Reflow text at the current (fixed) width, then enforce the
+            // user-dragged height so space below text is preserved.
             obj.set({ splitByGrapheme: false });
-            applyAutoFitFont(obj, nextWidth);
-          } else if (anyObj.__textMode === "auto_wrap") {
-            // Auto+Wrap: font scales to fill container height in wrap mode.
-            // Store the current container height so applyAutoWrap can use it.
-            anyObj.__boxHeight = nextHeight;
-            applyAutoWrap(obj, nextWidth);
+            if (!anyObj.__wordBoundaryPatched) patchWordBoundaryWrap(obj as fabric.Textbox);
+            (obj as any).initDimensions?.();
+            // Content height after reflow — never let box clip text.
+            const contentH = Math.max(20, Number(obj.height) || 20);
+            const finalH   = Math.max(contentH, newH);
+            obj.set({ height: finalH });
+            anyObj.__boxHeight = finalH;
+          } else if (anyObj.__textMode === "auto") {
+            // Auto Size: fit font to new width (shrink only — NEVER grow font).
+            obj.set({ splitByGrapheme: false });
+            applyAutoFitFont(obj, newW, 1, 100, /* shrinkOnly */ true);
+            // applyAutoFitFont calls initDimensions() which resets obj.height to
+            // the single-line content height. If the user previously dragged the
+            // mb handle to give the box a taller height, restore it so width
+            // changes do not undo the user's explicit height resize.
+            const autoUserH    = Math.max(0, Number(anyObj.__boxHeight) || 0);
+            if (autoUserH > 0) {
+              const autoContentH = Math.max(20, Number(obj.height) || 20);
+              const autoFinalH   = Math.max(autoContentH, autoUserH);
+              if (autoFinalH !== Number(obj.height)) obj.set({ height: autoFinalH });
+            }
+          } else if (isAutoWrap) {
+            // Auto+Wrap: width can change freely; height is user-controlled.
+            // applyAutoWrap reflowes text at the new width (calls initDimensions
+            // which resets obj.height to content height). Restore the
+            // user-set height so the container never shrinks automatically.
+            applyAutoWrap(obj, newW);
+            const awUserH   = Math.max(0, Number(anyObj.__boxHeight) || 0);
+            const awContentH = Math.max(20, Number(obj.height) || 20);
+            const awFinalH  = awUserH > 0 ? Math.max(awContentH, awUserH) : awContentH;
+            obj.set({ height: awFinalH });
+            anyObj.__boxHeight = awFinalH;
           } else {
-            // "none" (Normal) and "wrap": font is fixed, word-boundary wrap.
-            // Ensure splitByGrapheme is false and word-boundary patch is live.
+            // "none" / "wrap": fixed font, word-boundary reflow only.
+            // Width changed; height is INDEPENDENT — restore the user-set value
+            // because initDimensions() will reset obj.height to content height.
             obj.set({ splitByGrapheme: false });
             if (!(obj as any).__wordBoundaryPatched) patchWordBoundaryWrap(obj as fabric.Textbox);
             (obj as any).initDimensions?.();
+            // Content height after reflow at the new width.
+            const contentH  = Math.max(20, Number(obj.height) || 20);
+            // User-set height from previous mb drag (0 = never explicitly set).
+            const userH     = Math.max(0, Number(anyObj.__boxHeight) || 0);
+            // Final height: at least as tall as content; honour user value if larger.
+            const restoredH = Math.max(contentH, userH);
+            obj.set({ height: restoredH });
+            anyObj.__boxHeight = restoredH;
           }
 
-          // Restore the anchor position that Fabric set before our override.
-          // This is the final, correct pin position for whatever handle is active.
-          obj.set({ left: prevLeft, top: prevTop });
-
           obj.setCoords();
-        } else if (obj instanceof fabric.IText) {
+          constrainObjectToSafeArea(obj, false);
+          return;
+        }
+
+        if (obj instanceof fabric.IText) {
           // AUTO_SIZE → WORD_WRAP on first resize drag.
           // The user grabbed ml or mr on the IText.  Convert to a Textbox in
           // "wrap" mode right now so the rest of this drag (and all future
@@ -1269,6 +1449,68 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           // Notify the parent so the Properties Panel reflects the mode.
           onSelectionChangeRef.current(tb);
           fc.fire("object:modified", { target: tb });
+        } else {
+          // ── Non-text containers (Rect, Circle, Group, FabricImage, etc.) ──
+          // Use the same delta-based anchor approach as Textbox: read
+          // transform.original for the drag-start snapshot, compute new
+          // width/height and left/top from the corner being dragged, then
+          // bake scaleX/scaleY back to 1 so compound drift never accumulates.
+          const anyObj = obj as any;
+          if (anyObj.__isLocked) { constrainObjectToSafeArea(obj, false); return; }
+
+          const t2 = (e as any).transform as {
+            corner?: string;
+            original?: { left?: number; top?: number; width?: number; height?: number; scaleX?: number; scaleY?: number };
+          } | undefined;
+          const corner2 = t2?.corner ?? "";
+
+          if (anyObj.__scalingOrigW == null) {
+            anyObj.__scalingOrigW = Math.max(10, Number(t2?.original?.width  ?? obj.width  ?? 80));
+            anyObj.__scalingOrigH = Math.max(10, Number(t2?.original?.height ?? obj.height ?? 80));
+            anyObj.__scalingOrigL = Number(t2?.original?.left ?? obj.left ?? 0);
+            anyObj.__scalingOrigT = Number(t2?.original?.top  ?? obj.top  ?? 0);
+          }
+
+          const origW2 = anyObj.__scalingOrigW as number;
+          const origH2 = anyObj.__scalingOrigH as number;
+          const origL2 = anyObj.__scalingOrigL as number;
+          const origT2 = anyObj.__scalingOrigT as number;
+
+          const sx2 = Math.max(0.001, Number(obj.scaleX ?? 1));
+          const sy2 = Math.max(0.001, Number(obj.scaleY ?? 1));
+
+          let newW2 = Math.max(10, origW2 * sx2);
+          let newH2 = Math.max(10, origH2 * sy2);
+          let newL2 = origL2;
+          let newT2 = origT2;
+
+          if (corner2 === "tl") {
+            newL2 = origL2 + (origW2 - newW2);
+            newT2 = origT2 + (origH2 - newH2);
+          } else if (corner2 === "tr") {
+            newL2 = origL2;                       // LEFT FIXED
+            newT2 = origT2 + (origH2 - newH2);
+          } else if (corner2 === "bl") {
+            newL2 = origL2 + (origW2 - newW2);
+            newT2 = origT2;                       // TOP FIXED
+          } else {
+            // br (default): top-left stays fixed
+            newL2 = origL2;                       // LEFT FIXED
+            newT2 = origT2;                       // TOP FIXED
+          }
+
+          if (obj instanceof fabric.Circle) {
+            const newRadius = Math.max(5, Math.min(newW2, newH2) / 2);
+            obj.set({ left: newL2, top: newT2, radius: newRadius, scaleX: 1, scaleY: 1 } as any);
+          } else if (obj instanceof fabric.FabricImage) {
+            // FabricImage: scale IS the size — bake back to a single scale
+            const intrinsicW = Math.max(1, Number((obj as any)._originalElement?.naturalWidth ?? obj.width ?? 1));
+            const intrinsicH = Math.max(1, Number((obj as any)._originalElement?.naturalHeight ?? obj.height ?? 1));
+            obj.set({ left: newL2, top: newT2, scaleX: newW2 / intrinsicW, scaleY: newH2 / intrinsicH });
+          } else {
+            obj.set({ left: newL2, top: newT2, width: newW2, height: newH2, scaleX: 1, scaleY: 1 });
+          }
+          obj.setCoords();
         }
 
         constrainObjectToSafeArea(obj, false);
@@ -1287,17 +1529,42 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           const boxW = Math.max(40, Number(anyObj.__boxWidth) || Number(obj.width) || 80);
           obj.set({ splitByGrapheme: false });
           applyAutoFitFont(obj, boxW, 1, 100, /* shrinkOnly */ true);
+          // Restore user-set height (mb drag) which initDimensions() may have reset.
+          const tcUserH = Math.max(0, Number(anyObj.__boxHeight) || 0);
+          if (tcUserH > 0) {
+            const tcContentH = Math.max(20, Number(obj.height) || 20);
+            const tcFinalH   = Math.max(tcContentH, tcUserH);
+            if (tcFinalH !== Number(obj.height)) obj.set({ height: tcFinalH });
+          }
           return;
         }
 
-        // Normal ("none"/null) and Word Wrap ("wrap"): font is fixed, Fabric
-        // reflows text naturally — no extra action needed here.
-        if (mode === "none" || mode == null || mode === "wrap") return;
+        // Normal ("none"/null) and Word Wrap ("wrap"): font is fixed.
+        // Fabric internally calls initDimensions() on every keystroke, which
+        // resets obj.height to the wrapped content height — ignoring any taller
+        // container the user deliberately created with the mb handle.
+        // Restore the user-set height so the container stays fixed.
+        if (mode === "none" || mode == null || mode === "wrap") {
+          const userH = Math.max(0, Number(anyObj.__boxHeight) || 0);
+          if (userH > 0) {
+            const contentH  = Math.max(20, Number(obj.height) || 20);
+            const restoredH = Math.max(contentH, userH);
+            if (restoredH !== Number(obj.height)) obj.set({ height: restoredH });
+          }
+          return;
+        }
 
         if (mode === "auto_wrap") {
-          // Auto+Wrap: try single-line fit; if font < 12 px, wrap at 14 px.
+          // Auto+Wrap: reflow text at new width. Height is user-controlled —
+          // restore it after initDimensions() resets it to content height.
           const boxW = Math.max(40, Number(anyObj.__boxWidth) || Number(obj.width) || 80);
           applyAutoWrap(obj, boxW);
+          const awUserH    = Math.max(0, Number(anyObj.__boxHeight) || 0);
+          if (awUserH > 0) {
+            const awContentH = Math.max(20, Number(obj.height) || 20);
+            const awRestored = Math.max(awContentH, awUserH);
+            if (awRestored !== Number(obj.height)) obj.set({ height: awRestored });
+          }
         }
         // renderAll is called by the canvas after text:changed automatically
       };
@@ -1411,11 +1678,35 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             const boxW = Math.max(40, Number(anyTb.__boxWidth) || Number(obj.width) || 80);
             obj.set({ splitByGrapheme: false });
             applyAutoFitFont(obj, boxW);
+            // Restore user-set height (mb drag) that initDimensions() may have reset.
+            const exUserH = Math.max(0, Number(anyTb.__boxHeight) || 0);
+            if (exUserH > 0) {
+              const exContentH = Math.max(20, Number(obj.height) || 20);
+              const exFinalH   = Math.max(exContentH, exUserH);
+              if (exFinalH !== Number(obj.height)) obj.set({ height: exFinalH });
+            }
           } else if (exitMode === "auto_wrap") {
+            // Auto+Wrap: reflow text at stored width. Height is user-controlled —
+            // restore it after applyAutoWrap resets it via initDimensions().
             const boxW = Math.max(40, Number(anyTb.__boxWidth) || Number(obj.width) || 80);
             applyAutoWrap(obj, boxW);
+            const awUserH    = Math.max(0, Number(anyTb.__boxHeight) || 0);
+            if (awUserH > 0) {
+              const awContentH = Math.max(20, Number(obj.height) || 20);
+              const awRestored = Math.max(awContentH, awUserH);
+              if (awRestored !== Number(obj.height)) obj.set({ height: awRestored });
+            }
+          } else {
+            // wrap / none: font and width are fixed.
+            // Fabric may have reset obj.height to content height during editing.
+            // Restore the user-set height so the container does not shrink.
+            const userH = Math.max(0, Number(anyTb.__boxHeight) || 0);
+            if (userH > 0) {
+              const contentH  = Math.max(20, Number(obj.height) || 20);
+              const restoredH = Math.max(contentH, userH);
+              if (restoredH !== Number(obj.height)) obj.set({ height: restoredH });
+            }
           }
-          // "none" (Normal) and "wrap": font is fixed — nothing to refit.
           // Apply mode-correct resize handles
           applyTextboxControls(obj);
         } else if (obj instanceof fabric.IText) {
@@ -1440,17 +1731,23 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const obj = e.target;
         if (!obj || !(obj instanceof fabric.Textbox)) return;
         const anyObj = obj as any;
+        const resizeMode = anyObj.__textMode as string | undefined;
         // Ensure word-boundary wrap patch is active.
         if (!anyObj.__wordBoundaryPatched) patchWordBoundaryWrap(obj as fabric.Textbox);
         // Track live width so mode-specific reflow uses the current value.
         anyObj.__boxWidth = obj.width;
-        if (anyObj.__textMode === "auto_wrap") {
-          // Width changed (ml/mr drag) — re-fit font so text fills the
-          // stored container height at the new width.
-          applyAutoWrap(obj, obj.width);
-        } else {
-          // Reflow text at the current container width.
-          (obj as any).initDimensions?.();
+        // Reflow text at the new width (applyAutoWrap calls initDimensions).
+        applyAutoWrap(obj, obj.width);
+        // wrap / none / auto_wrap: height is user-controlled. initDimensions()
+        // (called inside applyAutoWrap) resets obj.height to content height —
+        // restore it.
+        if (resizeMode === "wrap" || resizeMode === "none" || resizeMode === "auto_wrap" || !resizeMode) {
+          const userH = Math.max(0, Number(anyObj.__boxHeight) || 0);
+          if (userH > 0) {
+            const contentH  = Math.max(20, Number(obj.height) || 20);
+            const restoredH = Math.max(contentH, userH);
+            if (restoredH !== Number(obj.height)) obj.set({ height: restoredH });
+          }
         }
         obj.setCoords();
       });
@@ -1463,13 +1760,36 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       // action and never pass through onObjectScaling).
       fc.on("object:modified", (e) => {
         const obj = e.target;
-        if (!obj || !(obj instanceof fabric.Textbox)) return;
+        if (!obj) return;
         const anyObj = obj as any;
-        anyObj.__boxWidth  = obj.width;
-        anyObj.__boxHeight = obj.height;
-        // Clear the drag-start sentinels so the next gesture captures them fresh.
+        if (obj instanceof fabric.Textbox) {
+          anyObj.__boxWidth  = obj.width;
+          anyObj.__boxHeight = obj.height;
+        }
+        // Capture visual style of any text object so the NEXT added text/variable
+        // inherits it automatically (style persistence across additions).
+        if (obj instanceof fabric.IText || obj instanceof fabric.Textbox) {
+          const t = obj as fabric.IText;
+          lastUsedTextStyleRef.current = {
+            fontFamily:  (t.fontFamily  as string)  ?? "Inter, sans-serif",
+            fontSize:    Number(t.fontSize  || 16),
+            fill:        (t.fill        as string)  ?? "#1f2937",
+            fontWeight:  (t.fontWeight  as string)  ?? "normal",
+            fontStyle:   (t.fontStyle   as string)  ?? "normal",
+            stroke:      (t.stroke      as string)  ?? "",
+            strokeWidth: Number(t.strokeWidth ?? 0),
+            paintFirst:  (t as any).paintFirst       ?? "fill",
+            shadow:      t.shadow ?? null,
+            textAlign:   (t.textAlign   as string)  ?? "left",
+            underline:   Boolean(t.underline),
+            _isSet:      true,
+          };
+        }
+        // Clear drag-start sentinels so the next gesture captures them fresh.
         delete anyObj.__scalingOrigW;
         delete anyObj.__scalingOrigH;
+        delete anyObj.__scalingOrigL;
+        delete anyObj.__scalingOrigT;
       });
       fc.on("mouse:up",        clearAlignmentGuides);
       fc.on("text:changed", clampToMargin);
@@ -1653,7 +1973,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           const y = (e.clientY - rect.top - Number(vpt[5] || 0)) / scaleY;
 
           if (item.type === "dynamic-field" && item.fieldKey) {
-            addDynamicFieldObject(fc, String(item.fieldKey), { x, y });
+            addDynamicFieldObject(fc, String(item.fieldKey), { x, y }, item.fieldType as string | undefined);
             fc.renderAll();
             return;
           }
@@ -1833,6 +2153,25 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         // no wrapping. "Auto Size" button is highlighted in the Properties Panel.
         (t as any).__textMode = "auto";
         (t as any).__boxWidth  = boxW;
+        // Inherit the last-used text style so users don't have to re-style every
+        // new text element.  Only applied if the user has previously styled
+        // something (lastUsedTextStyleRef._isSet is true).
+        const lusT = lastUsedTextStyleRef.current;
+        if (lusT._isSet) {
+          t.set({
+            fontFamily:  lusT.fontFamily  ?? t.fontFamily,
+            fontSize:    lusT.fontSize    ?? t.fontSize,
+            fill:        lusT.fill        ?? t.fill,
+            fontWeight:  lusT.fontWeight  ?? t.fontWeight,
+            fontStyle:   lusT.fontStyle   ?? t.fontStyle,
+            stroke:      lusT.stroke      ?? "",
+            strokeWidth: lusT.strokeWidth ?? 0,
+            paintFirst:  lusT.paintFirst  ?? "fill",
+            shadow:      lusT.shadow      ?? null,
+            textAlign:   lusT.textAlign   ?? t.textAlign,
+            underline:   lusT.underline   ?? false,
+          } as any);
+        }
         // Apply no-wrap patch + auto-fit font before first render.
         enableNoWrap(t);
         applyAutoFitFont(t, boxW);
@@ -2207,10 +2546,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         }).catch(() => {});
       },
 
-      addDynamicField(fieldKey: string, placement?: { x: number; y: number }) {
+      addDynamicField(fieldKey: string, fieldType?: string, placement?: { x: number; y: number }) {
         const fc = fabricRef.current;
         if (!fc) return;
-        addDynamicFieldObject(fc, fieldKey, placement);
+        addDynamicFieldObject(fc, fieldKey, placement, fieldType);
       },
 
       addImage(dataUrl: string) {
@@ -2352,19 +2691,26 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         fc.renderAll();
 
         const multiplier = Math.max(2, Math.ceil(1 / displayScaleRef.current));
-        const url = fc.toDataURL({
-          format: "png",
-          quality: 1,
-          multiplier,
-          left: 0,
-          top: 0,
-          width: fc.getWidth(),
-          height: fc.getHeight(),
-          filter: (obj: fabric.FabricObject) => {
-            const anyObj = obj as any;
-            return !anyObj.excludeFromExport && !anyObj.isGuide;
-          },
-        } as any);
+        let url = "";
+        try {
+          url = fc.toDataURL({
+            format: "png",
+            quality: 1,
+            multiplier,
+            left: 0,
+            top: 0,
+            width: fc.getWidth(),
+            height: fc.getHeight(),
+            filter: (obj: fabric.FabricObject) => {
+              const anyObj = obj as any;
+              return !anyObj.excludeFromExport && !anyObj.isGuide;
+            },
+          } as any);
+        } catch {
+          // Cross-origin taint or other canvas error — return empty so callers
+          // fall back to the existing thumbnail rather than crashing.
+          url = "";
+        }
 
         (fc as any).clipPath = prevClipPath;
         if (!prevBg) fc.backgroundColor = prevBg;
@@ -2782,7 +3128,25 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       applyImageMask(shape: ImageMaskShape, radius = 24) {
         const fc = fabricRef.current;
         const active = fc?.getActiveObject();
-        if (!fc || !active || active.type !== "image") return;
+        if (!fc || !active) return;
+
+        const anyActive = active as any;
+
+        // For image-variable Group placeholders: persist mask metadata so it is
+        // transferred to the real FabricImage when the template is rendered.
+        if (active.type === "group" && anyActive.__fieldKind === "image") {
+          anyActive.maskShape = shape;
+          anyActive.maskRadius = radius;
+          anyActive.__maskOptions = {
+            ...(anyActive.__maskOptions ?? {}),
+            cornerRadius: shape === "rounded" ? radius : 0,
+          };
+          fc.fire("object:modified", { target: active });
+          fc.requestRenderAll();
+          return;
+        }
+
+        if (active.type !== "image") return;
 
         const image = active as fabric.FabricImage & {
           maskShape?: ImageMaskShape;
@@ -2801,7 +3165,27 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       setImageBorderRadius(radius: number) {
         const fc = fabricRef.current;
         const active = fc?.getActiveObject();
-        if (!fc || !active || active.type !== "image") return;
+        if (!fc || !active) return;
+
+        const anyActive = active as any;
+
+        // Group image-field placeholder: store radius for later rendering.
+        if (active.type === "group" && anyActive.__fieldKind === "image") {
+          const shape: ImageMaskShape = (anyActive.maskShape as ImageMaskShape) ?? "rounded";
+          const normalizedShape: ImageMaskShape = shape === "none" ? "rounded" : shape;
+          const safeRadius = Math.max(0, radius);
+          anyActive.maskShape = normalizedShape;
+          anyActive.maskRadius = safeRadius;
+          anyActive.__maskOptions = {
+            ...(anyActive.__maskOptions ?? {}),
+            cornerRadius: safeRadius,
+          };
+          fc.fire("object:modified", { target: active });
+          fc.requestRenderAll();
+          return;
+        }
+
+        if (active.type !== "image") return;
 
         const image = active as fabric.FabricImage & {
           maskShape?: ImageMaskShape;
@@ -3150,6 +3534,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             anyTb.__boxWidth = boxW;
             if (stampMode === "auto") {
               // Auto Size: single-line, font shrinks; clip at container edge.
+              // Clicking "Auto Size" explicitly resets the manual height flag so
+              // the box height returns to content-driven sizing.
+              anyTb.__boxHeight = 0;
               unpatchWordBoundaryWrap(tb);
               tb.set({ splitByGrapheme: false, scaleX: 1, scaleY: 1, width: boxW });
               applyAutoFitFont(tb, boxW);
@@ -3219,11 +3606,13 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           // Remove any auto-size no-wrap patch; apply word-boundary wrap patch.
           const tb = active as fabric.Textbox;
           disableNoWrap(tb);
-          unpatchWordBoundaryWrap(tb); // clear any stale patch first
           anyActive.__textMode = mode;
           anyActive.__boxWidth = Number(tb.width) || existingBoxW;
           tb.set({ width: anyActive.__boxWidth, scaleX: 1, splitByGrapheme: false });
-          if (mode === "wrap") patchWordBoundaryWrap(tb);
+          // Both "wrap" and "auto_wrap" use word-boundary wrap.
+          // auto_wrap: font is fixed, height auto-adjusts to content.
+          unpatchWordBoundaryWrap(tb); // reset first to avoid double-patching
+          patchWordBoundaryWrap(tb);
           (tb as any).initDimensions?.();
           tb.setCoords();
           applyTextboxControls(tb);
@@ -3250,7 +3639,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           backgroundColor: anyActive.backgroundColor, backgroundPadding: anyActive.backgroundPadding,
           __textMode: mode,
         });
-        if (mode === "wrap") patchWordBoundaryWrap(tb);
+        // Both "wrap" and "auto_wrap" use word-boundary wrap.
+        patchWordBoundaryWrap(tb);
         (tb as any).initDimensions?.();
         ignoreSaveRef.current = true;
         fc.remove(active);
@@ -3361,6 +3751,19 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           const boxW = Math.max(1, Number(anyObj.__boxWidth || obj.width || obj.getScaledWidth() || 1));
           const boxH = Math.max(1, Number(anyObj.__boxHeight || obj.height || obj.getScaledHeight() || 1));
           applyImageFit(obj, boxW, boxH);
+          // Re-apply the ImageMaskShape that was stored on the source Group placeholder
+          // (or on an earlier version of this image) during design-mode editing.
+          const maskShape = anyObj.maskShape as ImageMaskShape | undefined;
+          if (maskShape && maskShape !== "none") {
+            const maskRadius = Math.max(0, Number(anyObj.maskRadius ?? 24));
+            const clipPath = createImageMaskClipPath(
+              obj,
+              maskShape,
+              maskRadius,
+              getImageMaskClipPadding(obj)
+            );
+            if (clipPath) obj.set({ clipPath });
+          }
         });
 
         fc.renderAll();
@@ -3442,6 +3845,146 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const fc = fabricRef.current;
         if (!fc) return [];
         return extractElementMetadata(fc);
+      },
+
+      // ── Variable image live preview ─────────────────────────────────────────
+      async applyVariableImage(fieldKey: string, imageDataUrl: string | null) {
+        const fc = fabricRef.current;
+        if (!fc) return;
+
+        const objects = fc.getObjects();
+
+        if (!imageDataUrl) {
+          // ── Clear: restore original placeholder Group ──────────────────────
+          // Find the currently-applied FabricImage bound to this variable
+          const bound = objects.find(
+            (o) =>
+              (o as any).variableKey === fieldKey &&
+              (o as any).__fieldKind === "image" &&
+              (o as any).__isVariableImageBound === true
+          );
+
+          const originalJson = variableImageOriginalsRef.current.get(fieldKey);
+          if (originalJson && fc) {
+            // Re-create the original placeholder Group from its cached JSON
+            const restoredObjs = await fc.loadFromJSON({
+              version: "6.0.0",
+              objects: [originalJson],
+            } as any).then(() => {
+              // loadFromJSON replaces ALL objects, so we need a different approach:
+              // enlivenObjects instead.
+              return null;
+            }).catch(() => null);
+            void restoredObjs; // suppress unused warning
+
+            // Use fabric.util.enlivenObjects to deserialize just the one object
+            const enlivened = await new Promise<fabric.FabricObject[]>((resolve) => {
+              (fabric.util as any).enlivenObjects(
+                [originalJson],
+                (objs: fabric.FabricObject[]) => resolve(objs),
+                "fabric"
+              );
+            });
+
+            if (enlivened.length > 0) {
+              const restored = enlivened[0];
+              // Copy position from the bound image if it exists (user may have moved it)
+              if (bound) {
+                restored.set({
+                  left: bound.left,
+                  top: bound.top,
+                  angle: bound.angle,
+                });
+                fc.remove(bound);
+              }
+              (restored as any).__isVariableImageBound = false;
+              fc.add(restored);
+              fc.setActiveObject(restored);
+              variableImageOriginalsRef.current.delete(fieldKey);
+              fc.renderAll();
+            }
+          } else if (bound) {
+            // No cached original; just remove the bound image (placeholder is lost)
+            fc.remove(bound);
+            fc.renderAll();
+          }
+          return;
+        }
+
+        // ── Apply: replace placeholder Group with a live FabricImage ──────────
+        // Find the placeholder Group (or an already-bound image)
+        const placeholder = objects.find(
+          (o) =>
+            (o as any).variableKey === fieldKey &&
+            (o as any).__fieldKind === "image"
+        );
+        if (!placeholder) return;
+
+        // Persist the original Group JSON before replacing it (only once)
+        if (
+          !variableImageOriginalsRef.current.has(fieldKey) &&
+          placeholder instanceof fabric.Group
+        ) {
+          const serialized = (placeholder as any).toJSON([...SERIALIZABLE_PROPS, "selectable", "evented"]);
+          variableImageOriginalsRef.current.set(fieldKey, serialized);
+        }
+
+        // Determine the box dimensions from metadata or current geometry
+        const anyPh = placeholder as any;
+        const boxW = Math.max(1, Number(anyPh.__boxWidth || placeholder.getScaledWidth() || 110));
+        const boxH = Math.max(1, Number(anyPh.__boxHeight || placeholder.getScaledHeight() || 120));
+
+        // Load image
+        const imgEl = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const el = new Image();
+          el.crossOrigin = "anonymous";
+          el.onload = () => resolve(el);
+          el.onerror = () => reject(new Error("Image load failed"));
+          el.src = imageDataUrl;
+        }).catch(() => null);
+
+        if (!imgEl) return;
+
+        const img = new fabric.FabricImage(imgEl, {
+          left: placeholder.left ?? 0,
+          top: placeholder.top ?? 0,
+          angle: placeholder.angle ?? 0,
+          opacity: placeholder.opacity ?? 1,
+          originX: placeholder.originX,
+          originY: placeholder.originY,
+          selectable: true,
+          evented: true,
+          hasControls: true,
+        } as any);
+
+        // Copy all custom metadata
+        (img as any).__uid            = anyPh.__uid;
+        (img as any).__layerName      = anyPh.__layerName;
+        (img as any).__fieldKey       = anyPh.__fieldKey ?? fieldKey;
+        (img as any).__fieldKind      = "image";
+        (img as any).__isDynamicField = true;
+        (img as any).variableKey      = fieldKey;
+        (img as any).__boxWidth       = boxW;
+        (img as any).__boxHeight      = boxH;
+        (img as any).__maskOptions    = anyPh.__maskOptions;
+        (img as any).maskShape        = anyPh.maskShape;
+        (img as any).maskRadius       = anyPh.maskRadius;
+        (img as any).__isVariableImageBound = true;
+
+        applyImageFit(img, boxW, boxH);
+
+        // Re-apply mask shape if one was set on the placeholder
+        const maskShape = anyPh.maskShape as ImageMaskShape | undefined;
+        if (maskShape && maskShape !== "none") {
+          const maskRadius = Math.max(0, Number(anyPh.maskRadius ?? 24));
+          const clipPath = createImageMaskClipPath(img, maskShape, maskRadius, getImageMaskClipPadding(img));
+          if (clipPath) img.set({ clipPath });
+        }
+
+        fc.remove(placeholder);
+        fc.add(img);
+        fc.setActiveObject(img);
+        fc.renderAll();
       },
     }));
 

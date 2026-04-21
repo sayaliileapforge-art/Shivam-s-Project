@@ -63,7 +63,7 @@ const ALL_STATIC_FIELDS: VariableField[] = [
 ];
 
 interface Props {
-  onAddField: (fieldKey: string) => void;
+  onAddField: (fieldKey: string, fieldType?: string) => void;
   /** Optional CSV-derived fields to show at the top. */
   csvFields?: CsvField[];
 }
@@ -76,7 +76,7 @@ function FieldTypeIcon({ type }: { type: VariableFieldType }) {
 
 interface FieldButtonProps {
   field: VariableField;
-  onAdd: (key: string) => void;
+  onAdd: (key: string, type?: string) => void;
   /** Show a small group badge in search results. */
   showGroup?: boolean;
 }
@@ -84,7 +84,7 @@ function FieldButton({ field, onAdd, showGroup }: FieldButtonProps) {
   return (
     <button
       draggable
-      onClick={() => onAdd(field.key)}
+      onClick={() => onAdd(field.key, field.type)}
       onDragStart={(e) => {
         e.dataTransfer.setData(
           "application/json",

@@ -128,7 +128,11 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 export function MaskPanel({ selected, canvasRef, onRefresh }: Props) {
-  const isImage = selected?.type === "image";
+  // Treat a dynamic-field Group placeholder (__fieldKind === "image") the same
+  // as a real FabricImage so users can set mask/border options before preview.
+  const isImage =
+    selected?.type === "image" ||
+    (selected?.type === "group" && (selected as any).__fieldKind === "image");
   const pngMaskInputRef = useRef<HTMLInputElement>(null);
 
   if (!selected) {

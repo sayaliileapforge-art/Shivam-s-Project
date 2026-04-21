@@ -64,7 +64,7 @@ export interface CsvDataPanelProps {
   /** Whether currently rendering (disables buttons). */
   isRendering: boolean;
   /** Drag a variable onto the canvas */
-  onAddField: (fieldKey: string) => void;
+  onAddField: (fieldKey: string, fieldType?: string) => void;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ export function CsvDataPanel({
                   <button
                     key={field.key}
                     draggable
-                    onClick={() => onAddField(field.key)}
+                    onClick={() => onAddField(field.key, field.type)}
                     onDragStart={(e) => {
                       e.dataTransfer.setData(
                         "application/json",

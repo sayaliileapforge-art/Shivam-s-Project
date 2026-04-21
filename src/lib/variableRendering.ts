@@ -271,70 +271,35 @@ export function applyAutoFitFont(
  * If __boxHeight is absent the search is unconstrained (uses a very large cap)
  * which makes Auto Wrap behave like "fit to width, wrap if needed".
  */
+/**
+ * Auto+Wrap mode: text wraps naturally inside a fixed-width container.
+ * Font size is NEVER changed. Height auto-adjusts to content.
+ *
+ * Rules:
+ *  - Width is locked (never modified here).
+ *  - Word-boundary wrap patch is applied (CSS word-wrap: break-word).
+ *  - Fabric computes height from content after initDimensions().
+ *  - Font size is completely untouched.
+ */
 export function applyAutoWrap(
   textObject: fabric.IText | fabric.Textbox,
   boxWidth: number,
-  maxFontSize = 200,
-  minFontSize = DEFAULT_MIN_FONT,
 ): void {
-  const width = Math.max(1, boxWidth);
-  const text = textObject.text ?? "";
-  if (!text.trim()) return;
-
-  // Container height constraint — must be set by caller before this call.
-  // Falls back to a very large cap so text wraps but is not height-constrained.
-  const boxHeight = Math.max(20, (textObject as any).__boxHeight ?? 9999);
+  const width = Math.max(40, boxWidth);
 
   if (textObject instanceof fabric.Textbox) {
-    // 1a. Remove single-line (no-wrap) patch — we want wrapping now.
+    // Remove single-line (no-wrap) patch — we want natural wrapping.
     disableNoWrap(textObject);
-    // 1b. Activate word-boundary-wrap + long-word-break patch.
-    //     This is the CSS `word-wrap: break-word` / `overflow-wrap: anywhere`
-    //     equivalent for Fabric: words wrap at spaces first; if a single word
-    //     is still wider than the container it is sub-split at character level.
+    // Apply word-boundary wrap patch (break at spaces; character-break fallback
+    // only for single words wider than the container).
     patchWordBoundaryWrap(textObject);
-    // 1c. Lock width to container width; disable character-level split (we
-    //     use our own patch above for that, which gives better results).
+    // Lock width; disable character-level split (our patch handles it).
     textObject.set({ width, splitByGrapheme: false });
   }
 
-  // 2. Binary search: find the LARGEST font size where the wrapped text height
-  //    is ≤ boxHeight.  After every fontSize change we call initDimensions()
-  //    so Fabric re-runs its full word-wrap layout and updates `obj.height`.
-  let lo = minFontSize;
-  let hi = maxFontSize;
-  while (hi - lo > 1) {
-    const mid = Math.floor((lo + hi) / 2);
-    textObject.set({ fontSize: mid });
-    (textObject as any).initDimensions?.();
-    const wrappedH = (textObject as any).height ?? 0;
-    if (wrappedH <= boxHeight) {
-      lo = mid; // fits vertically — try larger
-    } else {
-      hi = mid; // overflows vertically — try smaller
-    }
-  }
-
-  // 3. Apply the winning size.
-  textObject.set({ fontSize: lo });
+  // Let Fabric reflow text at the locked width.
+  // Height will grow or shrink automatically based on how many lines wrap.
   (textObject as any).initDimensions?.();
-
-  // 4. Safety step-down: decrement 1 px at a time while ANY of these are true:
-  //    • wrapped height still exceeds boxHeight  (rounding edge cases)
-  //    • any line still wider than boxWidth      (oversized single chars)
-  //    This mirrors the step-down correction used in applyAutoFitFont.
-  let size = lo;
-  while (size > minFontSize) {
-    const h = (textObject as any).height ?? 0;
-    const w = (textObject instanceof fabric.Textbox)
-      ? ((textObject as any).calcTextWidth?.() ?? 0)
-      : 0;
-    if (h <= boxHeight && w <= width) break;
-    size -= 1;
-    textObject.set({ fontSize: size });
-    (textObject as any).initDimensions?.();
-  }
-
   textObject.setCoords();
 }
 
@@ -529,9 +494,41 @@ function replaceTemplatePlaceholders(text: string, values: Record<string, string
   });
 }
 
+/**
+ * Image-type variable key patterns — mirrors the same set used by csvBinding.ts
+ * `inferFieldType` so that any field inferred as 'image' is also treated as image
+ * during rendering.
+ */
+const IMAGE_VARIABLE_PATTERNS: RegExp[] = [
+  /photo/i,
+  /image/i,
+  /img/i,
+  /picture/i,
+  /pic/i,
+  /avatar/i,
+  /logo/i,
+  /signature/i,
+  /seal/i,
+];
+
+/** Returns true when a variable key is associated with an image-type field. */
+function isImageVariableKey(key: string): boolean {
+  if (!key) return false;
+  return IMAGE_VARIABLE_PATTERNS.some((re) => re.test(key));
+}
+
 function resolveObjectVariableKey(obj: fabric.FabricObject): string {
   const anyObj = obj as any;
-  return String(anyObj.variableKey || anyObj.__fieldKey || "").trim();
+  // Primary: explicit variableKey or __fieldKey property
+  const explicit = String(anyObj.variableKey || anyObj.__fieldKey || "").trim();
+  if (explicit) return explicit;
+  // Secondary: for text elements, extract key from {{varname}} placeholder text
+  if (obj instanceof fabric.IText || obj instanceof fabric.Textbox) {
+    const text = asString((obj as fabric.IText).text ?? "").trim();
+    const m = /^\{\{([^}]+)\}\}$/.exec(text);
+    if (m) return m[1].trim();
+  }
+  return "";
 }
 
 async function loadFabricImage(url: string): Promise<fabric.FabricImage> {
@@ -572,12 +569,52 @@ async function toBarcodeDataUrl(value: string): Promise<string> {
   return c.toDataURL("image/png");
 }
 
+/**
+ * Build an ordered list of image URL candidates to try for a given value.
+ * For plain filenames (no protocol, no leading slash) we probe the standard
+ * backend upload paths before giving up on the fallback.
+ */
+function generateImageCandidates(value: string, fallbackImageUrl: string): string[] {
+  if (!value) return [];
+  if (value.startsWith("data:image")) return [value];
+  if (/^https?:\/\//i.test(value)) return [value];
+  if (value.startsWith("/") || value.startsWith(".")) return [value];
+  // Plain filename — try the typical backend upload directories in order
+  return [
+    `/uploads/photos/${value}`,
+    `/uploads/images/${value}`,
+    `/uploads/students/${value}`,
+    `/uploads/${value}`,
+    value,
+  ];
+}
+
+/** Try each candidate URL in sequence; return the first that loads successfully. */
+async function loadFabricImageWithFallbacks(
+  candidates: string[],
+  fallbackImageUrl: string
+): Promise<fabric.FabricImage | null> {
+  const queue = [...candidates, fallbackImageUrl].filter(Boolean);
+  for (const url of queue) {
+    try {
+      return await loadFabricImage(url);
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
+// Keep for backward-compat in case any other code references the old helper.
 function getImageCandidate(value: string, key: string, fallbackImageUrl: string): string {
   if (value.startsWith("data:image")) return value;
   if (/^https?:\/\//i.test(value)) return value;
   if (key === "qr" || key === "qrcode") return value;
   if (key === "barcode") return value;
-  return fallbackImageUrl;
+  if (value && !value.startsWith("/") && !value.startsWith(".")) {
+    return `/uploads/photos/${value}`;
+  }
+  return value || fallbackImageUrl;
 }
 
 function normalizeRenderData(input: VariableRenderInput): Required<VariableRenderInput> {
@@ -668,32 +705,43 @@ export async function renderTemplateWithData(
     const box = resolveObjectBox(obj);
 
     if (obj instanceof fabric.IText || obj instanceof fabric.Textbox) {
-      const original = asString(obj.text || "");
-      let nextText = original;
+      // If variableKey maps to an image-type field, skip text substitution and
+      // fall through to the image-loading path below so the element is replaced
+      // with the actual image rather than showing a URL/filename as plain text.
+      const isTextImageVar = Boolean(variableKey && isImageVariableKey(variableKey));
+      if (!isTextImageVar) {
+        const original = asString(obj.text || "");
+        let nextText = original;
 
-      if (variableKey) {
-        nextText = resolveVariableValue(variableKey, values);
-      } else if (/\{[^}]+\}/.test(original)) {
-        nextText = replaceTemplatePlaceholders(original, values, safeData.textPlaceholder);
-      }
+        if (variableKey) {
+          nextText = resolveVariableValue(variableKey, values);
+        } else if (/\{[^}]+\}/.test(original)) {
+          nextText = replaceTemplatePlaceholders(original, values, safeData.textPlaceholder);
+        }
 
-      if (!nextText && !safeData.emptyAsBlank) {
-        nextText = safeData.textPlaceholder;
-      }
+        if (!nextText && !safeData.emptyAsBlank) {
+          nextText = safeData.textPlaceholder;
+        }
 
-      obj.set({ text: nextText });
-      applyTextFit(obj, box.width, box.height);
-      if (anyObj.__maskOptions) {
-        applyMaskAndBorder(obj, anyObj.__maskOptions as MaskBorderOptions);
+        obj.set({ text: nextText });
+        applyTextFit(obj, box.width, box.height);
+        if (anyObj.__maskOptions) {
+          applyMaskAndBorder(obj, anyObj.__maskOptions as MaskBorderOptions);
+        }
+        continue;
       }
-      continue;
+      // isTextImageVar === true — fall through to image processing
     }
 
+    // An element is treated as an image binding if it is a FabricImage, carries
+    // an image-kind marker, OR its variableKey matches known image field patterns
+    // (handles text-placeholder elements that were wrongly typed as text fields).
     const isImageTarget =
       obj instanceof fabric.FabricImage
       || fieldKind === "image"
       || fieldKind === "barcode"
-      || fieldKind === "qr";
+      || fieldKind === "qr"
+      || Boolean(variableKey && isImageVariableKey(variableKey));
 
     if (!isImageTarget || !variableKey) {
       if (anyObj.__maskOptions) {
@@ -703,26 +751,49 @@ export async function renderTemplateWithData(
     }
 
     const raw = resolveVariableValue(variableKey, values);
-    let imageSource = getImageCandidate(raw, variableKey, safeData.fallbackImageUrl);
 
+    // Build candidate URL list — QR/barcode fields get their special treatment
+    // first; regular image fields try multiple upload paths for plain filenames.
+    let candidates: string[];
     if ((variableKey === "qr" || variableKey === "qrcode") && raw) {
-      imageSource = await QRCode.toDataURL(raw, { margin: 1, width: 256 });
-    }
-    if ((variableKey === "barcode" || fieldKind === "barcode") && raw) {
-      imageSource = await toBarcodeDataUrl(raw);
+      candidates = [await QRCode.toDataURL(raw, { margin: 1, width: 256 })];
+    } else if ((variableKey === "barcode" || fieldKind === "barcode") && raw) {
+      candidates = [await toBarcodeDataUrl(raw)];
+    } else {
+      candidates = generateImageCandidates(raw, safeData.fallbackImageUrl);
     }
 
-    let loaded: fabric.FabricImage | null = null;
-    try {
-      loaded = await loadFabricImage(imageSource || safeData.fallbackImageUrl);
-    } catch {
-      try {
-        loaded = await loadFabricImage(safeData.fallbackImageUrl);
-      } catch {
-        loaded = null;
-      }
+    const loaded = await loadFabricImageWithFallbacks(candidates, safeData.fallbackImageUrl);
+
+    if (!loaded) {
+      // All image-load attempts failed.  Replace the placeholder (which may
+      // show {{variable}} caption text) with an invisible empty-state box so
+      // the template renders cleanly without stray placeholder text.
+      const emptyBox = new fabric.Rect({
+        left:   Number(obj.left  || 0),
+        top:    Number(obj.top   || 0),
+        width:  box.width,
+        height: box.height,
+        fill:   "rgba(0,0,0,0)",
+        stroke: "rgba(180,180,180,0.4)",
+        strokeWidth: 1,
+        strokeDashArray: [4, 4],
+        rx: 4,
+        ry: 4,
+        angle:   Number(obj.angle   || 0),
+        opacity: Number(obj.opacity  || 1),
+        selectable: obj.selectable ?? false,
+        evented:    obj.evented    ?? false,
+      } as any);
+      (emptyBox as any).__uid       = anyObj.__uid;
+      (emptyBox as any).__layerName = anyObj.__layerName;
+      (emptyBox as any).__fieldKey  = anyObj.__fieldKey || variableKey;
+      (emptyBox as any).__fieldKind = fieldKind || "image";
+      (emptyBox as any).variableKey = variableKey;
+      canvas.remove(obj);
+      canvas.add(emptyBox);
+      continue;
     }
-    if (!loaded) continue;
 
     loaded.set({
       left: Number(obj.left || 0),
@@ -744,6 +815,11 @@ export async function renderTemplateWithData(
     (loaded as any).__boxWidth = box.width;
     (loaded as any).__boxHeight = box.height;
     (loaded as any).__maskOptions = anyObj.__maskOptions;
+    // Preserve the ImageMaskShape (circle, star, etc.) that may have been set on
+    // a Group placeholder in design mode — the FabricCanvas post-processor applies
+    // the actual clip path after this util returns.
+    if (anyObj.maskShape) (loaded as any).maskShape = anyObj.maskShape;
+    if (anyObj.maskRadius != null) (loaded as any).maskRadius = anyObj.maskRadius;
 
     applyImageFit(loaded, box.width, box.height);
     applyMaskAndBorder(loaded, anyObj.__maskOptions as MaskBorderOptions | undefined);

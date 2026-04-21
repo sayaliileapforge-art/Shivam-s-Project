@@ -42,6 +42,7 @@ import { MaskPanel } from "../components/designer/MaskPanel";
 import { ContextToolbar } from "../components/designer/ContextToolbar";
 import { ShapesGallery } from "../components/designer/ShapesGallery";
 import { VariableFieldsPanel } from "../components/designer/VariableFieldsPanel";
+import { VariableImageUploadPanel } from "../components/designer/VariableImageUploadPanel";
 import { CsvDataPanel } from "../components/designer/CsvDataPanel";
 import { HRuler, VRuler, RULER_THICKNESS } from "../components/designer/Ruler";
 import { rowToRenderInput, type ParsedCsv, type CsvRow } from "../../lib/csvBinding";
@@ -368,6 +369,11 @@ export function DesignerStudio() {
   const svgInputRef     = useRef<HTMLInputElement>(null);
   const loadTplInputRef = useRef<HTMLInputElement>(null);
   const canvasScrollRef = useRef<HTMLDivElement>(null);
+  // Variable-image upload: separate hidden input so it doesn't conflict with the
+  // regular "Add Image" input.  pendingUploadFieldKeyRef tracks which variable
+  // key we're uploading for (set just before opening the file picker).
+  const variableImageInputRef    = useRef<HTMLInputElement>(null);
+  const pendingUploadFieldKeyRef = useRef<string>("");
 
   // -- Core state -------------------------------------------------------------
   const [config, setConfig] = useState<TemplateConfig>(
@@ -389,6 +395,12 @@ export function DesignerStudio() {
   const [csvIsRendering, setCsvIsRendering] = useState(false);
   // Snapshot of template canvas JSON before preview so we can restore it
   const csvTemplateSnapshotRef = useRef<object | null>(null);
+
+  // -- Designer-time image variable values ------------------------------------
+  // Maps fieldKey → data URL / remote URL uploaded by the user in the right panel.
+  // These are injected into userVariables during preview/export so image variable
+  // placeholders render as real images even without a CSV row.
+  const [variableImages, setVariableImages] = useState<Record<string, string>>({});
 
   // -- Custom fonts ------------------------------------------------------------
   const [customFonts, setCustomFonts] = useState<CustomFont[]>([]);
@@ -422,6 +434,68 @@ export function DesignerStudio() {
   const [pageLoadNonce, setPageLoadNonce] = useState(0);
   const activeCanvasHashRef = useRef("");
   const lastPersistedHashRef = useRef("");
+  // Stable ref to the latest autoSaveTemplateNow — lets keyboard/button handlers
+  // call an immediate save without being stale closures in their own effects.
+  const autoSaveNowRef = useRef<(reason?: "debounce" | "unmount") => boolean>(
+    (_r?: "debounce" | "unmount") => false
+  );
+
+  /**
+   * DIRECT synchronous save — called immediately after deleteSelected().
+   *
+   * Why not rely on autoSaveNowRef / autoSaveTemplateNow?
+   * - autoSaveNowRef is updated in a useEffect (async after paint), so it can
+   *   hold a stale closure that captured the canvas state BEFORE the delete.
+   * - autoSaveTemplateNow has several early-return guards (designerContext,
+   *   initialTemplateLoadDoneRef, importMode, isSaving, hash equality) any of
+   *   which can silently skip the save.
+   *
+   * This function bypasses all of that:
+   *   1. Reads the live Fabric canvas directly → deleted object is already gone.
+   *   2. Calls updateProjectTemplate directly → no guards, no hash check.
+   *   3. Resets lastPersistedHashRef so the debounce save afterwards also runs.
+   */
+  const forceSaveAfterDelete = () => {
+    if (!designerContext?.templateId || !designerContext.projectId) return;
+
+    // Read current canvas state — fc.remove(obj) has already run synchronously.
+    const currentCanvas = canvasRef.current?.toJSON();
+    if (!currentCanvas || !("objects" in currentCanvas)) return;
+
+    // Build the pages snapshot: active page gets the live canvas, others are
+    // unchanged (they are not affected by the delete on the current page).
+    const snap = pages.map((p) =>
+      p.id === activePageId ? { ...p, canvas: currentCanvas } : p
+    );
+
+    let elementMetadata: unknown[] = [];
+    try { elementMetadata = canvasRef.current?.getElementMetadata() ?? []; } catch { /* ignore */ }
+
+    const canJSON = JSON.stringify({
+      config,
+      pages: snap,
+      activePageId,
+      canvas: currentCanvas,
+      elementMetadata,
+    });
+
+    // Write directly to localStorage — no guards, no async delays.
+    try {
+      updateProjectTemplate(designerContext.templateId, { canvasJSON: canJSON });
+    } catch { /* ignore — localStorage may be full */ }
+
+    // Update the hash so the 900ms debounce save doesn't re-run unnecessarily.
+    lastPersistedHashRef.current = JSON.stringify({
+      projectId: designerContext.projectId,
+      templateId: designerContext.templateId,
+      templateName: (config.templateName || "").trim() || "Untitled Template",
+      templateType: config.templateType,
+      canvas: config.canvas,
+      margin: config.margin,
+      isPublic: saveIsPublic,
+      canJSON,
+    });
+  };
   const initialTemplateLoadDoneRef = useRef(false);
 
   // -- Designer context -------------------------------------------------------
@@ -461,6 +535,42 @@ export function DesignerStudio() {
     setCanUndo(canvasRef.current?.canUndo?.() ?? false);
     setCanRedo(canvasRef.current?.canRedo?.() ?? false);
   }, []);
+
+  // -- Variable image file input handler --------------------------------------
+  // -- Variable image upload handler ------------------------------------------
+  const handleVariableImageChange = useCallback(async (fieldKey: string, dataUrl: string | null) => {
+    if (dataUrl) {
+      setVariableImages((prev) => ({ ...prev, [fieldKey]: dataUrl }));
+    } else {
+      setVariableImages((prev) => {
+        const next = { ...prev };
+        delete next[fieldKey];
+        return next;
+      });
+    }
+    // Apply live preview to the canvas immediately
+    await canvasRef.current?.applyVariableImage(fieldKey, dataUrl);
+    refresh();
+  }, [refresh]);
+
+  // -- Variable image file input handler --------------------------------------
+  const handleVariableFileInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file || !pendingUploadFieldKeyRef.current) return;
+      if (!file.type.startsWith("image/")) return;
+      const fieldKey = pendingUploadFieldKeyRef.current;
+      pendingUploadFieldKeyRef.current = "";
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const dataUrl = ev.target?.result as string;
+        if (dataUrl) handleVariableImageChange(fieldKey, dataUrl);
+      };
+      reader.readAsDataURL(file);
+    },
+    [handleVariableImageChange]
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -927,6 +1037,7 @@ export function DesignerStudio() {
       if (tag === "INPUT" || tag === "TEXTAREA") return;
       if (e.key === "Delete" || e.key === "Backspace") {
         canvasRef.current?.deleteSelected(); setSelected(null); refresh();
+        forceSaveAfterDelete();
       }
       if ((e.ctrlKey || e.metaKey) && e.key === "z") { e.preventDefault(); canvasRef.current?.undo(); refresh(); }
       if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.shiftKey && e.key === "z"))) {
@@ -986,10 +1097,17 @@ export function DesignerStudio() {
       templateName,
     });
 
-    // toPNG() returns "" when the canvas is disposed (during unmount).
-    // An empty string is not a valid thumbnail — keep the previously saved one.
-    const rawThumb = canvasRef.current?.toPNG();
-    const thumb = (rawThumb && rawThumb.startsWith('data:')) ? rawThumb : existingTemplate.thumbnail;
+    // toPNG() can throw a SecurityError when cross-origin images taint the
+    // canvas. Catch silently and fall back to the existing thumbnail so the
+    // canvasJSON save always completes.
+    let thumb = existingTemplate.thumbnail;
+    try {
+      const rawThumb = canvasRef.current?.toPNG();
+      if (rawThumb && rawThumb.startsWith('data:')) thumb = rawThumb;
+    } catch {
+      // Keep existing thumbnail — do NOT abort the save.
+    }
+
     updateProjectTemplate(designerContext.templateId, {
       templateName,
       templateType: config.templateType,
@@ -1028,6 +1146,20 @@ export function DesignerStudio() {
       autoSaveTemplateNow("unmount");
     };
   }, [autoSaveTemplateNow]);
+
+  // Keep the stable ref in sync so event handlers can call the latest version
+  // without capturing stale closures.
+  useEffect(() => {
+    autoSaveNowRef.current = autoSaveTemplateNow;
+  }, [autoSaveTemplateNow]);
+
+  // Save on browser hard-refresh / tab-close (beforeunload fires even on F5
+  // when React's unmount cleanup does NOT run).
+  useEffect(() => {
+    const onBeforeUnload = () => { autoSaveNowRef.current("unmount"); };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
 
   // -- Image upload ------------------------------------------------------------
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1208,6 +1340,8 @@ export function DesignerStudio() {
       }
 
       const renderInput = rowToRenderInput(row);
+      // Merge designer-time uploaded images; CSV row values take priority.
+      renderInput.userVariables = { ...variableImages, ...renderInput.userVariables };
       await fc.renderTemplateWithData(null, renderInput);
       refresh();
     } catch (err) {
@@ -1215,7 +1349,7 @@ export function DesignerStudio() {
     } finally {
       setCsvIsRendering(false);
     }
-  }, [csvPreviewRowIndex, refresh]);
+  }, [csvPreviewRowIndex, variableImages, refresh]);
 
   // -- CSV exit preview -------------------------------------------------------
   const handleCsvExitPreview = useCallback(() => {
@@ -1253,6 +1387,8 @@ export function DesignerStudio() {
         await canvas.loadFromJSON(templateSnapshot as any);
 
         const renderInput = rowToRenderInput(rows[i]);
+        // Merge designer-time uploaded images; CSV row values take priority.
+        renderInput.userVariables = { ...variableImages, ...renderInput.userVariables };
         const dataUrl = await fc.renderTemplateWithData(null, renderInput);
 
         const rowLabel = rows[i]["name"] || rows[i]["roll_no"] || String(i + 1);
@@ -1288,7 +1424,7 @@ export function DesignerStudio() {
     } finally {
       setCsvIsRendering(false);
     }
-  }, [config, refresh]);
+  }, [config, variableImages, refresh]);
 
   // -- Derived values ---------------------------------------------------------
   const sizeLabel = (() => {
@@ -1301,7 +1437,10 @@ export function DesignerStudio() {
   // Auto-switch to properties tab when an element is selected
   useEffect(() => {
     if (!selected) return;
-    if (selected.type === "image") {
+    const isImageElement =
+      selected.type === "image" ||
+      (selected.type === "group" && (selected as any).__fieldKind === "image");
+    if (isImageElement) {
       setRightTab("mask");
       return;
     }
@@ -1483,7 +1622,7 @@ export function DesignerStudio() {
         selected={selected}
         canvasRef={canvasRef}
         onRefresh={refresh}
-        onDelete={() => { canvasRef.current?.deleteSelected(); setSelected(null); refresh(); }}
+        onDelete={() => { canvasRef.current?.deleteSelected(); setSelected(null); refresh(); forceSaveAfterDelete(); }}
       />
 
       {/* ------ BODY ------ */}
@@ -1608,7 +1747,22 @@ export function DesignerStudio() {
                     showMargins={false}
                     displayScale={effectiveScale}
                     onBgChange={(bg) => setCurrentBg(bg || "none")}
-                    onSelectionChange={(obj) => { setSelected(obj); refresh(); }}
+                    onSelectionChange={(obj) => {
+                      setSelected(obj);
+                      refresh();
+                      if (obj && (obj as any).__fieldKind === "image") {
+                        // Always show the upload panel when an image variable is selected
+                        setRightTab("properties");
+                        // Auto-open file picker only for unbound placeholders
+                        // (i.e. no image uploaded yet — still the dashed Group box)
+                        if (!(obj as any).__isVariableImageBound && (obj as any).variableKey) {
+                          pendingUploadFieldKeyRef.current = String((obj as any).variableKey);
+                          // Defer one tick so the click event that triggered selection
+                          // has fully settled before we open a new dialog.
+                          setTimeout(() => variableImageInputRef.current?.click(), 50);
+                        }
+                      }
+                    }}
                   />
                   {showGuides && (
                     <div
@@ -1685,16 +1839,30 @@ export function DesignerStudio() {
 
               <TabsContent value="properties" className="mt-2 p-0">
                 {selected ? (
-                  <PropertiesPanel
-                    selected={selected}
-                    canvasRef={canvasRef}
-                    onRefresh={refresh}
-                    displayScale={effectiveScale}
-                    customFonts={customFonts}
-                    onAddCustomFont={(font) => setCustomFonts((prev) => [
-                      ...prev.filter((f) => f.name !== font.name), font
-                    ])}
-                  />
+                  <>
+                    {/* Image-variable upload panel — shown above PropertiesPanel
+                        when the selected element is an image-variable placeholder */}
+                    {(selected as any).__fieldKind === "image" && (selected as any).variableKey && (
+                      <>
+                        <VariableImageUploadPanel
+                          fieldKey={(selected as any).variableKey as string}
+                          currentValue={variableImages[(selected as any).variableKey as string] ?? null}
+                          onImageChange={handleVariableImageChange}
+                        />
+                        <div className="border-t border-border/60 mx-3 mb-1" />
+                      </>
+                    )}
+                    <PropertiesPanel
+                      selected={selected}
+                      canvasRef={canvasRef}
+                      onRefresh={refresh}
+                      displayScale={effectiveScale}
+                      customFonts={customFonts}
+                      onAddCustomFont={(font) => setCustomFonts((prev) => [
+                        ...prev.filter((f) => f.name !== font.name), font
+                      ])}
+                    />
+                  </>
                 ) : (
                   <div className="p-5 text-center">
                     <MousePointer2 className="h-9 w-9 text-muted-foreground/30 mx-auto mb-3" />
@@ -1724,8 +1892,8 @@ export function DesignerStudio() {
               <TabsContent value="variables" className="mt-2 p-0">
                 <VariableFieldsPanel
                   csvFields={csvData?.fields}
-                  onAddField={(fieldKey) => {
-                    canvasRef.current?.addDynamicField(fieldKey);
+                  onAddField={(fieldKey, fieldType) => {
+                    canvasRef.current?.addDynamicField(fieldKey, fieldType);
                     refresh();
                   }}
                 />
@@ -1744,8 +1912,8 @@ export function DesignerStudio() {
                   onPreviewRow={handleCsvPreviewRow}
                   onExitPreview={handleCsvExitPreview}
                   onBulkExport={handleBulkExport}
-                  onAddField={(fieldKey) => {
-                    canvasRef.current?.addDynamicField(fieldKey);
+                  onAddField={(fieldKey, fieldType) => {
+                    canvasRef.current?.addDynamicField(fieldKey, fieldType);
                     refresh();
                   }}
                 />
@@ -1918,7 +2086,7 @@ export function DesignerStudio() {
           <Tooltip>
             <TooltipTrigger asChild>
               <Button variant="ghost" size="icon" className="h-8 w-8"
-                onClick={() => { canvasRef.current?.deleteSelected(); setSelected(null); refresh(); }}>
+                onClick={() => { canvasRef.current?.deleteSelected(); setSelected(null); refresh(); forceSaveAfterDelete(); }}>
                 <Trash2 className="h-4 w-4 text-destructive" />
               </Button>
             </TooltipTrigger>
@@ -1979,6 +2147,9 @@ export function DesignerStudio() {
       {/* ------ HIDDEN FILE INPUTS ------ */}
       <input ref={imageInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
       <input ref={svgInputRef}   type="file" accept=".svg,image/svg+xml" className="hidden" onChange={handleSVGUpload} />
+      {/* Variable-image upload — triggered automatically when an image variable
+          placeholder is selected on the canvas, or via the upload panel. */}
+      <input ref={variableImageInputRef} type="file" accept="image/*" className="hidden" onChange={handleVariableFileInputChange} />
 
       {/* ------ QR CODE DIALOG ------ */}
       <Dialog open={qrDialogOpen} onOpenChange={setQrDialogOpen}>
