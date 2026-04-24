@@ -1,7 +1,7 @@
 /**
  * ContextToolbar - floats below the main toolbar when an element is selected.
  */
-import { useState, useEffect, type ReactElement, type ReactNode, type RefObject } from "react";
+import { useState, useEffect, useRef, type ReactElement, type ReactNode, type RefObject } from "react";
 import * as fabric from "fabric";
 import {
   AlignCenter,
@@ -40,6 +40,7 @@ import {
   TooltipTrigger,
 } from "../ui/tooltip";
 import type { FabricCanvasHandle } from "./FabricCanvas";
+import { applyAutoWrap, applyTextTransformValue, enableNoWrap } from "../../../lib/variableRendering";
 
 const FONT_FAMILIES = [
   "Inter",
@@ -77,22 +78,77 @@ function VSep() {
 }
 
 export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Props) {
+  // ── Pre-compute Fabric values before hooks so they can be used as effect deps ──
+  // These are re-evaluated on every render from the live Fabric object, giving
+  // effects an accurate dependency to react to when the canvas changes.
+  const canvasFontSize =
+    selected instanceof fabric.IText || selected instanceof fabric.Textbox
+      ? (selected.fontSize ?? 16)
+      : 16;
+  const canvasLineHeight =
+    selected instanceof fabric.IText || selected instanceof fabric.Textbox
+      ? (selected.lineHeight ?? 1.16)
+      : 1.16;
+  const canvasCharSpacing =
+    selected instanceof fabric.IText || selected instanceof fabric.Textbox
+      ? (selected.charSpacing ?? 0)
+      : 0;
+
   // ── Hooks (must be before any early returns) ─────────────────────────────
   // Local editing state lets the user type freely without each keystroke
   // immediately clamping & re-applying the value.
-  const [isEditingFontSize, setIsEditingFontSize] = useState(false);
-  const [fontSizeInputVal, setFontSizeInputVal] = useState("16");
+  const [isEditingFontSize,    setIsEditingFontSize]    = useState(false);
+  const [fontSizeInputVal,     setFontSizeInputVal]     = useState("16");
+  const [isEditingLineHeight,  setIsEditingLineHeight]  = useState(false);
+  const [lineHeightVal,        setLineHeightVal]        = useState("1.16");
+  const [isEditingCharSpacing, setIsEditingCharSpacing] = useState(false);
+  const [charSpacingVal,       setCharSpacingVal]       = useState("0");
 
-  // Reset editing state when selection changes so stale input is discarded.
+  // Ref always holds the latest isEditing flags so effects can safely read
+  // them without listing them as dependencies (avoids stale-closure warnings).
+  const isEditingRef = useRef({ fontSize: false, lineHeight: false, charSpacing: false });
+  isEditingRef.current = {
+    fontSize:    isEditingFontSize,
+    lineHeight:  isEditingLineHeight,
+    charSpacing: isEditingCharSpacing,
+  };
+
+  // Reset editing state and re-sync all display values when selection changes.
   useEffect(() => {
     setIsEditingFontSize(false);
+    setIsEditingLineHeight(false);
+    setIsEditingCharSpacing(false);
+    const isTextEl =
+      selected instanceof fabric.IText || selected instanceof fabric.Textbox;
+    const fs = isTextEl ? ((selected as fabric.IText).fontSize   ?? 16)   : 16;
+    const lh = isTextEl ? ((selected as fabric.IText).lineHeight  ?? 1.16) : 1.16;
+    const cs = isTextEl ? ((selected as fabric.IText).charSpacing ?? 0)   : 0;
+    setFontSizeInputVal(String(fs));
+    setLineHeightVal(String(+lh.toFixed(2)));
+    setCharSpacingVal(String(cs));
   }, [selected]);
+
+  // Sync display values when the canvas changes them on the SAME element
+  // (e.g., auto-fit font resize on handle drag, undo/redo, Properties panel
+  // slider changes).  The isEditingRef guard prevents interrupting a user who
+  // is actively typing in the input.
+  useEffect(() => {
+    if (!isEditingRef.current.fontSize)    setFontSizeInputVal(String(canvasFontSize));
+  }, [canvasFontSize]);   // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!isEditingRef.current.lineHeight)  setLineHeightVal(String(+canvasLineHeight.toFixed(2)));
+  }, [canvasLineHeight]);  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!isEditingRef.current.charSpacing) setCharSpacingVal(String(canvasCharSpacing));
+  }, [canvasCharSpacing]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!selected) return null;
 
   const fc = canvasRef.current?.getCanvas();
   if (!fc) return null;
 
+  // isText was already computed before hooks (as a canvas dep); reuse it here
+  // with the narrowed type so TypeScript is satisfied after the null guard.
   const isText = selected instanceof fabric.IText || selected instanceof fabric.Textbox;
   const isRect = selected.type === "rect";
   const isImage = selected.type === "image";
@@ -116,17 +172,176 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
     onRefresh();
   };
 
-  // Apply a font size clamped to [6, 200] without triggering auto-fit overrides.
+  // Apply a font size clamped to [6, 200] with mode-aware container reflow so
+  // text is never clipped after a manual font-size increase.
   const applyFontSize = (size: number) => {
     const clamped = Math.min(200, Math.max(6, Math.round(size) || 6));
-    applyProps({ fontSize: clamped });
     setIsEditingFontSize(false);
     setFontSizeInputVal(String(clamped));
+
+    if (!isText) {
+      applyProps({ fontSize: clamped });
+      return;
+    }
+
+    // Apply the new font size first, then reflow based on the current text mode
+    // so the container expands / wraps correctly instead of clipping the text.
+    textObj.set({ fontSize: clamped, scaleX: 1, scaleY: 1 });
+    const anyText = textObj as any;
+    const textMode: string = String(anyText.__textMode ?? "none");
+
+    if (textObj instanceof fabric.Textbox) {
+      const boxW = Math.max(40, Number(anyText.__boxWidth) || Number(textObj.width) || 80);
+
+      if (textMode === "auto") {
+        // Auto Size: container width must grow so the larger font fits on one
+        // line without clipping.
+        //
+        // Measurement strategy:
+        //  1. Ensure enableNoWrap is active so initDimensions never word-wraps.
+        //  2. Temporarily set a very wide container so Fabric has no width
+        //     constraint while computing __charBounds (measurement pass).
+        //  3. Read calcTextWidth() — with no wrapping this equals the full
+        //     single-line text width at the new font size.
+        //  4. Set obj.width = measured width.
+        //  5. Call initDimensions() again (layout pass) to finalise the object
+        //     at the correct new width — without this the bounding box and
+        //     canvas rendering stay stale.
+        enableNoWrap(textObj);                              // idempotent
+        textObj.set({ splitByGrapheme: false, width: 9999 }); // measurement pass
+        (textObj as any).initDimensions?.();
+        const measured = (textObj as any).calcTextWidth?.() as number | undefined;
+        const textW = Math.max(40, Number(measured) || Number(textObj.width) || 40);
+        textObj.set({ width: textW });                      // layout pass
+        (textObj as any).initDimensions?.();
+        anyText.__boxWidth = textW;
+        // Preserve user-set height if taller than single-line content.
+        const contentH = Math.max(20, Number(textObj.height) || 20);
+        const userH    = Math.max(0, Number(anyText.__boxHeight) || 0);
+        if (userH > contentH) textObj.set({ height: userH });
+        anyText.__boxHeight = Math.max(contentH, userH) || contentH;
+      } else if (textMode === "auto_wrap") {
+        // Auto+Wrap: reflow at fixed width; height grows to fit extra lines.
+        applyAutoWrap(textObj, boxW);
+        const contentH = Math.max(20, Number(textObj.height) || 20);
+        const userH    = Math.max(0, Number(anyText.__boxHeight) || 0);
+        const finalH   = Math.max(contentH, userH);
+        textObj.set({ height: finalH });
+        anyText.__boxHeight = finalH;
+      } else {
+        // "wrap" / "none" / default: fixed width, word-boundary reflow.
+        // initDimensions grows height to accommodate more wrapped lines.
+        textObj.set({ width: boxW, splitByGrapheme: false });
+        (textObj as any).initDimensions?.();
+        const contentH = Math.max(20, Number(textObj.height) || 20);
+        const userH    = Math.max(0, Number(anyText.__boxHeight) || 0);
+        const finalH   = Math.max(contentH, userH);
+        textObj.set({ height: finalH });
+        anyText.__boxHeight = finalH;
+      }
+    } else {
+      // IText (auto-size single line): initDimensions expands width naturally.
+      (textObj as any).initDimensions?.();
+    }
+
+    textObj.setCoords();
+    fc.fire("object:modified", { target: textObj });
+    fc.renderAll();
+    onRefresh();
   };
 
   const applyText = (nextText: string) => {
     textObj.set({ text: nextText });
     (textObj as any).initDimensions?.();
+    textObj.setCoords();
+    fc.fire("object:modified", { target: textObj });
+    fc.renderAll();
+    onRefresh();
+  };
+
+  /**
+   * Apply or toggle a text case transform on the selected text object.
+   *
+   * Behaviour:
+   *  - First call: saves the original text as __originalText, then transforms.
+   *  - Clicking the same button again: restores __originalText and clears the
+   *    stored transform (toggle-off).
+   *  - Switching between transforms (e.g. UPPER → Capitalize): always
+   *    transforms __originalText so the result is always correct.
+   *  - Works for both static text AND dynamic placeholders like {{full_name}}.
+   */
+  const applyTextTransform = (type: "uppercase" | "lowercase" | "capitalize") => {
+    const currentTransform = (textObj as any).__textTransform as string | undefined;
+    const isToggleOff = currentTransform === type;
+
+    if (isToggleOff) {
+      // Restore the original text and clear transform metadata.
+      const original = (textObj as any).__originalText as string | undefined;
+      const restored = original ?? textObj.text ?? "";
+      textObj.set({ text: restored } as any);
+      (textObj as any).__textTransform = "none";
+      delete (textObj as any).__originalText;
+    } else {
+      // Preserve original text before the very first transform on this object.
+      if (!(textObj as any).__originalText) {
+        (textObj as any).__originalText = textObj.text ?? "";
+      }
+      // Always transform from the original so switching cases gives correct result.
+      const base: string = (textObj as any).__originalText;
+      const transformed = applyTextTransformValue(base, type);
+      textObj.set({ text: transformed } as any);
+      (textObj as any).__textTransform = type;
+    }
+
+    // ── Re-fit text inside its bounding box ────────────────────────────
+    // After any case change the string length changes (uppercase is wider).
+    // We re-run the same fitting logic that Fabric uses during interactive
+    // resize so the text never overflows its container regardless of mode.
+    const anyText = textObj as any;
+    const textMode: string = String(anyText.__textMode ?? "none");
+
+    if (textObj instanceof fabric.Textbox) {
+      const boxW = Math.max(40, Number(anyText.__boxWidth) || Number(textObj.width) || 80);
+
+      if (textMode === "auto") {
+        // Auto Size: container adapts to text at the current font. Font is fixed.
+        // Use the same measurement-pass approach as applyFontSize so the box
+        // auto-expands correctly after a case change (UPPER is wider than lower).
+        enableNoWrap(textObj);
+        textObj.set({ splitByGrapheme: false, width: 9999, scaleX: 1 }); // measurement pass
+        (textObj as any).initDimensions?.();
+        const measured = (textObj as any).calcTextWidth?.() as number | undefined;
+        const textW = Math.max(40, Number(measured) || Number(textObj.width) || 40);
+        textObj.set({ width: textW });
+        anyText.__boxWidth = textW;
+        (textObj as any).initDimensions?.();                              // layout pass
+        const contentH = Math.max(20, Number(textObj.height) || 20);
+        const userH = Math.max(0, Number(anyText.__boxHeight) || 0);
+        if (userH > contentH) textObj.set({ height: userH });
+      } else if (textMode === "auto_wrap") {
+        // Auto+Wrap: reflow at fixed width, height grows to fit all lines.
+        applyAutoWrap(textObj, boxW);
+        const contentH = Math.max(20, Number(textObj.height) || 20);
+        const userH = Math.max(0, Number(anyText.__boxHeight) || 0);
+        const finalH = userH > 0 ? Math.max(contentH, userH) : contentH;
+        textObj.set({ height: finalH });
+        anyText.__boxHeight = finalH;
+      } else {
+        // "wrap" / "none" / default: fixed width + word-boundary wrap.
+        // initDimensions reflowes at the current width; height grows for long text.
+        textObj.set({ width: boxW, splitByGrapheme: false, scaleX: 1 });
+        (textObj as any).initDimensions?.();
+        const contentH = Math.max(20, Number(textObj.height) || 20);
+        const userH = Math.max(0, Number(anyText.__boxHeight) || 0);
+        const finalH = Math.max(contentH, userH);
+        textObj.set({ height: finalH });
+        anyText.__boxHeight = finalH;
+      }
+    } else {
+      // IText (Auto Size, single line): just reflow dimensions.
+      (textObj as any).initDimensions?.();
+    }
+
     textObj.setCoords();
     fc.fire("object:modified", { target: textObj });
     fc.renderAll();
@@ -196,6 +411,12 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
               min={6}
               max={200}
               value={fontSizeDisplay}
+              onFocus={() => {
+                // Seed with the live canvas value so blur-without-typing does
+                // not accidentally commit a stale number.
+                setFontSizeInputVal(String(fontSize));
+                setIsEditingFontSize(true);
+              }}
               onChange={(e) => {
                 setIsEditingFontSize(true);
                 setFontSizeInputVal(e.target.value);
@@ -322,8 +543,36 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
                   min={0.5}
                   max={5}
                   step={0.1}
-                  value={+(textObj.lineHeight ?? 1.16).toFixed(2)}
-                  onChange={(e) => applyProps({ lineHeight: parseFloat(e.target.value) || 1 })}
+                  value={isEditingLineHeight ? lineHeightVal : String(+canvasLineHeight.toFixed(2))}
+                  onFocus={() => {
+                    setLineHeightVal(String(+canvasLineHeight.toFixed(2)));
+                    setIsEditingLineHeight(true);
+                  }}
+                  onChange={(e) => {
+                    setIsEditingLineHeight(true);
+                    setLineHeightVal(e.target.value);
+                  }}
+                  onBlur={() => {
+                    const parsed = parseFloat(lineHeightVal);
+                    const clamped = Math.min(5, Math.max(0.5, isNaN(parsed) ? 1.16 : parsed));
+                    setIsEditingLineHeight(false);
+                    setLineHeightVal(String(+clamped.toFixed(2)));
+                    applyProps({ lineHeight: clamped });
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      const parsed = parseFloat(lineHeightVal);
+                      const clamped = Math.min(5, Math.max(0.5, isNaN(parsed) ? 1.16 : parsed));
+                      setIsEditingLineHeight(false);
+                      setLineHeightVal(String(+clamped.toFixed(2)));
+                      applyProps({ lineHeight: clamped });
+                      (e.target as HTMLInputElement).blur();
+                    }
+                    if (e.key === "Escape") {
+                      setIsEditingLineHeight(false);
+                      setLineHeightVal(String(+canvasLineHeight.toFixed(2)));
+                    }
+                  }}
                   className="h-7 w-14 shrink-0 px-1 text-center text-xs"
                 />
               </div>
@@ -337,8 +586,36 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
                   min={-500}
                   max={2000}
                   step={10}
-                  value={textObj.charSpacing ?? 0}
-                  onChange={(e) => applyProps({ charSpacing: parseInt(e.target.value, 10) || 0 })}
+                  value={isEditingCharSpacing ? charSpacingVal : String(canvasCharSpacing)}
+                  onFocus={() => {
+                    setCharSpacingVal(String(canvasCharSpacing));
+                    setIsEditingCharSpacing(true);
+                  }}
+                  onChange={(e) => {
+                    setIsEditingCharSpacing(true);
+                    setCharSpacingVal(e.target.value);
+                  }}
+                  onBlur={() => {
+                    const parsed = parseInt(charSpacingVal, 10);
+                    const clamped = Math.min(2000, Math.max(-500, isNaN(parsed) ? 0 : parsed));
+                    setIsEditingCharSpacing(false);
+                    setCharSpacingVal(String(clamped));
+                    applyProps({ charSpacing: clamped });
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      const parsed = parseInt(charSpacingVal, 10);
+                      const clamped = Math.min(2000, Math.max(-500, isNaN(parsed) ? 0 : parsed));
+                      setIsEditingCharSpacing(false);
+                      setCharSpacingVal(String(clamped));
+                      applyProps({ charSpacing: clamped });
+                      (e.target as HTMLInputElement).blur();
+                    }
+                    if (e.key === "Escape") {
+                      setIsEditingCharSpacing(false);
+                      setCharSpacingVal(String(canvasCharSpacing));
+                    }
+                  }}
                   className="h-7 w-16 shrink-0 px-1 text-center text-xs"
                 />
               </div>
@@ -351,16 +628,7 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
                 variant={(textObj as any).__textTransform === "uppercase" ? "secondary" : "ghost"}
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => {
-                  const isDynamic = !!(textObj as any).__isDynamicField;
-                  const next = (textObj as any).__textTransform === "uppercase" ? "none" : "uppercase";
-                  if (isDynamic) {
-                    applyProps({ __textTransform: next });
-                  } else {
-                    const txt = next === "uppercase" ? (textObj.text ?? "").toUpperCase() : (textObj.text ?? "");
-                    applyProps({ text: txt, __textTransform: next });
-                  }
-                }}
+                onClick={() => applyTextTransform("uppercase")}
               >
                 <CaseUpper className="h-3.5 w-3.5" />
               </Button>
@@ -371,16 +639,7 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
                 variant={(textObj as any).__textTransform === "lowercase" ? "secondary" : "ghost"}
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => {
-                  const isDynamic = !!(textObj as any).__isDynamicField;
-                  const next = (textObj as any).__textTransform === "lowercase" ? "none" : "lowercase";
-                  if (isDynamic) {
-                    applyProps({ __textTransform: next });
-                  } else {
-                    const txt = next === "lowercase" ? (textObj.text ?? "").toLowerCase() : (textObj.text ?? "");
-                    applyProps({ text: txt, __textTransform: next });
-                  }
-                }}
+                onClick={() => applyTextTransform("lowercase")}
               >
                 <CaseLower className="h-3.5 w-3.5" />
               </Button>
@@ -391,18 +650,7 @@ export function ContextToolbar({ selected, canvasRef, onRefresh, onDelete }: Pro
                 variant={(textObj as any).__textTransform === "capitalize" ? "secondary" : "ghost"}
                 size="icon"
                 className="h-7 w-7 shrink-0"
-                onClick={() => {
-                  const isDynamic = !!(textObj as any).__isDynamicField;
-                  const next = (textObj as any).__textTransform === "capitalize" ? "none" : "capitalize";
-                  if (isDynamic) {
-                    applyProps({ __textTransform: next });
-                  } else {
-                    const txt = next === "capitalize"
-                      ? (textObj.text ?? "").replace(/\b\w/g, (c) => c.toUpperCase())
-                      : (textObj.text ?? "");
-                    applyProps({ text: txt, __textTransform: next });
-                  }
-                }}
+                onClick={() => applyTextTransform("capitalize")}
               >
                 <CaseSensitive className="h-3.5 w-3.5" />
               </Button>

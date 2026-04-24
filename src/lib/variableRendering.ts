@@ -153,6 +153,29 @@ export function unpatchWordBoundaryWrap(tb: fabric.Textbox): void {
 }
 
 /**
+ * Apply a CSS-semantic `textTransform` value to a string and return the result.
+ *
+ * Mirrors the CSS `text-transform` property so callers stay semantic:
+ *   applyTextTransformValue(text, "uppercase")  →  "HELLO WORLD"
+ *   applyTextTransformValue(text, "lowercase")  →  "hello world"
+ *   applyTextTransformValue(text, "capitalize") →  "Hello World"
+ *   applyTextTransformValue(text, "none")       →  unchanged
+ *
+ * Fabric.js renders to HTML Canvas and does not support CSS properties.
+ * This helper bridges the gap: the TRANSFORM INTENT is expressed as a
+ * CSS-style value (stored in `__textTransform`), and this function applies
+ * it when updating canvas display text or export output.
+ */
+export function applyTextTransformValue(text: string, transform: string): string {
+  switch (transform.toLowerCase()) {
+    case "uppercase":  return text.toUpperCase();
+    case "lowercase":  return text.toLowerCase();
+    case "capitalize": return text.replace(/\b\w/gu, (c) => c.toUpperCase());
+    default:           return text;
+  }
+}
+
+/**
  * Auto-fit font size: shrink (or grow) the font so the text occupies exactly
  * one line within `boxWidth`.
  *
@@ -443,6 +466,95 @@ export function applyImageFit(
   imageObject.setCoords();
 }
 
+/**
+ * Override FabricImage._stroke() so the border path traces the mask clip shape
+ * (circle or rounded-rectangle) instead of the default axis-aligned rectangle.
+ *
+ * Root cause: Fabric.js's FabricImage._render calls `this._stroke(ctx)` which
+ * draws a rectangular moveTo/lineTo path.  _renderPaintInOrder then calls
+ * _renderStroke → ctx.stroke() on that rectangular path — producing a square
+ * border even when the image has a circular clipPath.
+ *
+ * By replacing `_stroke` at the instance level we redirect only the path-setup
+ * step; all other stroke-style, shadow, and strokeUniform logic in
+ * _renderStroke is untouched.
+ *
+ * Call this after every maskShape change and after every clipPath rebuild:
+ *   - applyImageMask()
+ *   - setImageBorderRadius()
+ *   - applyMaskAndBorder() on a FabricImage
+ *   - after clipPath is (re-)applied from template data
+ */
+export function patchImageShapeStroke(
+  image: fabric.FabricImage,
+  shape: string
+): void {
+  const img = image as any;
+
+  if (shape === "circle") {
+    /**
+     * Draw a circular arc path whose radius matches the circular clipPath.
+     * Fabric's render coordinate space centers the object at (0, 0), so the
+     * image occupies [-w/2, -h/2] → [w/2, h/2] and the circle edge sits at
+     * radius = min(w, h) / 2 — identical to createImageMaskClipPath("circle").
+     */
+    img._stroke = function (this: fabric.FabricImage, ctx: CanvasRenderingContext2D) {
+      if (!this.stroke || this.strokeWidth === 0) return;
+      const r = Math.min(Number(this.width ?? 0), Number(this.height ?? 0)) / 2;
+      if (r <= 0) return;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.closePath();
+    };
+    img.__shapeStrokePatched = "circle";
+
+  } else if (shape === "rounded" || shape === "rounded-rectangle") {
+    /**
+     * Draw a rounded-rectangle path matching the rounded clipPath.
+     * Uses ctx.roundRect when available; falls back to quadraticCurveTo for
+     * older browsers.
+     */
+    img._stroke = function (this: fabric.FabricImage, ctx: CanvasRenderingContext2D) {
+      if (!this.stroke || this.strokeWidth === 0) return;
+      const w = Number(this.width ?? 0);
+      const h = Number(this.height ?? 0);
+      if (!w || !h) return;
+      const cornerR = Math.max(
+        0,
+        Math.min(
+          Number((this as any).__maskOptions?.cornerRadius ?? (this as any).maskRadius ?? 0),
+          Math.min(w, h) / 2
+        )
+      );
+      const x = -w / 2;
+      const y = -h / 2;
+      ctx.beginPath();
+      if (typeof (ctx as any).roundRect === "function") {
+        (ctx as any).roundRect(x, y, w, h, cornerR);
+      } else {
+        ctx.moveTo(x + cornerR, y);
+        ctx.lineTo(x + w - cornerR, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + cornerR);
+        ctx.lineTo(x + w, y + h - cornerR);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - cornerR, y + h);
+        ctx.lineTo(x + cornerR, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - cornerR);
+        ctx.lineTo(x, y + cornerR);
+        ctx.quadraticCurveTo(x, y, x + cornerR, y);
+        ctx.closePath();
+      }
+    };
+    img.__shapeStrokePatched = "rounded";
+
+  } else {
+    // No custom shape — restore the default rectangular _stroke behaviour.
+    if (img.__shapeStrokePatched) {
+      delete img._stroke;
+      delete img.__shapeStrokePatched;
+    }
+  }
+}
+
 export function applyMaskAndBorder(
   object: fabric.FabricObject,
   options: MaskBorderOptions = {}
@@ -453,9 +565,24 @@ export function applyMaskAndBorder(
   const borderColor = options.borderColor || "#2563eb";
   const showBorder = Boolean(options.showBorder);
 
+  // Respect an existing mask shape on the object so the clip path keeps the
+  // correct geometry (circle, rounded-rect) rather than always defaulting to
+  // an axis-aligned rectangle.
+  const maskShape = String(anyObj.maskShape ?? "none");
   const box = resolveObjectBox(object);
-  object.set({
-    clipPath: new fabric.Rect({
+
+  let clipPath: fabric.FabricObject;
+  if (maskShape === "circle") {
+    clipPath = new fabric.Circle({
+      radius: Math.min(box.width, box.height) / 2,
+      originX: "center",
+      originY: "center",
+      left: 0,
+      top: 0,
+      absolutePositioned: false,
+    });
+  } else {
+    clipPath = new fabric.Rect({
       width: box.width,
       height: box.height,
       rx: radius,
@@ -465,8 +592,10 @@ export function applyMaskAndBorder(
       left: 0,
       top: 0,
       absolutePositioned: false,
-    }),
-  } as any);
+    });
+  }
+
+  object.set({ clipPath } as any);
 
   anyObj.__maskOptions = {
     cornerRadius: radius,
@@ -484,6 +613,13 @@ export function applyMaskAndBorder(
       });
     }
   }
+
+  // For FabricImage objects patch the stroke path so the border follows the
+  // mask shape instead of the default rectangular image bounding box.
+  if (object instanceof fabric.FabricImage && maskShape !== "none") {
+    patchImageShapeStroke(object, maskShape);
+  }
+
   object.setCoords();
 }
 
@@ -722,6 +858,12 @@ export async function renderTemplateWithData(
         if (!nextText && !safeData.emptyAsBlank) {
           nextText = safeData.textPlaceholder;
         }
+
+        // Apply text case transform stored by the designer toolbar (uppercase /
+        // lowercase / capitalize).  This runs on the RESOLVED text so exported
+        // cards honour the transform even for variable placeholders like {{full_name}}.
+        const textTransform = String(anyObj.__textTransform ?? "none");
+        nextText = applyTextTransformValue(nextText, textTransform);
 
         obj.set({ text: nextText });
         applyTextFit(obj, box.width, box.height);

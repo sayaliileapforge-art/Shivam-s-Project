@@ -23,6 +23,16 @@ import { ToggleGroup, ToggleGroupItem } from "../ui/toggle-group";
 import { pxToMm, MM_TO_PX } from "../../../lib/fabricUtils";
 import type { FabricCanvasHandle } from "./FabricCanvas";
 
+/**
+ * Sanitise a colour value for use in <input type="color">.
+ * The browser requires a strict "#rrggbb" format; values like "transparent",
+ * "", undefined or rgb(…) are rejected and produce console warnings.
+ */
+function toColorInput(val: unknown, fallback = "#000000"): string {
+  const s = String(val ?? "").trim();
+  return /^#[0-9a-fA-F]{6}$/.test(s) ? s : fallback;
+}
+
 export type CustomFont = { name: string; dataUrl: string };
 
 interface Props {
@@ -759,7 +769,7 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                   <Label className="text-xs text-muted-foreground">Color</Label>
                   <div className="flex gap-2 mt-0.5">
                     <input type="color"
-                      value={((selected as fabric.IText).fill as string) ?? "#000000"}
+                      value={toColorInput((selected as fabric.IText).fill, "#000000")}
                       onChange={(e) => set({ fill: e.target.value })}
                       className="h-8 w-10 rounded border cursor-pointer" />
                     <Input
@@ -773,7 +783,7 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                   <Label className="text-xs text-muted-foreground">Background</Label>
                   <div className="flex gap-2 mt-0.5">
                     <input type="color"
-                      value={(selected as any).backgroundColor as string ?? "#ffffff"}
+                      value={toColorInput((selected as any).backgroundColor, "#ffffff")}
                       onChange={(e) => set({ backgroundColor: e.target.value })}
                       className="h-8 w-10 rounded border cursor-pointer" />
                     <Input
@@ -991,7 +1001,7 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                 <SLabel>Fill</SLabel>
                 <div className="flex gap-2">
                   <input type="color"
-                    value={((selected as fabric.Rect).fill as string) ?? "#6366f1"}
+                    value={toColorInput((selected as fabric.Rect).fill, "#6366f1")}
                     onChange={(e) => set({ fill: e.target.value })}
                     className="h-8 w-10 rounded border cursor-pointer" />
                   <Input value={((selected as fabric.Rect).fill as string) ?? "#6366f1"}
@@ -1003,7 +1013,7 @@ export function PropertiesPanel({ selected, canvasRef, onRefresh, displayScale, 
                 <SLabel>Stroke</SLabel>
                 <div className="flex gap-2">
                   <input type="color"
-                    value={((selected as fabric.Rect).stroke as string) ?? "#000000"}
+                    value={toColorInput((selected as fabric.Rect).stroke, "#000000")}
                     onChange={(e) => set({ stroke: e.target.value })}
                     className="h-8 w-10 rounded border cursor-pointer" />
                   <div className="flex flex-col gap-1 flex-1">
