@@ -1,6 +1,8 @@
 ﻿import { useParams, Link, useNavigate } from "react-router";
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import * as fabric from "fabric";
+import html2canvas from "html2canvas";
+import jsPDF from "jspdf";
 import {
   ArrowLeft, Plus, Trash2, Edit, Upload, FileText,
   CheckCircle2, Circle, Clock, MoreVertical, Download,
@@ -49,6 +51,7 @@ import {
 } from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
+import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
 
 // ─── Template dialog types ───────────────────────────────────────────────────
 type PageFormat = "a4" | "13x19" | "custom";
@@ -470,6 +473,9 @@ function getRecordPhotoUrl(rec: ProjectDataRecord): string {
 }
 const DEFAULT_AVATAR =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Ccircle cx='18' cy='18' r='18' fill='%23e2e8f0'/%3E%3Ccircle cx='18' cy='14' r='6' fill='%2394a3b8'/%3E%3Cellipse cx='18' cy='30' rx='10' ry='7' fill='%2394a3b8'/%3E%3C/svg%3E";
+const MM_TO_PX = 96 / 25.4;
+const PREVIEW_CARD_WIDTH_PX = 250;
+const PREVIEW_CARD_HEIGHT_PX = 350;
 
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
@@ -639,6 +645,13 @@ export function ProjectDetail() {
     ? templateDiagnosticsMap[previewTemplate.id]
     : undefined;
 
+  const selectedGenerateTemplate = previewForm.templateId
+    ? (templates.find((template) => template.id === previewForm.templateId) || null)
+    : null;
+  const selectedGenerateTemplateSlug = selectedGenerateTemplate
+    ? getTemplateSlugForRender(selectedGenerateTemplate)
+    : "";
+
   const selectedGenerateTemplateDiagnostics = previewForm.templateId
     ? templateDiagnosticsMap[previewForm.templateId]
     : undefined;
@@ -656,6 +669,16 @@ export function ProjectDetail() {
       return { ...prev, [templateId]: true };
     });
   };
+
+  useEffect(() => {
+    if (!previewForm.templateId) return;
+
+    console.debug("[PreviewUI] selectedTemplate", {
+      selectedTemplateId: previewForm.templateId,
+      selectedTemplateName: selectedGenerateTemplate?.templateName,
+      selectedTemplateSlug: selectedGenerateTemplateSlug,
+    });
+  }, [previewForm.templateId, selectedGenerateTemplate?.templateName, selectedGenerateTemplateSlug]);
 
   const refresh = () => setVersion((v) => v + 1);
 
@@ -1508,6 +1531,78 @@ export function ProjectDetail() {
   };
 
   const selectedRecords = dataRecords.filter((record) => dataSelectedIds.has(record.id));
+  const previewCapturePagesRef = useRef<Array<HTMLDivElement | null>>([]);
+
+  const printLayout = useMemo(() => {
+    const sheetWidthMm = Number(previewForm.sheetWidthMm);
+    const sheetHeightMm = Number(previewForm.sheetHeightMm);
+    const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
+    const pageMarginLeftMm = Number(previewForm.pageMarginLeftMm);
+    const rowMarginMm = Number(previewForm.rowMarginMm || "0");
+    const columnMarginMm = Number(previewForm.columnMarginMm || "0");
+
+    const sheetWidthPx = Math.max(1, Math.round(Math.max(sheetWidthMm, 1) * MM_TO_PX));
+    const sheetHeightPx = Math.max(1, Math.round(Math.max(sheetHeightMm, 1) * MM_TO_PX));
+    const marginTopPx = Math.max(0, Math.round(Math.max(pageMarginTopMm, 0) * MM_TO_PX));
+    const marginLeftPx = Math.max(0, Math.round(Math.max(pageMarginLeftMm, 0) * MM_TO_PX));
+    const rowGapPx = Math.max(0, Math.round(Math.max(rowMarginMm, 0) * MM_TO_PX));
+    const columnGapPx = Math.max(0, Math.round(Math.max(columnMarginMm, 0) * MM_TO_PX));
+
+    const usableWidth = Math.max(1, sheetWidthPx - marginLeftPx * 2);
+    const usableHeight = Math.max(1, sheetHeightPx - marginTopPx * 2);
+    const columns = Math.max(1, Math.floor((usableWidth + columnGapPx) / (PREVIEW_CARD_WIDTH_PX + columnGapPx)));
+    const rows = Math.max(1, Math.floor((usableHeight + rowGapPx) / (PREVIEW_CARD_HEIGHT_PX + rowGapPx)));
+    const cardsPerPage = Math.max(1, columns * rows);
+
+    return {
+      sheetWidthPx,
+      sheetHeightPx,
+      marginTopPx,
+      marginLeftPx,
+      rowGapPx,
+      columnGapPx,
+      columns,
+      rows,
+      cardsPerPage,
+      sheetWidthMm,
+      sheetHeightMm,
+    };
+  }, [
+    previewForm.sheetWidthMm,
+    previewForm.sheetHeightMm,
+    previewForm.pageMarginTopMm,
+    previewForm.pageMarginLeftMm,
+    previewForm.rowMarginMm,
+    previewForm.columnMarginMm,
+  ]);
+
+  const previewPrintPages = useMemo(() => {
+    if (!selectedRecords.length) return [] as ProjectDataRecord[][];
+    const pages: ProjectDataRecord[][] = [];
+    for (let i = 0; i < selectedRecords.length; i += printLayout.cardsPerPage) {
+      pages.push(selectedRecords.slice(i, i + printLayout.cardsPerPage));
+    }
+    return pages;
+  }, [selectedRecords, printLayout.cardsPerPage]);
+
+  useEffect(() => {
+    previewCapturePagesRef.current = previewCapturePagesRef.current.slice(0, previewPrintPages.length);
+  }, [previewPrintPages.length]);
+
+  const waitForImagesToLoad = async (element: HTMLElement) => {
+    const images = Array.from(element.querySelectorAll("img"));
+    await Promise.all(
+      images.map((image) => new Promise<void>((resolve) => {
+        if (image.complete && image.naturalWidth > 0) {
+          resolve();
+          return;
+        }
+        const done = () => resolve();
+        image.addEventListener("load", done, { once: true });
+        image.addEventListener("error", done, { once: true });
+      }))
+    );
+  };
 
   const handleOpenGeneratePreview = () => {
     if (!selectedRecords.length) return;
@@ -1539,9 +1634,10 @@ export function ProjectDetail() {
     if (!id) return;
 
     const selectedTemplate = templates.find((template) => template.id === previewForm.templateId);
+    const selectedTemplateSlug = selectedTemplate ? getTemplateSlugForRender(selectedTemplate) : "";
     const selectedTemplateDiagnostics = selectedTemplate ? templateDiagnosticsMap[selectedTemplate.id] : undefined;
-    const sheetWidthMm = Number(previewForm.sheetWidthMm);
-    const sheetHeightMm = Number(previewForm.sheetHeightMm);
+    const sheetWidthMm = printLayout.sheetWidthMm;
+    const sheetHeightMm = printLayout.sheetHeightMm;
     const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
     const pageMarginLeftMm = Number(previewForm.pageMarginLeftMm);
     const rowMarginMm = Number(previewForm.rowMarginMm || "0");
@@ -1553,6 +1649,10 @@ export function ProjectDetail() {
     }
     if (!previewForm.templateId || !selectedTemplate) {
       setPreviewError("Please select a template.");
+      return;
+    }
+    if (!selectedTemplateSlug) {
+      setPreviewError("Selected template could not be mapped to a render layout.");
       return;
     }
     if (!selectedTemplateDiagnostics?.hasDesignElements) {
@@ -1576,116 +1676,42 @@ export function ProjectDetail() {
       return;
     }
 
-    const minimalRecords = selectedRecords.map((record) => {
-      const compact: Record<string, unknown> = {
-        id: record.id,
-        projectId: record.projectId,
-        category: record.category,
-        groupId: record.groupId,
-      };
-
-      Object.entries(record).forEach(([key, value]) => {
-        if (["id", "projectId", "category", "groupId", "photo", "barcode"].includes(key)) return;
-        const raw = String(value ?? "").trim();
-        if (raw) compact[key] = raw;
-      });
-
-      return compact;
-    });
-
     setPreviewError("");
     setIsGeneratingPreview(true);
     try {
-      console.debug("[Preview] Preparing template payload", {
-        templateId: selectedTemplate.id,
-        templateName: selectedTemplate.templateName,
-        templateType: selectedTemplate.templateType,
-        hasValidLayoutJson: selectedTemplateDiagnostics.hasValidLayoutJson,
-        elementCount: selectedTemplateDiagnostics.elementCount,
-        requiredFieldKeys: selectedTemplateDiagnostics.requiredFieldKeys,
-        missingFieldKeys: selectedTemplateDiagnostics.missingFieldKeys,
-        selectedRecordCount: selectedRecords.length,
-      });
-
-      if (selectedTemplateDiagnostics.missingFieldKeys.length > 0) {
-        console.warn("[Preview] Missing template field mappings", {
-          templateId: selectedTemplate.id,
-          missingFieldKeys: selectedTemplateDiagnostics.missingFieldKeys,
-        });
+      if (!previewPrintPages.length) {
+        throw new Error("No preview pages generated.");
       }
 
-      const response = await fetch("/api/preview/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          projectId: id,
-          selectedRecordIds: selectedRecords.map((record) => record.id),
-          selectedRecords: minimalRecords,
-          configuration: {
-            pageSize: previewForm.pageSize,
-            templateId: previewForm.templateId,
-            orientation: previewForm.orientation,
-            templateType: previewForm.templateType,
-            isSample: previewForm.isSample === "yes",
-            sheetSize: {
-              widthMm: sheetWidthMm,
-              heightMm: sheetHeightMm,
-            },
-            pageMargin: {
-              topMm: pageMarginTopMm,
-              leftMm: pageMarginLeftMm,
-            },
-            rowMarginMm,
-            columnMarginMm,
-            fileName: previewForm.fileName.trim(),
-          },
-          template: {
-            id: selectedTemplate.id,
-            templateName: selectedTemplate.templateName,
-            templateType: selectedTemplate.templateType,
-            canvas: selectedTemplate.canvas,
-            thumbnail: selectedTemplate.thumbnail,
-            // Send pre-computed diagnostics instead of the full canvasJSON
-            // (canvasJSON can be several MB which makes the request very slow).
-            hasValidLayout: selectedTemplateDiagnostics.hasValidLayoutJson,
-            elementCount: selectedTemplateDiagnostics.elementCount,
-          },
-        }),
+      const orientation = sheetWidthMm > sheetHeightMm ? "landscape" : "portrait";
+      const doc = new jsPDF({
+        orientation,
+        unit: "mm",
+        format: [sheetWidthMm, sheetHeightMm],
+        compress: true,
       });
 
-      if (!response.ok) {
-        let errorMessage = "Failed to generate preview PDF.";
-        try {
-          const json = await response.json();
-          errorMessage = String(json?.error || json?.message || errorMessage);
-        } catch {
-          // Keep generic message if JSON parsing fails.
+      for (let pageIndex = 0; pageIndex < previewPrintPages.length; pageIndex += 1) {
+        const pageElement = previewCapturePagesRef.current[pageIndex];
+        if (!pageElement) {
+          throw new Error(`Unable to render preview page ${pageIndex + 1}.`);
         }
-        throw new Error(errorMessage);
+
+        await waitForImagesToLoad(pageElement);
+        const canvas = await html2canvas(pageElement, {
+          useCORS: true,
+          scale: 2,
+          backgroundColor: "#ffffff",
+        });
+        const imageData = canvas.toDataURL("image/png", 1);
+
+        if (pageIndex > 0) {
+          doc.addPage([sheetWidthMm, sheetHeightMm], orientation);
+        }
+        doc.addImage(imageData, "PNG", 0, 0, sheetWidthMm, sheetHeightMm, undefined, "FAST");
       }
 
-      const responseTemplateId = response.headers.get("x-preview-template-id");
-      const responseHasLayout = response.headers.get("x-preview-has-layout");
-      const responseRecordCount = Number(response.headers.get("x-preview-record-count") || "0");
-      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-
-      if (responseTemplateId && responseTemplateId !== selectedTemplate.id) {
-        throw new Error("Preview response template mismatch.");
-      }
-      if (responseHasLayout === "0") {
-        throw new Error("No preview available. Please configure the template.");
-      }
-      if (Number.isFinite(responseRecordCount) && responseRecordCount <= 0) {
-        throw new Error("Preview response has no data.");
-      }
-      if (!contentType.includes("application/pdf")) {
-        throw new Error("Invalid preview response format.");
-      }
-
-      const pdfBlob = await response.blob();
-      const pdfUrl = URL.createObjectURL(pdfBlob);
-      window.open(pdfUrl, "_blank", "noopener,noreferrer");
-      setTimeout(() => URL.revokeObjectURL(pdfUrl), 60000);
+      doc.save(`${previewForm.fileName.trim()}.pdf`);
       setIsGeneratePreviewOpen(false);
     } catch (error) {
       setPreviewError((error as Error).message || "Failed to generate preview PDF.");
@@ -3241,6 +3267,47 @@ export function ProjectDetail() {
                         ))}
                       </SelectContent>
                     </Select>
+                  </div>
+
+                  <div className="sm:col-span-2 space-y-1.5">
+                    <Label>Rendered template preview</Label>
+                    <IdCardGrid students={selectedRecords.slice(0, 1)} template={selectedGenerateTemplate} />
+                    {selectedRecords.length > 1 && (
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Showing 1 of {selectedRecords.length} student(s). PDF will include all.
+                      </p>
+                    )}
+                  </div>
+
+                  <div aria-hidden className="pointer-events-none fixed -left-[10000px] top-0 opacity-0">
+                    {previewPrintPages.map((pageRecords, pageIndex) => (
+                      <div
+                        key={`print-page-${pageIndex}`}
+                        ref={(el) => {
+                          previewCapturePagesRef.current[pageIndex] = el;
+                        }}
+                      >
+                        <div
+                          className="id-print-page id-print-page-grid"
+                          style={{
+                            width: `${printLayout.sheetWidthPx}px`,
+                            height: `${printLayout.sheetHeightPx}px`,
+                            padding: `${printLayout.marginTopPx}px ${printLayout.marginLeftPx}px`,
+                            gridTemplateColumns: `repeat(${printLayout.columns}, ${PREVIEW_CARD_WIDTH_PX}px)`,
+                            columnGap: `${printLayout.columnGapPx}px`,
+                            rowGap: `${printLayout.rowGapPx}px`,
+                          }}
+                        >
+                          {pageRecords.map((student, studentIndex) => (
+                            <IdCard
+                              key={`print-card-${student.id}-${pageIndex}-${studentIndex}`}
+                              student={student}
+                              template={selectedGenerateTemplate}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    ))}
                   </div>
 
                   {selectedGenerateTemplateDiagnostics && (
