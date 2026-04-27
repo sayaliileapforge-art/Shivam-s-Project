@@ -138,14 +138,19 @@ router.put('/:projectId/templates/:templateId', async (req: Request, res: Respon
   }
 });
 
-// DELETE a template
+// DELETE a template (default/seeded templates cannot be deleted)
 router.delete('/:projectId/templates/:templateId', async (req: Request, res: Response) => {
   try {
-    const template = await ProjectDesignTemplate.findByIdAndDelete(req.params.templateId);
+    const template = await ProjectDesignTemplate.findById(req.params.templateId);
     if (!template) {
       res.status(404).json({ success: false, error: 'Template not found' });
       return;
     }
+    if ((template as any).isDefault) {
+      res.status(403).json({ success: false, error: 'Default templates cannot be deleted.' });
+      return;
+    }
+    await template.deleteOne();
     res.json({ success: true, message: 'Template deleted' });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });

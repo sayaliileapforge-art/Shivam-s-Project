@@ -11,6 +11,7 @@ export interface IProjectDesignTemplate extends Document {
   canvasJSON?: string;
   thumbnail?: string;
   isPublic: boolean;
+  isDefault: boolean;
 }
 
 const ProjectDesignTemplateSchema = new Schema<IProjectDesignTemplate>(
@@ -33,6 +34,7 @@ const ProjectDesignTemplateSchema = new Schema<IProjectDesignTemplate>(
     canvasJSON: String,
     thumbnail: String,
     isPublic: { type: Boolean, default: false },
+    isDefault: { type: Boolean, default: false, index: true },
   },
   { timestamps: true }
 );

@@ -36,7 +36,7 @@ interface ResolvedTemplateConfig extends IdCardTemplateConfig {
 
 const DEFAULT_TEMPLATE_CONFIGS: Record<SupportedTemplateSlug, IdCardTemplateConfig> = {
   template_1: {
-    background: "/templates/template_1.png",
+    background: "/templates/template_1.svg",
     layout: {
       photo: { top: 64, left: 75, width: 100, height: 100 },
       name: { top: 188, left: 30, width: 190, fontSize: 16, fontWeight: 700, color: "#0f172a", textAlign: "center" },
@@ -45,7 +45,7 @@ const DEFAULT_TEMPLATE_CONFIGS: Record<SupportedTemplateSlug, IdCardTemplateConf
     },
   },
   template_2: {
-    background: "/templates/template_2.png",
+    background: "/templates/template_2.svg",
     layout: {
       photo: { top: 56, left: 18, width: 84, height: 84 },
       name: { top: 70, left: 114, width: 122, fontSize: 14, fontWeight: 700, color: "#065f46", textAlign: "left" },
@@ -54,7 +54,7 @@ const DEFAULT_TEMPLATE_CONFIGS: Record<SupportedTemplateSlug, IdCardTemplateConf
     },
   },
   template_3: {
-    background: "/templates/template_3.png",
+    background: "/templates/template_3.svg",
     layout: {
       photo: { top: 206, left: 170, width: 64, height: 64 },
       name: { top: 216, left: 18, width: 142, fontSize: 14, fontWeight: 700, color: "#111827", textAlign: "left" },

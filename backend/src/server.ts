@@ -5,6 +5,7 @@ import path from 'path';
 import fs from 'fs';
 import { connectDB } from './config/database';
 import { hasPostgresConfig, initAuthSchema, testAuthDbConnection } from './config/postgres';
+import { seedDefaultTemplates } from './scripts/seedDefaultTemplates';
 import projectRoutes from './routes/projects';
 import clientRoutes from './routes/clients';
 import productRoutes from './routes/products';
@@ -15,6 +16,7 @@ import previewRoutes from './routes/preview';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
 const backendRootDir = path.resolve(__dirname, '..');
 const repoRootDir = path.resolve(backendRootDir, '..');
 
@@ -114,6 +116,7 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 async function startServer() {
   try {
     await connectDB();
+    await seedDefaultTemplates();
     if (hasPostgresConfig()) {
       await testAuthDbConnection();
       await initAuthSchema();
