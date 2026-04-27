@@ -44,7 +44,6 @@ import {
   type DataCategory, type ProjectDataField, type ProjectDataGroup, type ProjectDataRecord,
 } from "../../lib/projectStore";
 import {
-  API_BASE,
   fetchProjectById as apiFetchProjectById,
   updateProject as apiUpdateProject,
   deleteProject as apiDeleteProject,
@@ -612,27 +611,7 @@ export function ProjectDetail() {
   const products = id ? loadProjectProducts(id) : [];
   const tasks = id ? loadProjectTasks(id) : [];
   const files = id ? loadProjectFiles(id) : [];
-  const [templates, setTemplates] = useState<ProjectTemplate[]>(() =>
-    id ? loadProjectTemplates(id, '') : []
-  );
-
-  // Fetch templates from API (production-safe — not localStorage-only)
-  useEffect(() => {
-    if (!id) return;
-    let mounted = true;
-    fetch(`${API_BASE}/projects/${id}/templates`)
-      .then((r) => r.json())
-      .then((json) => {
-        if (!mounted) return;
-        if (json.success && Array.isArray(json.data)) {
-          setTemplates(json.data);
-        }
-      })
-      .catch(() => {
-        // fallback: localStorage already seeded in useState initializer
-      });
-    return () => { mounted = false; };
-  }, [id]);
+  const templates = id ? loadProjectTemplates(id, project?.clientId ?? "") : [];
 
   const availableTemplateFieldKeys = useMemo(() => {
     const keys = new Set<string>();
@@ -734,10 +713,10 @@ export function ProjectDetail() {
     return c.toDataURL("image/png");
   };
 
-  const handleCreateTemplate = async () => {
+  const handleCreateTemplate = () => {
     if (!validateTemplate() || !id) return;
     const thumb = createBlankTemplateThumbnail(templateForm.canvas.width, templateForm.canvas.height);
-    const payload = {
+    addProjectTemplate({
       projectId: id,
       clientId: project?.clientId ?? "",
       templateName: templateForm.templateName,
@@ -747,26 +726,7 @@ export function ProjectDetail() {
       applicableFor: templateForm.applicableFor,
       thumbnail: thumb,
       isPublic: templateForm.isPublic,
-    };
-    try {
-      const res = await fetch(`${API_BASE}/projects/${id}/templates`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const json = await res.json();
-      if (json.success && json.data) {
-        setTemplates((prev) => [...prev, json.data]);
-      } else {
-        // API returned an error — fall back to localStorage
-        const newTmpl = addProjectTemplate(payload);
-        setTemplates((prev) => [...prev, newTmpl]);
-      }
-    } catch {
-      // Network error — fall back to localStorage
-      const newTmpl = addProjectTemplate(payload);
-      setTemplates((prev) => [...prev, newTmpl]);
-    }
+    });
     setTemplateForm(emptyTemplateForm);
     setTemplateErrors({});
     setIsCreateTemplateOpen(false);
@@ -2365,11 +2325,7 @@ export function ProjectDetail() {
                                 <Pencil className="h-3 w-3" />Edit
                               </Button>
                               {isOwnTemplate && (
-                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => {
-                                  fetch(`${API_BASE}/projects/${id}/templates/${tmpl.id}`, { method: 'DELETE' }).catch(() => {});
-                                  deleteProjectTemplate(tmpl.id);
-                                  setTemplates((prev) => prev.filter((t) => t.id !== tmpl.id));
-                                }}>
+                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
                                   <Trash2 className="h-3 w-3" />
                                 </Button>
                               )}
@@ -2380,9 +2336,9 @@ export function ProjectDetail() {
                               variant="outline"
                               className="flex-1 text-xs gap-1"
                               title="Copy this global template to your project"
-                              onClick={async () => {
+                              onClick={() => {
                                 if (!id) return;
-                                const payload = {
+                                addProjectTemplate({
                                   projectId: id,
                                   clientId: currentClientId,
                                   templateName: `${tmpl.templateName} (Copy)`,
@@ -2393,24 +2349,8 @@ export function ProjectDetail() {
                                   canvasJSON: tmpl.canvasJSON,
                                   thumbnail: tmpl.thumbnail,
                                   isPublic: false,
-                                };
-                                try {
-                                  const res = await fetch(`${API_BASE}/projects/${id}/templates`, {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify(payload),
-                                  });
-                                  const json = await res.json();
-                                  if (json.success && json.data) {
-                                    setTemplates((prev) => [...prev, json.data]);
-                                  } else {
-                                    const newTmpl = addProjectTemplate(payload);
-                                    setTemplates((prev) => [...prev, newTmpl]);
-                                  }
-                                } catch {
-                                  const newTmpl = addProjectTemplate(payload);
-                                  setTemplates((prev) => [...prev, newTmpl]);
-                                }
+                                });
+                                refresh();
                               }}
                             >
                               <FilePlus className="h-3 w-3" />Use

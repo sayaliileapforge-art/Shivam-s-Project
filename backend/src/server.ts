@@ -4,8 +4,8 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import { connectDB } from './config/database';
+import ProductTemplate from './models/ProductTemplate';
 import { hasPostgresConfig, initAuthSchema, testAuthDbConnection } from './config/postgres';
-import { seedDefaultTemplates } from './scripts/seedDefaultTemplates';
 import projectRoutes from './routes/projects';
 import clientRoutes from './routes/clients';
 import productRoutes from './routes/products';
@@ -116,7 +116,22 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 async function startServer() {
   try {
     await connectDB();
-    await seedDefaultTemplates();
+    // --- AUTO SEED LOGIC: Insert default templates if none exist ---
+    const templateCount = await ProductTemplate.countDocuments();
+    console.log(`✓ ProductTemplate count: ${templateCount}`);
+    if (templateCount === 0) {
+      await ProductTemplate.insertMany([
+        {
+          productId: new (require('mongoose')).Types.ObjectId(),
+          templateName: 'Default Template',
+          category: 'Business',
+          designData: {},
+          isActive: true,
+          tags: ['default'],
+        }
+      ]);
+      console.log('✓ Seeded default ProductTemplate');
+    }
     if (hasPostgresConfig()) {
       await testAuthDbConnection();
       await initAuthSchema();

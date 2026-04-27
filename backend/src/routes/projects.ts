@@ -1,7 +1,6 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import Project from '../models/Project';
-import ProjectDesignTemplate from '../models/ProjectDesignTemplate';
 
 const router = Router();
 
@@ -77,81 +76,6 @@ router.delete('/:id', async (req: Request, res: Response) => {
       return;
     }
     res.json({ success: true, message: 'Project deleted' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: (error as Error).message });
-  }
-});
-
-// ─── Project Design Templates ────────────────────────────────────────────────
-
-function mapTemplate(t: any) {
-  const obj = t.toObject ? t.toObject() : { ...t };
-  const { _id, __v, ...rest } = obj;
-  return { ...rest, id: String(_id) };
-}
-
-// GET all templates for a project (own + same-client + public)
-router.get('/:projectId/templates', async (req: Request, res: Response) => {
-  try {
-    const { projectId } = req.params;
-    const project = await Project.findById(projectId).lean();
-    const clientId = project ? String((project as any).clientId || '') : '';
-
-    const conditions: any[] = [{ projectId }];
-    if (clientId) conditions.push({ clientId });
-    conditions.push({ isPublic: true });
-
-    const templates = await ProjectDesignTemplate.find({ $or: conditions });
-    res.json({ success: true, data: templates.map(mapTemplate) });
-  } catch (error) {
-    res.status(500).json({ success: false, error: (error as Error).message });
-  }
-});
-
-// POST create a template
-router.post('/:projectId/templates', async (req: Request, res: Response) => {
-  try {
-    const { projectId } = req.params;
-    const template = new ProjectDesignTemplate({ ...req.body, projectId });
-    await template.save();
-    res.status(201).json({ success: true, data: mapTemplate(template) });
-  } catch (error) {
-    res.status(400).json({ success: false, error: (error as Error).message });
-  }
-});
-
-// PUT update a template
-router.put('/:projectId/templates/:templateId', async (req: Request, res: Response) => {
-  try {
-    const template = await ProjectDesignTemplate.findByIdAndUpdate(
-      req.params.templateId,
-      req.body,
-      { new: true }
-    );
-    if (!template) {
-      res.status(404).json({ success: false, error: 'Template not found' });
-      return;
-    }
-    res.json({ success: true, data: mapTemplate(template) });
-  } catch (error) {
-    res.status(400).json({ success: false, error: (error as Error).message });
-  }
-});
-
-// DELETE a template (default/seeded templates cannot be deleted)
-router.delete('/:projectId/templates/:templateId', async (req: Request, res: Response) => {
-  try {
-    const template = await ProjectDesignTemplate.findById(req.params.templateId);
-    if (!template) {
-      res.status(404).json({ success: false, error: 'Template not found' });
-      return;
-    }
-    if ((template as any).isDefault) {
-      res.status(403).json({ success: false, error: 'Default templates cannot be deleted.' });
-      return;
-    }
-    await template.deleteOne();
-    res.json({ success: true, message: 'Template deleted' });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });
   }
