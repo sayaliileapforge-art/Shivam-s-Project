@@ -16,40 +16,18 @@ function resolvePreviewImage(payload: Record<string, any>): string {
 
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const {
-      productId,
-      category,
-      search,
-      page = '1',
-      pageSize = '12',
-      active = 'true',
-    } = req.query;
+    // Debug: Log all query params
+    console.log("[DEBUG] /api/templates query:", req.query);
 
-    const filter: Record<string, any> = {};
-    if (productId) filter.productId = productId;
-    if (category) filter.category = category;
-    if (active !== 'all') filter.isActive = String(active) === 'true';
-    if (search) filter.templateName = { $regex: String(search), $options: 'i' };
-
-    const pageNum = Math.max(1, Number(page) || 1);
-    const perPage = Math.max(1, Math.min(50, Number(pageSize) || 12));
-
-    const [items, total] = await Promise.all([
-      ProductTemplate.find(filter)
-        .sort({ updatedAt: -1 })
-        .skip((pageNum - 1) * perPage)
-        .limit(perPage),
-      ProductTemplate.countDocuments(filter),
-    ]);
+    // TEMP: Remove all filters for debugging
+    const templates = await ProductTemplate.find({}).sort({ updatedAt: -1 });
+    console.log("[DEBUG] /api/templates returned templates:", templates);
 
     res.json({
       success: true,
-      data: items,
+      data: templates,
       meta: {
-        page: pageNum,
-        pageSize: perPage,
-        total,
-        totalPages: Math.ceil(total / perPage),
+        total: templates.length
       },
     });
   } catch (error) {
