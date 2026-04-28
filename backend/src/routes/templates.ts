@@ -46,7 +46,12 @@ router.get('/', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: (error as Error).message });
+    const err = error as Error;
+    console.error('[templates] GET /api/templates failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -63,14 +68,27 @@ router.get('/product/:productId', async (req: Request, res: Response) => {
     if (category) filter.category = category;
     if (search) filter.templateName = { $regex: String(search), $options: 'i' };
 
+    console.log('[templates] Querying /api/templates/product/:productId', {
+      productId,
+      filter,
+      database: mongoose.connection.name,
+      collection: 'producttemplates',
+    });
+
     const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
-    console.log('[templates] GET /api/templates/product/:productId', {
+    console.log('[templates] Query result', {
       productId,
       count: templates.length,
+      templateIds: templates.map((t) => String(t._id)),
     });
     res.json({ success: true, data: templates });
   } catch (error) {
-    res.status(500).json({ success: false, error: (error as Error).message });
+    const err = error as Error;
+    console.error('[templates] GET /api/templates/product/:productId failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -90,7 +108,12 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     res.json({ success: true, data: template });
   } catch (error) {
-    res.status(500).json({ success: false, error: (error as Error).message });
+    const err = error as Error;
+    console.error('[templates] GET /api/templates/:id failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -137,10 +160,30 @@ router.post('/', async (req: Request, res: Response) => {
       isActive,
     });
 
-    await template.save();
-    res.status(201).json({ success: true, data: template });
+    console.log('[templates] Saving template', {
+      productId,
+      templateName: template.templateName,
+      collection: 'producttemplates',
+      database: mongoose.connection.name,
+    });
+
+    const savedTemplate = await template.save();
+    console.log('[templates] Template saved successfully', {
+      _id: String(savedTemplate._id),
+      templateName: savedTemplate.templateName,
+      createdAt: savedTemplate.createdAt,
+    });
+
+    res.status(201).json({ success: true, data: savedTemplate });
   } catch (error) {
-    res.status(400).json({ success: false, error: (error as Error).message });
+    const err = error as Error;
+    console.error('[templates] Template save failed', {
+      error: err.message,
+      stack: err.stack,
+      mongoError: (error as any).code,
+      mongoMessage: (error as any).message,
+    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
@@ -169,11 +212,26 @@ router.put('/:id', async (req: Request, res: Response) => {
       previewImageUrl: normalizedPreview || undefined,
     };
 
+    console.log('[templates] Updating template', {
+      _id: id,
+      database: mongoose.connection.name,
+      updateFields: Object.keys(updatePayload),
+    });
+
     const template = await ProductTemplate.findByIdAndUpdate(id, updatePayload, { new: true });
+    console.log('[templates] Template updated successfully', {
+      _id: id,
+      updatedAt: template?.updatedAt,
+    });
 
     res.json({ success: true, data: template });
   } catch (error) {
-    res.status(400).json({ success: false, error: (error as Error).message });
+    const err = error as Error;
+    console.error('[templates] Template update failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
@@ -207,7 +265,12 @@ router.post('/selection', async (req: Request, res: Response) => {
     await selection.save();
     res.status(201).json({ success: true, data: selection });
   } catch (error) {
-    res.status(400).json({ success: false, error: (error as Error).message });
+    const err = error as Error;
+    console.error('[templates] Template selection save failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 

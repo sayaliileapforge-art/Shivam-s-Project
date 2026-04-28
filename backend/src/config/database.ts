@@ -31,12 +31,18 @@ function normalizeMongoUri(rawUri?: string): string {
 export async function connectDB() {
   try {
     const mongoUri = normalizeMongoUri(process.env.MONGODB_URI || process.env.MONGO_URI);
+    const dbName = mongoUri.includes('/') ? mongoUri.split('/').pop()?.split('?')[0] : 'unknown';
 
     await mongoose.connect(mongoUri);
-    console.log('✓ MongoDB connected successfully');
+    console.log('✓ MongoDB connected successfully', {
+      database: dbName,
+      host: mongoUri.includes('@') ? mongoUri.split('@')[1].split('/')[0] : 'unknown',
+      uri: mongoUri.replace(/:[^:@]*@/, ':***@'),
+    });
     return mongoose.connection;
   } catch (error) {
     console.error('✗ MongoDB connection failed:', error);
+    console.error('  Attempted URI:', (process.env.MONGODB_URI || process.env.MONGO_URI)?.replace(/:[^:@]*@/, ':***@'));
     process.exit(1);
   }
 }
