@@ -1,3 +1,5 @@
+import { API_BASE as API_ROOT } from './apiService';
+
 export interface TemplateRecord {
   _id: string;
   productId: string;
@@ -13,7 +15,7 @@ export interface TemplateRecord {
   updatedAt: string;
 }
 
-const TEMPLATE_API_BASE = '/api/templates';
+const TEMPLATE_API_BASE = `${API_ROOT}/templates`;
 
 export function generatePreview(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL('image/png');
@@ -42,10 +44,21 @@ function resolvePreviewForSave(input: TemplateSaveInput): string {
 }
 
 async function handleResponse<T>(response: Response): Promise<T> {
-  const json = await response.json();
-  if (!response.ok || !json.success) {
-    throw new Error(json.error || 'Request failed');
+  const raw = await response.text();
+  let json: { success?: boolean; data?: T; error?: string; message?: string } = {};
+
+  if (raw) {
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      throw new Error(raw || `Request failed with status ${response.status}`);
+    }
   }
+
+  if (!response.ok || json.success === false) {
+    throw new Error(json.error || json.message || `Request failed with status ${response.status}`);
+  }
+
   return json.data as T;
 }
 
@@ -55,12 +68,23 @@ export async function getTemplatesByProductId(productId: string, params?: { cate
   if (params?.search) query.set('search', params.search);
   const queryString = query.toString();
 
-  const response = await fetch(`${TEMPLATE_API_BASE}/product/${productId}${queryString ? `?${queryString}` : ''}`);
-  return handleResponse<TemplateRecord[]>(response);
+  const requestUrl = `${TEMPLATE_API_BASE}/product/${productId}${queryString ? `?${queryString}` : ''}`;
+  const response = await fetch(requestUrl);
+  const payload = await handleResponse<TemplateRecord[]>(response);
+
+  console.info('[templateApi] /api/templates response', {
+    url: requestUrl,
+    status: response.status,
+    count: Array.isArray(payload) ? payload.length : 0,
+  });
+
+  return payload;
 }
 
 export async function getTemplateById(templateId: string): Promise<TemplateRecord> {
-  const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}`);
+  const requestUrl = `${TEMPLATE_API_BASE}/${templateId}`;
+  const response = await fetch(requestUrl);
+  console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
   return handleResponse<TemplateRecord>(response);
 }
 

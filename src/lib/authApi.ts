@@ -1,6 +1,8 @@
 const MOBILE_REGEX = /^[6-9]\d{9}$/;
 
-const rawBase = ((import.meta as any).env?.VITE_API_BASE_URL as string | undefined)?.trim();
+const rawBase = (((import.meta as any).env?.VITE_API_BASE_URL as string | undefined)
+  || ((import.meta as any).env?.VITE_API_URL as string | undefined)
+  || '').trim();
 const API_BASE = rawBase
   ? rawBase.replace(/\/$/, '').endsWith('/api')
     ? rawBase.replace(/\/$/, '')

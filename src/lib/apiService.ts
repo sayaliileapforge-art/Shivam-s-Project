@@ -6,7 +6,7 @@
 
 function getApiBaseEnv(): string | undefined {
   const env = (import.meta as any).env as Record<string, string | boolean | undefined>;
-  const value = env.VITE_API_BASE_URL;
+  const value = env.VITE_API_BASE_URL || env.VITE_API_URL;
   return typeof value === 'string' ? value.trim() : undefined;
 }
 

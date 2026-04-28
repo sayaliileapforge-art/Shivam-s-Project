@@ -16,12 +16,27 @@ function resolvePreviewImage(payload: Record<string, any>): string {
 
 router.get('/', async (req: Request, res: Response) => {
   try {
-    // Debug: Log all query params
-    console.log("[DEBUG] /api/templates query:", req.query);
+    const requestedProductId = String(req.query.productId || req.query.projectId || '').trim();
+    console.log('[templates] GET /api/templates', {
+      productId: requestedProductId || null,
+      query: req.query,
+    });
 
-    // TEMP: Remove all filters for debugging
-    const templates = await ProductTemplate.find({}).sort({ updatedAt: -1 });
-    console.log("[DEBUG] /api/templates returned templates:", templates);
+    // Fetch templates by projectId or isGlobal (optional global flag)
+    let filter: Record<string, any> = {};
+    if (requestedProductId) {
+      filter = {
+        $or: [
+          { productId: requestedProductId },
+          { isGlobal: true }
+        ]
+      };
+    }
+    const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
+    console.log('[templates] Templates found', {
+      count: templates.length,
+      ids: templates.map((template) => String(template._id)),
+    });
 
     res.json({
       success: true,
@@ -49,6 +64,10 @@ router.get('/product/:productId', async (req: Request, res: Response) => {
     if (search) filter.templateName = { $regex: String(search), $options: 'i' };
 
     const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
+    console.log('[templates] GET /api/templates/product/:productId', {
+      productId,
+      count: templates.length,
+    });
     res.json({ success: true, data: templates });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });
