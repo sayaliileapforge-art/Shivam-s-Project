@@ -131,3 +131,47 @@ export async function saveSelectedTemplate(input: {
   });
   return handleResponse<{ _id: string }>(response);
 }
+
+/**
+ * Migrate localStorage project templates to MongoDB
+ * This syncs locally-stored templates to the backend for persistence
+ */
+export async function migrateProjectTemplatesToDatabase(projectId: string, templates: any[]): Promise<{
+  saved: Array<{ _id: string; templateName: string }>;
+  errors: Array<{ templateName: string; error: string }>;
+}> {
+  console.log('[templateApi:migration] Starting migration', {
+    projectId,
+    count: templates.length,
+  });
+
+  const response = await fetch(`${TEMPLATE_API_BASE}/migration/sync-project-templates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      projectId,
+      templates: templates.map(t => ({
+        id: t.id,
+        templateName: t.templateName,
+        templateType: t.templateType,
+        canvas: t.canvas,
+        margin: t.margin,
+        thumbnail: t.thumbnail,
+        isPublic: t.isPublic,
+        applicableFor: t.applicableFor,
+      })),
+    }),
+  });
+
+  const result = await handleResponse<{
+    saved: Array<{ _id: string; templateName: string }>;
+    errors: Array<{ templateName: string; error: string }>;
+  }>(response);
+
+  console.log('[templateApi:migration] Migration complete', {
+    saved: result.saved.length,
+    errors: result.errors.length,
+  });
+
+  return result;
+}

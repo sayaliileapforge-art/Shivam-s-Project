@@ -274,4 +274,112 @@ router.post('/selection', async (req: Request, res: Response) => {
   }
 });
 
+// Migration endpoint: Sync localStorage project templates to MongoDB
+router.post('/migration/sync-project-templates', async (req: Request, res: Response) => {
+  try {
+    const { projectId, templates } = req.body as {
+      projectId: string;
+      templates: Array<{
+        id?: string;
+        templateName: string;
+        templateType?: string;
+        canvas?: Record<string, any>;
+        margin?: Record<string, any>;
+        thumbnail?: string;
+        isPublic?: boolean;
+        applicableFor?: string[];
+      }>;
+    };
+
+    if (!projectId || !Array.isArray(templates)) {
+      res.status(400).json({
+        success: false,
+        error: 'projectId and templates array are required'
+      });
+      return;
+    }
+
+    console.log('[templates:migration] Starting sync', {
+      projectId,
+      count: templates.length,
+      database: mongoose.connection.name,
+    });
+
+    const savedTemplates = [];
+    const errors = [];
+
+    for (const tpl of templates) {
+      try {
+        // Check if product exists
+        const productExists = await Product.exists({ _id: projectId });
+        if (!productExists) {
+          console.warn('[templates:migration] Product not found:', { projectId });
+          errors.push({ templateName: tpl.templateName, error: 'Product not found' });
+          continue;
+        }
+
+        // Create template in MongoDB
+        const newTemplate = new ProductTemplate({
+          productId: projectId,
+          templateName: String(tpl.templateName).trim(),
+          category: 'Other', // Default category
+          preview_image: tpl.thumbnail || '',
+          previewImageUrl: tpl.thumbnail || '',
+          designData: {
+            templateType: tpl.templateType,
+            canvas: tpl.canvas,
+            margin: tpl.margin,
+            applicableFor: tpl.applicableFor,
+          },
+          isActive: tpl.isPublic !== false,
+          tags: [`migrated_${new Date().toISOString().split('T')[0]}`],
+        });
+
+        await newTemplate.save();
+        savedTemplates.push({
+          _id: String(newTemplate._id),
+          templateName: newTemplate.templateName,
+        });
+
+        console.log('[templates:migration] Template saved', {
+          templateName: tpl.templateName,
+          _id: String(newTemplate._id),
+        });
+      } catch (err) {
+        const error = err as Error;
+        console.error('[templates:migration] Template save failed', {
+          templateName: tpl.templateName,
+          error: error.message,
+        });
+        errors.push({
+          templateName: tpl.templateName,
+          error: error.message,
+        });
+      }
+    }
+
+    console.log('[templates:migration] Sync complete', {
+      projectId,
+      saved: savedTemplates.length,
+      failed: errors.length,
+    });
+
+    res.json({
+      success: true,
+      message: `Migrated ${savedTemplates.length} templates to MongoDB`,
+      data: {
+        saved: savedTemplates,
+        errors,
+      },
+    });
+  } catch (error) {
+    const err = error as Error;
+    console.error('[templates:migration] Migration failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 export default router;
