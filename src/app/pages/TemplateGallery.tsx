@@ -1,23 +1,29 @@
-import { useMemo, useState } from "react";
-import { useNavigate } from "react-router";
-import { Search, Palette, Globe, Lock, Download } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Search, Globe, Lock } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Input } from "../components/ui/input";
-import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
-import { loadAllProjectTemplates } from "../../lib/projectStore";
-import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
-import { downloadTemplateAsPdf } from "../../lib/templatePdf";
-import { toast } from "sonner";
-
-const DESIGNER_IMPORT_MODE_KEY = "vendor_designer_import_mode";
+import { getTemplates, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 
 export function TemplateGallery() {
-  const navigate = useNavigate();
   const [query, setQuery] = useState("");
+  const [templates, setTemplates] = useState<TemplateRecord[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  const templates = useMemo(() => loadAllProjectTemplates(), []);
-  const publicTemplates = useMemo(() => templates.filter((t) => t.isPublic !== false), [templates]);
+  useEffect(() => {
+    setLoading(true);
+    setError("");
+    getTemplates()
+      .then((data) => setTemplates(data))
+      .catch((err) => setError((err as Error).message || "Failed to load templates"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const publicTemplates = useMemo(
+    () => templates.filter((t) => t.isActive !== false),
+    [templates]
+  );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -25,39 +31,11 @@ export function TemplateGallery() {
     return publicTemplates.filter((t) => {
       return (
         t.templateName.toLowerCase().includes(q) ||
-        t.templateType.toLowerCase().includes(q) ||
-        (t.applicableFor || "").toLowerCase().includes(q)
+        t.category.toLowerCase().includes(q) ||
+        (t.tags || []).some((tag) => tag.toLowerCase().includes(q))
       );
     });
   }, [publicTemplates, query]);
-
-  const openInDesigner = (templateId: string, projectId: string, templateName: string) => {
-    localStorage.setItem(
-      DESIGNER_CONTEXT_KEY,
-      JSON.stringify({
-        projectId,
-        templateId,
-        templateName,
-      })
-    );
-    localStorage.setItem(DESIGNER_IMPORT_MODE_KEY, "true");
-    navigate("/designer-studio");
-  };
-
-  const handleDownloadPdf = async (templateId: string) => {
-    const template = templates.find((t) => t.id === templateId);
-    if (!template) {
-      toast.error("Template not found");
-      return;
-    }
-
-    try {
-      await downloadTemplateAsPdf(template);
-      toast.success("PDF downloaded");
-    } catch (error) {
-      toast.error((error as Error).message || "Failed to generate PDF");
-    }
-  };
 
   return (
     <div className="space-y-6">
@@ -79,29 +57,36 @@ export function TemplateGallery() {
               className="pl-9"
             />
           </div>
+          {error ? (
+            <p className="mt-3 text-sm text-destructive">{error}</p>
+          ) : null}
         </CardContent>
       </Card>
 
       {filtered.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
-            No public templates found.
+            {loading ? "Loading templates..." : "No public templates found."}
           </CardContent>
         </Card>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {filtered.map((t) => (
-            <Card key={t.id} className="overflow-hidden">
+            <Card key={t._id} className="overflow-hidden">
               <div className="relative h-44 bg-muted">
-                {t.thumbnail ? (
-                  <img src={t.thumbnail} alt={t.templateName} className="h-full w-full object-contain" />
+                {t.preview_image || t.previewImageUrl ? (
+                  <img
+                    src={resolveTemplatePreview(t)}
+                    alt={t.templateName}
+                    className="h-full w-full object-contain"
+                  />
                 ) : (
                   <div className="flex h-full items-center justify-center text-muted-foreground">
                     No preview
                   </div>
                 )}
                 <div className="absolute right-2 top-2">
-                  {t.isPublic !== false ? (
+                  {t.isActive !== false ? (
                     <Badge className="gap-1">
                       <Globe className="h-3 w-3" /> Public
                     </Badge>
@@ -117,22 +102,11 @@ export function TemplateGallery() {
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex flex-wrap gap-2 text-xs">
-                  <Badge variant="secondary">{t.templateType}</Badge>
-                  {t.applicableFor ? <Badge variant="outline">{t.applicableFor}</Badge> : null}
+                  <Badge variant="secondary">{t.category}</Badge>
+                  {t.tags?.slice(0, 2).map((tag) => (
+                    <Badge key={tag} variant="outline">{tag}</Badge>
+                  ))}
                 </div>
-                <Button
-                  className="w-full gap-2"
-                  onClick={() => openInDesigner(t.id, t.projectId, t.templateName)}
-                >
-                  <Palette className="h-4 w-4" /> Open and Customize
-                </Button>
-                <Button
-                  variant="outline"
-                  className="w-full gap-2"
-                  onClick={() => void handleDownloadPdf(t.id)}
-                >
-                  <Download className="h-4 w-4" /> Download PDF
-                </Button>
               </CardContent>
             </Card>
           ))}

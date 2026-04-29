@@ -1,12 +1,15 @@
-import { API_BASE as API_ROOT } from './apiService';
+import { API_BASE as API_ROOT, resolveProfileImageUrl } from './apiService';
 
 export interface TemplateRecord {
   _id: string;
   productId: string;
+  createdBy?: string;
   templateName: string;
+  description?: string;
   category: 'Business' | 'Wedding' | 'Minimal' | 'Corporate' | 'Festival' | 'Other';
   previewImageUrl?: string;
   preview_image?: string;
+  imageUrl?: string;
   designFileUrl?: string;
   designData: Record<string, any>;
   isActive: boolean;
@@ -22,12 +25,19 @@ export function generatePreview(canvas: HTMLCanvasElement): string {
 }
 
 export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_image' | 'previewImageUrl'> | null | undefined): string {
-  return template?.preview_image || template?.previewImageUrl || '/placeholder.png';
+  const raw = template?.preview_image || template?.previewImageUrl || '';
+  if (!raw) return '/placeholder.png';
+  if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) {
+    return raw;
+  }
+  return resolveProfileImageUrl(raw);
 }
 
 type TemplateSaveInput = {
   productId: string;
   templateName: string;
+  userId?: string;
+  description?: string;
   category?: TemplateRecord['category'];
   designFileUrl?: string;
   designData?: Record<string, any>;
@@ -35,6 +45,18 @@ type TemplateSaveInput = {
   isActive?: boolean;
   preview_image?: string;
   previewCanvas?: HTMLCanvasElement;
+};
+
+type TemplateUploadInput = {
+  productId: string;
+  title: string;
+  userId?: string;
+  description?: string;
+  category?: TemplateRecord['category'];
+  designData?: Record<string, any>;
+  tags?: string[];
+  isActive?: boolean;
+  imageFile: File;
 };
 
 function resolvePreviewForSave(input: TemplateSaveInput): string {
@@ -81,6 +103,14 @@ export async function getTemplatesByProductId(productId: string, params?: { cate
   return payload;
 }
 
+export async function getTemplates(params?: { productId?: string }): Promise<TemplateRecord[]> {
+  const query = new URLSearchParams();
+  if (params?.productId) query.set('productId', params.productId);
+  const requestUrl = `${TEMPLATE_API_BASE}${query.toString() ? `?${query}` : ''}`;
+  const response = await fetch(requestUrl);
+  return handleResponse<TemplateRecord[]>(response);
+}
+
 export async function getTemplateById(templateId: string): Promise<TemplateRecord> {
   const requestUrl = `${TEMPLATE_API_BASE}/${templateId}`;
   const response = await fetch(requestUrl);
@@ -98,6 +128,26 @@ export async function createTemplate(input: TemplateSaveInput): Promise<Template
       preview_image: preview,
       previewImageUrl: preview,
     }),
+  });
+
+  return handleResponse<TemplateRecord>(response);
+}
+
+export async function createTemplateWithImage(input: TemplateUploadInput): Promise<TemplateRecord> {
+  const formData = new FormData();
+  formData.append('image', input.imageFile);
+  formData.append('productId', input.productId);
+  formData.append('title', input.title);
+  if (input.userId) formData.append('userId', input.userId);
+  if (input.description) formData.append('description', input.description);
+  if (input.category) formData.append('category', input.category);
+  if (input.designData) formData.append('designData', JSON.stringify(input.designData));
+  if (input.tags) formData.append('tags', JSON.stringify(input.tags));
+  if (typeof input.isActive === 'boolean') formData.append('isActive', String(input.isActive));
+
+  const response = await fetch(TEMPLATE_API_BASE, {
+    method: 'POST',
+    body: formData,
   });
 
   return handleResponse<TemplateRecord>(response);

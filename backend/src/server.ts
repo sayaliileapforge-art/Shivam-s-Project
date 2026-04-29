@@ -17,6 +17,8 @@ import previewRoutes from './routes/preview';
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+app.set('trust proxy', 1);
+
 const backendRootDir = path.resolve(__dirname, '..');
 const repoRootDir = path.resolve(backendRootDir, '..');
 
@@ -51,12 +53,15 @@ app.use('/api', apiCorsMiddleware);
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-const uploadsDir = path.resolve(backendRootDir, 'uploads');
+const uploadsDir = process.env.UPLOADS_DIR?.trim()
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.resolve(backendRootDir, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
   console.warn(`Uploads directory was missing and has been created: ${uploadsDir}`);
 }
 app.use('/uploads', express.static(uploadsDir));
+app.use('/images', express.static(uploadsDir));
 
 const isRenderEnvironment = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID);
 const studentPhotosDir = process.env.STUDENT_PHOTOS_DIR?.trim()
@@ -144,6 +149,7 @@ async function startServer() {
         console.log('✓ PostgreSQL auth database connected successfully');
       }
       console.log(`✓ Serving uploads from: ${uploadsDir}`);
+      console.log(`✓ Serving images from: ${uploadsDir}`);
       if (fs.existsSync(frontendIndexPath)) {
         console.log(`✓ Serving frontend build from: ${frontendDistDir}`);
       }

@@ -4,7 +4,9 @@ export type TemplateCategory = 'Business' | 'Wedding' | 'Minimal' | 'Corporate' 
 
 export interface IProductTemplate extends Document {
   productId: mongoose.Types.ObjectId;
+  createdBy?: mongoose.Types.ObjectId;
   templateName: string;
+  description?: string;
   category: TemplateCategory;
   previewImageUrl?: string;
   preview_image?: string;
@@ -19,7 +21,9 @@ export interface IProductTemplate extends Document {
 const ProductTemplateSchema = new Schema<IProductTemplate>(
   {
     productId: { type: Schema.Types.ObjectId, ref: 'Product', required: true, index: true },
+    createdBy: { type: Schema.Types.ObjectId, ref: 'AuthUser', index: true },
     templateName: { type: String, required: true, trim: true },
+    description: { type: String, trim: true },
     category: {
       type: String,
       enum: ['Business', 'Wedding', 'Minimal', 'Corporate', 'Festival', 'Other'],

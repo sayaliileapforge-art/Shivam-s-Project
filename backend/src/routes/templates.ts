@@ -1,4 +1,8 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
+import fs from 'fs';
+import path from 'path';
+import multer from 'multer';
+import { randomUUID } from 'crypto';
 import mongoose from 'mongoose';
 import ProductTemplate from '../models/ProductTemplate';
 import Product from '../models/Product';
@@ -6,13 +10,142 @@ import TemplateSelection from '../models/TemplateSelection';
 
 const router = Router();
 
+function resolveUploadsDir(): string {
+  const configured = process.env.UPLOADS_DIR?.trim();
+  if (configured) {
+    return path.resolve(configured);
+  }
+  return path.resolve(__dirname, '..', '..', 'uploads');
+}
+
+function normalizeImagesRoute(value?: string): string {
+  const raw = (value || '/images').trim();
+  const withSlash = raw.startsWith('/') ? raw : `/${raw}`;
+  return withSlash.replace(/\/+$/, '');
+}
+
+const uploadsDir = resolveUploadsDir();
+const imagesRoute = normalizeImagesRoute(process.env.IMAGES_ROUTE);
+const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 5) || 5;
+const maxUploadBytes = maxUploadMb * 1024 * 1024;
+
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const allowedMimeTypes = new Set(['image/jpeg', 'image/png']);
+const mimeToExt: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+};
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (_req, file, cb) => {
+    const ext = mimeToExt[file.mimetype]
+      || path.extname(file.originalname).toLowerCase()
+      || '.jpg';
+    cb(null, `${Date.now()}-${randomUUID()}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: maxUploadBytes },
+  fileFilter: (_req, file, cb) => {
+    if (!allowedMimeTypes.has(file.mimetype)) {
+      const error = new Error('Only JPG and PNG images are allowed.');
+      (error as NodeJS.ErrnoException).code = 'INVALID_FILE_TYPE';
+      cb(error);
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+function buildPublicImageUrl(req: Request, filename: string): string {
+  const baseUrl = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`)
+    .replace(/\/+$/, '');
+  return `${baseUrl}${imagesRoute}/${filename}`;
+}
+
+function handleUploadError(error: unknown, res: Response): void {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({ success: false, error: `Image too large. Max ${maxUploadMb}MB.` });
+      return;
+    }
+    res.status(400).json({ success: false, error: error.message });
+    return;
+  }
+  if ((error as NodeJS.ErrnoException)?.code === 'INVALID_FILE_TYPE') {
+    res.status(400).json({ success: false, error: 'Only JPG and PNG images are allowed.' });
+    return;
+  }
+  res.status(500).json({ success: false, error: 'Image upload failed.' });
+}
+
+const maybeUploadImage = (req: Request, res: Response, next: NextFunction) => {
+  if (req.is('multipart/form-data')) {
+    upload.single('image')(req, res, (error) => {
+      if (error) {
+        handleUploadError(error, res);
+        return;
+      }
+      next();
+    });
+    return;
+  }
+  next();
+};
+
 function isValidObjectId(id: string): boolean {
   return mongoose.Types.ObjectId.isValid(id);
 }
 
 function resolvePreviewImage(payload: Record<string, any>): string {
-  return String(payload.preview_image || payload.previewImageUrl || '').trim();
+  return String(payload.preview_image || payload.previewImageUrl || payload.imageUrl || '').trim();
 }
+
+function parseJsonField<T>(value: unknown, fallback: T): T {
+  if (value == null) return fallback;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    try {
+      return JSON.parse(trimmed) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return value as T;
+}
+
+router.post('/upload-image', (req: Request, res: Response) => {
+  upload.single('image')(req, res, (error) => {
+    if (error) {
+      handleUploadError(error, res);
+      return;
+    }
+
+    const file = (req as Request & { file?: Express.Multer.File }).file;
+    if (!file) {
+      res.status(400).json({ success: false, error: 'Image file is required.' });
+      return;
+    }
+
+    const url = buildPublicImageUrl(req, file.filename);
+    res.status(201).json({
+      success: true,
+      data: {
+        url,
+        filename: file.filename,
+      },
+    });
+  });
+});
 
 router.get('/', async (req: Request, res: Response) => {
   try {
@@ -117,11 +250,15 @@ router.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
   try {
     const {
       productId,
+      userId,
+      title,
       templateName,
+      description,
+      imageUrl,
       previewImageUrl,
       preview_image,
       designFileUrl,
@@ -131,14 +268,22 @@ router.post('/', async (req: Request, res: Response) => {
       isActive = true,
     } = req.body;
 
-    const normalizedPreview = resolvePreviewImage({ preview_image, previewImageUrl });
+    const file = (req as Request & { file?: Express.Multer.File }).file;
+    const uploadedImageUrl = file ? buildPublicImageUrl(req, file.filename) : '';
+    const normalizedPreview = uploadedImageUrl || resolvePreviewImage({ preview_image, previewImageUrl, imageUrl });
+    const resolvedTemplateName = String(title || templateName || '').trim();
 
-    if (!productId || !templateName || !normalizedPreview) {
-      res.status(400).json({ success: false, error: 'productId, templateName, and preview_image are required' });
+    if (!productId || !resolvedTemplateName || !normalizedPreview) {
+      res.status(400).json({ success: false, error: 'productId, title/templateName, and image are required' });
       return;
     }
     if (!isValidObjectId(productId)) {
       res.status(400).json({ success: false, error: 'Invalid productId' });
+      return;
+    }
+
+    if (userId && !isValidObjectId(String(userId))) {
+      res.status(400).json({ success: false, error: 'Invalid userId' });
       return;
     }
 
@@ -150,13 +295,15 @@ router.post('/', async (req: Request, res: Response) => {
 
     const template = new ProductTemplate({
       productId,
-      templateName: String(templateName).trim(),
+      createdBy: userId ? new mongoose.Types.ObjectId(String(userId)) : undefined,
+      templateName: resolvedTemplateName,
+      description: typeof description === 'string' ? description.trim() : undefined,
       preview_image: normalizedPreview,
       previewImageUrl: normalizedPreview,
       designFileUrl,
-      designData: designData ?? {},
+      designData: parseJsonField<Record<string, any>>(designData, {}),
       category,
-      tags,
+      tags: parseJsonField<string[]>(tags, []),
       isActive,
     });
 
