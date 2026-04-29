@@ -108,7 +108,13 @@ export async function getTemplates(params?: { productId?: string }): Promise<Tem
   if (params?.productId) query.set('productId', params.productId);
   const requestUrl = `${TEMPLATE_API_BASE}${query.toString() ? `?${query}` : ''}`;
   const response = await fetch(requestUrl);
-  return handleResponse<TemplateRecord[]>(response);
+  const payload = await handleResponse<TemplateRecord[]>(response);
+  console.info('[templateApi] GET templates', {
+    url: requestUrl,
+    status: response.status,
+    count: Array.isArray(payload) ? payload.length : 0,
+  });
+  return payload;
 }
 
 export async function getTemplateById(templateId: string): Promise<TemplateRecord> {

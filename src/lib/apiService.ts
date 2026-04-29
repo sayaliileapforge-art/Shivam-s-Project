@@ -43,6 +43,10 @@ function resolveBackendOrigin(): string {
 
 export const BACKEND_ORIGIN = resolveBackendOrigin();
 export const UPLOADS_BASE_URL = `${BACKEND_ORIGIN}/uploads/`;
+if (typeof window !== 'undefined') {
+  console.info('[apiService] API_BASE', resolveApiBase());
+  console.info('[apiService] BACKEND_ORIGIN', BACKEND_ORIGIN);
+}
 
 export function resolveProfileImageUrl(profilePic?: string): string {
   const raw = String(profilePic || '').trim();

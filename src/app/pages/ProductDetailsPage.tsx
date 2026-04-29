@@ -6,7 +6,10 @@ import { Card } from "../components/ui/card";
 import { Badge } from "../components/ui/badge";
 import { ProductDetails } from "../components/products/ProductDetails";
 import { TemplateShowcase } from "../components/products/TemplateShowcase";
-import { Product, getProductById, getProductTemplates, loadTemplates, ProductTemplate } from "../../lib/productStore";
+import { API_BASE } from "../../lib/apiService";
+import { fetchProductById } from "../../lib/productApi";
+import { resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { Product, ProductTemplate } from "../../lib/productStore";
 import { useRbac } from "../../lib/rbac";
 import { getPriceByRole, formatPrice, getRoleDisplayName } from "../../lib/pricingUtils";
 
@@ -18,23 +21,51 @@ export function ProductDetailsPage() {
   const [templates, setTemplates] = useState<ProductTemplate[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    if (productId) {
-      const loadedProduct = getProductById(productId);
-      if (loadedProduct) {
-        setProduct(loadedProduct);
-        
-        // Load templates for this product
-        const productTemplates = getProductTemplates(productId);
-        setTemplates(productTemplates);
-        
-        // Auto-select first template
-        if (productTemplates.length > 0) {
-          setSelectedTemplateId(productTemplates[0].id);
+    if (!productId) return;
+
+    setIsLoading(true);
+    setError("");
+
+    const templatesUrl = `${API_BASE}/templates/product/${encodeURIComponent(productId)}`;
+
+    Promise.all([
+      fetchProductById(productId),
+      fetch(templatesUrl).then(async (response) => {
+        const json = await response.json();
+        console.log("Full API response:", json);
+        if (!response.ok || json?.success === false) {
+          throw new Error(json?.error || "Failed to fetch templates");
         }
-      }
-    }
+        const items = Array.isArray(json?.data) ? (json.data as TemplateRecord[]) : [];
+        console.log("Templates array:", items);
+        return items;
+      }),
+    ])
+      .then(([productData, templateData]) => {
+        setProduct(productData || null);
+
+        const mappedTemplates = templateData.map((t) => ({
+          id: t._id,
+          name: t.templateName,
+          previewImageUrl: resolveTemplatePreview(t),
+          description: t.description,
+          createdAt: t.createdAt,
+        }));
+
+        setTemplates(mappedTemplates);
+        if (mappedTemplates.length > 0) {
+          setSelectedTemplateId(mappedTemplates[0].id);
+        } else {
+          setSelectedTemplateId(null);
+        }
+      })
+      .catch((err) => {
+        setError((err as Error).message || "Failed to load templates");
+      })
+      .finally(() => setIsLoading(false));
   }, [productId]);
 
   const handleOrderNow = () => {
@@ -65,7 +96,7 @@ export function ProductDetailsPage() {
           <ArrowLeft className="h-4 w-4" /> Back
         </Button>
         <Card className="p-8 text-center text-muted-foreground">
-          <p>Product not found or has been removed.</p>
+          <p>{isLoading ? "Loading product..." : "Product not found or has been removed."}</p>
         </Card>
       </div>
     );
@@ -122,6 +153,10 @@ export function ProductDetailsPage() {
               )}
             </div>
 
+            {error ? (
+              <p className="text-sm text-destructive py-3">{error}</p>
+            ) : null}
+
             {/* Template Showcase */}
             {templates.length > 0 ? (
               <TemplateShowcase
@@ -134,7 +169,7 @@ export function ProductDetailsPage() {
             ) : (
               <div className="space-y-4">
                 <p className="text-sm text-muted-foreground text-center py-8">
-                  No templates available for this product. Please contact support.
+                  {isLoading ? "Loading templates..." : "No templates available for this product. Please contact support."}
                 </p>
                 <Button disabled className="w-full">
                   Order Now
