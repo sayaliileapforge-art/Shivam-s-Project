@@ -215,6 +215,8 @@ export function deleteProjectFile(id: string): void {
 
 export interface ProjectTemplate {
   id: string;
+  /** MongoDB _id if persisted remotely */
+  remoteId?: string;
   projectId: string;
   /** Client that owns this template — used to show all same-client templates across projects */
   clientId?: string;

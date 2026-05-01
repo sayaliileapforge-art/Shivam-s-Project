@@ -3,8 +3,10 @@ import mongoose, { Schema, Document } from 'mongoose';
 export type TemplateCategory = 'Business' | 'Wedding' | 'Minimal' | 'Corporate' | 'Festival' | 'Other';
 
 export interface IProductTemplate extends Document {
-  productId: mongoose.Types.ObjectId;
+  productId?: mongoose.Types.ObjectId;
+  projectId?: string;
   createdBy?: mongoose.Types.ObjectId;
+  isGlobal?: boolean;
   templateName: string;
   description?: string;
   category: TemplateCategory;
@@ -20,8 +22,10 @@ export interface IProductTemplate extends Document {
 
 const ProductTemplateSchema = new Schema<IProductTemplate>(
   {
-    productId: { type: Schema.Types.ObjectId, ref: 'Product', required: true, index: true },
+    productId: { type: Schema.Types.ObjectId, ref: 'Product', index: true },
+    projectId: { type: String, index: true },
     createdBy: { type: Schema.Types.ObjectId, ref: 'AuthUser', index: true },
+    isGlobal: { type: Boolean, default: false, index: true },
     templateName: { type: String, required: true, trim: true },
     description: { type: String, trim: true },
     category: {
@@ -62,6 +66,9 @@ ProductTemplateSchema.set('toJSON', {
   },
 });
 
-ProductTemplateSchema.index({ productId: 1, templateName: 1 }, { unique: true });
+ProductTemplateSchema.index(
+  { productId: 1, templateName: 1 },
+  { unique: true, partialFilterExpression: { productId: { $exists: true, $ne: null } } }
+);
 
 export default mongoose.model<IProductTemplate>('ProductTemplate', ProductTemplateSchema);

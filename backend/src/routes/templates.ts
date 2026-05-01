@@ -6,6 +6,7 @@ import { randomUUID } from 'crypto';
 import mongoose from 'mongoose';
 import ProductTemplate from '../models/ProductTemplate';
 import Product from '../models/Product';
+import Project from '../models/Project';
 import TemplateSelection from '../models/TemplateSelection';
 
 const router = Router();
@@ -149,21 +150,35 @@ router.post('/upload-image', (req: Request, res: Response) => {
 
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const requestedProductId = String(req.query.productId || req.query.projectId || '').trim();
+    const requestedProductId = String(req.query.productId || '').trim();
+    const requestedProjectId = String(req.query.projectId || '').trim();
     console.log('[templates] GET /api/templates', {
       productId: requestedProductId || null,
+      projectId: requestedProjectId || null,
       query: req.query,
     });
 
-    // Fetch templates by projectId or isGlobal (optional global flag)
+    // Fetch templates by projectId or productId
     let filter: Record<string, any> = {};
     if (requestedProductId) {
-      filter = {
-        $or: [
-          { productId: requestedProductId },
-          { isGlobal: true }
-        ]
-      };
+      const productConditions: Record<string, any>[] = [
+        { productId: requestedProductId },
+        { isGlobal: true },
+      ];
+      if (isValidObjectId(requestedProductId)) {
+        productConditions.push({ productId: new mongoose.Types.ObjectId(requestedProductId) });
+      }
+      filter = { $or: productConditions };
+    } else if (requestedProjectId) {
+      // Match both projectId (string field) AND productId (ObjectId field) for backward compat —
+      // older templates stored the projectId in productId before this fix was applied.
+      const projectConditions: Record<string, any>[] = [
+        { projectId: requestedProjectId },
+      ];
+      if (isValidObjectId(requestedProjectId)) {
+        projectConditions.push({ productId: new mongoose.Types.ObjectId(requestedProjectId) });
+      }
+      filter = { $or: projectConditions };
     }
     const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
     console.log('[templates] Templates found', {
@@ -254,6 +269,7 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
   try {
     const {
       productId,
+      projectId: bodyProjectId,
       userId,
       title,
       templateName,
@@ -266,6 +282,8 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       category = 'Other',
       tags = [],
       isActive = true,
+      isGlobal,
+      isPublic,
     } = req.body;
 
     const file = (req as Request & { file?: Express.Multer.File }).file;
@@ -273,12 +291,8 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
     const normalizedPreview = uploadedImageUrl || resolvePreviewImage({ preview_image, previewImageUrl, imageUrl });
     const resolvedTemplateName = String(title || templateName || '').trim();
 
-    if (!productId || !resolvedTemplateName || !normalizedPreview) {
-      res.status(400).json({ success: false, error: 'productId, title/templateName, and image are required' });
-      return;
-    }
-    if (!isValidObjectId(productId)) {
-      res.status(400).json({ success: false, error: 'Invalid productId' });
+    if (!productId || !resolvedTemplateName) {
+      res.status(400).json({ success: false, error: 'productId and title/templateName are required' });
       return;
     }
 
@@ -287,19 +301,37 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       return;
     }
 
-    const productExists = await Product.exists({ _id: productId });
-    if (!productExists) {
-      res.status(404).json({ success: false, error: 'Product not found for template mapping' });
-      return;
+    const isProductObjectId = isValidObjectId(productId);
+    let isActualProduct = false;
+    let isActualProject = false;
+
+    if (isProductObjectId) {
+      const productExists = await Product.exists({ _id: productId });
+      if (productExists) {
+        isActualProduct = true;
+      } else {
+        const projectExists = await Project.exists({ _id: productId });
+        if (!projectExists) {
+          res.status(404).json({ success: false, error: 'Product or Project not found for template mapping' });
+          return;
+        }
+        isActualProject = true;
+      }
     }
 
+    // Resolve final projectId: explicit bodyProjectId wins, otherwise derive from productId when it's a project
+    const resolvedProjectId = String(bodyProjectId || (isActualProject ? productId : '') || '').trim();
+
     const template = new ProductTemplate({
-      productId,
+      ...(isActualProduct ? { productId: new mongoose.Types.ObjectId(String(productId)) } : {}),
+      ...(resolvedProjectId ? { projectId: resolvedProjectId } : {}),
       createdBy: userId ? new mongoose.Types.ObjectId(String(userId)) : undefined,
+      isGlobal: [true, 'true', 1, '1'].includes(isGlobal)
+        || [true, 'true', 1, '1'].includes(isPublic),
       templateName: resolvedTemplateName,
       description: typeof description === 'string' ? description.trim() : undefined,
-      preview_image: normalizedPreview,
-      previewImageUrl: normalizedPreview,
+      preview_image: normalizedPreview || '',
+      previewImageUrl: normalizedPreview || '',
       designFileUrl,
       designData: parseJsonField<Record<string, any>>(designData, {}),
       category,
@@ -308,16 +340,31 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
     });
 
     console.log('[templates] Saving template', {
-      productId,
+      resolvedProjectId: resolvedProjectId || null,
+      isActualProduct,
+      isActualProject,
       templateName: template.templateName,
       collection: 'producttemplates',
       database: mongoose.connection.name,
     });
 
     const savedTemplate = await template.save();
+
+    // Push template ref into Project.templates array
+    if (resolvedProjectId && isValidObjectId(resolvedProjectId)) {
+      await Project.findByIdAndUpdate(
+        resolvedProjectId,
+        { $addToSet: { templates: savedTemplate._id } },
+        { new: false }
+      ).catch((err: Error) => {
+        console.warn('[templates] Failed to update Project.templates array', err.message);
+      });
+    }
+
     console.log('[templates] Template saved successfully', {
       _id: String(savedTemplate._id),
       templateName: savedTemplate.templateName,
+      projectId: savedTemplate.projectId || null,
       createdAt: savedTemplate.createdAt,
     });
 
@@ -457,17 +504,20 @@ router.post('/migration/sync-project-templates', async (req: Request, res: Respo
 
     for (const tpl of templates) {
       try {
-        // Check if product exists
-        const productExists = await Product.exists({ _id: projectId });
-        if (!productExists) {
-          console.warn('[templates:migration] Product not found:', { projectId });
-          errors.push({ templateName: tpl.templateName, error: 'Product not found' });
-          continue;
+        const isProjectObjectId = isValidObjectId(projectId);
+        if (isProjectObjectId) {
+          const productExists = await Product.exists({ _id: projectId });
+          const projectExists = productExists ? null : await Project.exists({ _id: projectId });
+          if (!productExists && !projectExists) {
+            console.warn('[templates:migration] Product or Project not found:', { projectId });
+            errors.push({ templateName: tpl.templateName, error: 'Product or Project not found' });
+            continue;
+          }
         }
 
         // Create template in MongoDB
         const newTemplate = new ProductTemplate({
-          productId: projectId,
+          ...(isProjectObjectId ? { productId: projectId } : { projectId: String(projectId) }),
           templateName: String(tpl.templateName).trim(),
           category: 'Other', // Default category
           preview_image: tpl.thumbnail || '',

@@ -6,6 +6,7 @@ export interface IProject extends Document {
   clientId?: mongoose.Schema.Types.ObjectId;
   client?: string;
   templateId?: mongoose.Schema.Types.ObjectId;
+  templates: mongoose.Schema.Types.ObjectId[];
   status: 'draft' | 'active' | 'archived' | 'completed';
   stage?: string;
   priority?: 'urgent' | 'high' | 'medium' | 'low';
@@ -25,7 +26,8 @@ const ProjectSchema = new Schema<IProject>(
     description: String,
     clientId: { type: Schema.Types.ObjectId, ref: 'Client' },
     client: String,
-    templateId: { type: Schema.Types.ObjectId, ref: 'Template' },
+    templateId: { type: Schema.Types.ObjectId, ref: 'ProductTemplate' },
+    templates: [{ type: Schema.Types.ObjectId, ref: 'ProductTemplate' }],
     status: {
       type: String,
       enum: ['draft', 'active', 'archived', 'completed'],

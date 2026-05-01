@@ -48,10 +48,13 @@ import {
   updateProject as apiUpdateProject,
   deleteProject as apiDeleteProject,
   resolveProfileImageUrl,
+  API_BASE,
 } from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
+import { createTemplate, type TemplateRecord } from "../../lib/templateApi";
+import { matchImages, type BulkMatchResult } from "../../lib/imageMatchEngine";
 
 // ─── Template dialog types ───────────────────────────────────────────────────
 type PageFormat = "a4" | "13x19" | "custom";
@@ -66,6 +69,44 @@ const TEMPLATE_TYPES: { value: ProjectTemplate["templateType"]; label: string }[
   { value: "poster",      label: "Poster" },
   { value: "custom",      label: "Custom" },
 ];
+
+type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean };
+
+function mapApiTemplateToProjectTemplate(template: TemplateRecord): PreviewTemplateOption {
+  const designData = (template.designData || {}) as Record<string, any>;
+  const canvas = (designData.canvas && typeof designData.canvas === "object") ? designData.canvas : {};
+  const margin = (designData.margin && typeof designData.margin === "object") ? designData.margin : {};
+  const canvasJSON = typeof designData.canvasJSON === "string"
+    ? designData.canvasJSON
+    : (typeof designData.canvasJson === "string" ? designData.canvasJson : "");
+  const rawApplicableFor = designData.applicableFor;
+  const applicableFor = Array.isArray(rawApplicableFor)
+    ? rawApplicableFor.join(", ")
+    : (rawApplicableFor ? String(rawApplicableFor) : "");
+
+  return {
+    id: template._id,
+    projectId: String(template.projectId || template.productId || ""),
+    templateName: template.templateName,
+    templateType: (designData.templateType as ProjectTemplate["templateType"]) || "custom",
+    canvas: {
+      width: Number(canvas.width || 0) || 0,
+      height: Number(canvas.height || 0) || 0,
+    },
+    margin: {
+      top: Number(margin.top || 0) || 0,
+      left: Number(margin.left || 0) || 0,
+      right: Number(margin.right || 0) || 0,
+      bottom: Number(margin.bottom || 0) || 0,
+    },
+    applicableFor,
+    createdAt: template.createdAt,
+    canvasJSON: canvasJSON || undefined,
+    thumbnail: template.preview_image || template.previewImageUrl || undefined,
+    isPublic: template.isGlobal === true,
+    isGlobal: template.isGlobal === true,
+  };
+}
 const emptyTemplateForm = {
   templateName: "",
   templateType: "id_card" as ProjectTemplate["templateType"],
@@ -549,11 +590,9 @@ export function ProjectDetail() {
   const [isBulkImageUploadOpen, setIsBulkImageUploadOpen] = useState(false);
 
   const [bulkImageProcessing, setBulkImageProcessing] = useState(false);
-  const [bulkImageResults, setBulkImageResults] = useState<{
-    matched: { userId: string; name: string; filename: string; dataUrl: string }[];
-    unmatched: { filename: string; reason: string }[];
-    duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[];
-  } | null>(null);
+  const [bulkImageResults, setBulkImageResults] = useState<BulkMatchResult | null>(null);
+  const [manualAssign, setManualAssign] = useState<Record<string, string>>({}); // filename → userId override
+  const bulkImageDataUrlsRef = useRef<Map<string, string>>(new Map()); // filename → dataUrl
   const [isAddDataOpen, setIsAddDataOpen] = useState(false);
   const [addDataDraft, setAddDataDraft] = useState<Record<string, string>>({});
   const [isBulkEditOpen, setIsBulkEditOpen] = useState(false);
@@ -570,11 +609,15 @@ export function ProjectDetail() {
 
   // Template dialog state
   const [isCreateTemplateOpen, setIsCreateTemplateOpen] = useState(false);
+  const [isTemplateSaving, setIsTemplateSaving] = useState(false);
   const [templateForm, setTemplateForm] = useState(emptyTemplateForm);
   const [templateErrors, setTemplateErrors] = useState<{ templateName?: string; applicableFor?: string }>({});
   const [previewTemplate, setPreviewTemplate] = useState<ProjectTemplate | null>(null);
   const [brokenTemplatePreviewIds, setBrokenTemplatePreviewIds] = useState<Record<string, true>>({});
   const [activeTab, setActiveTab] = useState("details");
+  const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>([]);
+  const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(false);
+  const [remoteTemplatesError, setRemoteTemplatesError] = useState("");
 
   const updateTemplateMargin = (key: keyof typeof emptyTemplateForm.margin, val: number) =>
     setTemplateForm((f) => ({ ...f, margin: { ...f.margin, [key]: val } }));
@@ -607,11 +650,83 @@ export function ProjectDetail() {
     };
   }, [id, version]);
 
+  useEffect(() => {
+    let mounted = true;
+    if (!id) {
+      setRemoteTemplates([]);
+      setRemoteTemplatesError("");
+      return;
+    }
+
+    const requestUrl = `${API_BASE}/templates?projectId=${encodeURIComponent(id)}`;
+    setRemoteTemplatesLoading(true);
+    setRemoteTemplatesError("");
+
+    fetch(requestUrl)
+      .then(async (response) => {
+        const json = await response.json();
+        if (!response.ok || json?.success === false) {
+          throw new Error(json?.error || "Failed to load templates");
+        }
+        const items = Array.isArray(json?.data) ? (json.data as TemplateRecord[]) : [];
+        console.log("Fetched Templates:", items);
+        return items;
+      })
+      .then((items) => {
+        if (!mounted) return;
+        const mapped = items.map(mapApiTemplateToProjectTemplate);
+        const deduped = Array.from(new Map(mapped.map((t) => [t.id, t])).values());
+        setRemoteTemplates(deduped);
+      })
+      .catch((error) => {
+        if (!mounted) return;
+        console.warn("[preview] Failed to load templates", error);
+        setRemoteTemplates([]);
+        setRemoteTemplatesError((error as Error).message || "Failed to load templates");
+      })
+      .finally(() => {
+        if (mounted) setRemoteTemplatesLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, [id, version]);
+
   // Load data
   const products = id ? loadProjectProducts(id) : [];
   const tasks = id ? loadProjectTasks(id) : [];
   const files = id ? loadProjectFiles(id) : [];
   const templates = id ? loadProjectTemplates(id, project?.clientId ?? "") : [];
+  const previewTemplates = useMemo(() => {
+    const merged = new Map<string, PreviewTemplateOption>();
+    const remoteIdSet = new Set(
+      templates
+        .map((template) => template.remoteId)
+        .filter((remoteId): remoteId is string => Boolean(remoteId))
+    );
+
+    remoteTemplates.forEach((template) => {
+      if (!remoteIdSet.has(template.id)) {
+        merged.set(template.id, template);
+      }
+    });
+    templates.forEach((template) => {
+      if (!merged.has(template.id)) {
+        merged.set(template.id, { ...template, isGlobal: false });
+      }
+    });
+    return Array.from(merged.values());
+  }, [remoteTemplates, templates]);
+
+  const previewTemplateGroups = useMemo(() => {
+    const projectTemplates = previewTemplates.filter((template) => !template.isGlobal);
+    const globalTemplates = previewTemplates.filter((template) => template.isGlobal);
+    return {
+      projectTemplates: projectTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
+      globalTemplates: globalTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
+    };
+  }, [previewTemplates]);
 
   const availableTemplateFieldKeys = useMemo(() => {
     const keys = new Set<string>();
@@ -635,25 +750,34 @@ export function ProjectDetail() {
 
   const templateDiagnosticsMap = useMemo(() => {
     const diagnostics: Record<string, TemplatePreviewDiagnostics> = {};
-    templates.forEach((template) => {
+    // Include both local and remote (DB) templates so the card grid shows correct diagnostics
+    previewTemplates.forEach((template) => {
       diagnostics[template.id] = inspectTemplatePreview(template, availableTemplateFieldKeys);
     });
     return diagnostics;
-  }, [templates, availableTemplateFieldKeys]);
+  }, [previewTemplates, availableTemplateFieldKeys]);
+
+  const previewTemplateDiagnosticsMap = useMemo(() => {
+    const diagnostics: Record<string, TemplatePreviewDiagnostics> = {};
+    previewTemplates.forEach((template) => {
+      diagnostics[template.id] = inspectTemplatePreview(template, availableTemplateFieldKeys);
+    });
+    return diagnostics;
+  }, [previewTemplates, availableTemplateFieldKeys]);
 
   const selectedPreviewTemplateDiagnostics = previewTemplate
-    ? templateDiagnosticsMap[previewTemplate.id]
+    ? previewTemplateDiagnosticsMap[previewTemplate.id]
     : undefined;
 
   const selectedGenerateTemplate = previewForm.templateId
-    ? (templates.find((template) => template.id === previewForm.templateId) || null)
+    ? (previewTemplates.find((template) => template.id === previewForm.templateId) || null)
     : null;
   const selectedGenerateTemplateSlug = selectedGenerateTemplate
     ? getTemplateSlugForRender(selectedGenerateTemplate)
     : "";
 
   const selectedGenerateTemplateDiagnostics = previewForm.templateId
-    ? templateDiagnosticsMap[previewForm.templateId]
+    ? previewTemplateDiagnosticsMap[previewForm.templateId]
     : undefined;
 
   const canRenderSelectedTemplateImage = Boolean(
@@ -713,10 +837,10 @@ export function ProjectDetail() {
     return c.toDataURL("image/png");
   };
 
-  const handleCreateTemplate = () => {
+  const handleCreateTemplate = async () => {
     if (!validateTemplate() || !id) return;
     const thumb = createBlankTemplateThumbnail(templateForm.canvas.width, templateForm.canvas.height);
-    addProjectTemplate({
+    const localTemplate = addProjectTemplate({
       projectId: id,
       clientId: project?.clientId ?? "",
       templateName: templateForm.templateName,
@@ -727,10 +851,38 @@ export function ProjectDetail() {
       thumbnail: thumb,
       isPublic: templateForm.isPublic,
     });
+
     setTemplateForm(emptyTemplateForm);
     setTemplateErrors({});
     setIsCreateTemplateOpen(false);
     setActiveTab("templates");
+
+    setIsTemplateSaving(true);
+    try {
+      const remoteTemplate = await createTemplate({
+        productId: id,
+        projectId: id,
+        templateName: localTemplate.templateName,
+        preview_image: thumb,
+        category: "Other",
+        designData: {
+          templateType: localTemplate.templateType,
+          canvas: localTemplate.canvas,
+          margin: localTemplate.margin,
+          applicableFor: localTemplate.applicableFor,
+        },
+        isGlobal: localTemplate.isPublic,
+        isPublic: localTemplate.isPublic,
+      });
+
+      updateProjectTemplate(localTemplate.id, { remoteId: remoteTemplate._id });
+      console.log('[templates] Template persisted to DB', { _id: remoteTemplate._id });
+    } catch (error) {
+      console.warn("[templates] Failed to persist project template to MongoDB", error);
+    } finally {
+      setIsTemplateSaving(false);
+      refresh();
+    }
   };
 
   const productTotal = products.reduce((s, p) => s + p.quantity * p.unitPrice, 0);
@@ -1261,186 +1413,27 @@ export function ProjectDetail() {
     if (!imageFiles.length || !id) return;
     setBulkImageProcessing(true);
     setBulkImageResults(null);
+    setManualAssign({});
 
     // Read all images as data URLs
     const loaded = await Promise.all(
       imageFiles.map(
         (file) =>
-          new Promise<{ file: File; dataUrl: string }>((resolve) => {
+          new Promise<{ name: string; dataUrl: string }>((resolve) => {
             const r = new FileReader();
-            r.onload = (ev) => resolve({ file, dataUrl: ev.target!.result as string });
+            r.onload = (ev) => resolve({ name: file.name, dataUrl: ev.target!.result as string });
             r.readAsDataURL(file);
           })
       )
     );
 
-    // Normalize a value: lowercase, trim, strip trailing Excel ".0" artifacts (e.g. "145.0" → "145")
-    const normVal = (s: unknown) =>
-      String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "");
+    // Store dataUrls for potential manual assignment later
+    const urlMap = new Map<string, string>();
+    loaded.forEach(({ name, dataUrl }) => urlMap.set(name, dataUrl));
+    bulkImageDataUrlsRef.current = urlMap;
 
-    // Normalize a field key for comparison: lowercase, trim, collapse ALL
-    // separators (underscore, dot, multiple spaces) into a single space.
-    // Effect: "school_code" → "school code", "School Code" → "school code"  ← they now match!
-    const normKey = (k: string) =>
-      k.toLowerCase().trim().replace(/[_.\s]+/g, " ");
-
-    // Find a record field value by trying multiple key spellings.
-    // Matching strategy per key k:
-    //   1. Exact key match (rec[k])
-    //   2. normKey-equal match (unifies underscore/space/case differences)
-    const getField = (rec: ProjectDataRecord, ...keys: string[]): string => {
-      for (const k of keys) {
-        if (rec[k] !== undefined && rec[k] !== null) return normVal(rec[k]);
-        const nk = normKey(k);
-        const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
-        if (entry && entry[1] !== undefined && entry[1] !== null) return normVal(entry[1]);
-      }
-      return "";
-    };
-
-    const getName = (rec: ProjectDataRecord) =>
-      String(rec["Name"] ?? rec["name"] ?? rec["full_name"] ?? rec["Full Name"] ?? rec["Student Name"] ?? rec.id);
-
-    const matched: { userId: string; name: string; filename: string; dataUrl: string }[] = [];
-    const unmatched: { filename: string; reason: string }[] = [];
-    const duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[] = [];
-    const usedUserIds = new Set<string>();
-
-    // Internal fields that are never data-column values
-    const META_KEYS = new Set(["id", "projectId", "category", "photo"]);
-
-    /**
-     * Find matching records using TWO strategies (in order):
-     *
-     * 1. Named-field strategy — looks for well-known school-code and
-     *    roll/admission-number column names. Fast and precise.
-     *
-     * 2. Value-scan fallback — if strategy 1 returns nothing, scan every
-     *    field of every record looking for a record that has BOTH
-     *    fileSchoolCode and fileRollNumber as values in separate columns.
-     *    This is column-name-agnostic and handles any CSV format.
-     */
-    const findMatches = (fileSchoolCode: string, fileRollNumber: string): ProjectDataRecord[] => {
-      // ── Strategy 1: named fields ──────────────────────────────────────────
-      const byName = dataRecords.filter((rec) => {
-        const recSchoolCode = getField(
-          rec,
-          "school_code", "School Code", "schoolCode", "school_id", "School Id",
-          "Sch Code", "sch_code",
-        );
-        const recRoll = getField(
-          rec,
-          "roll_number", "Roll Number", "roll_no", "Roll No",
-          "rollNumber", "rollNo", "Roll_No", "Roll_Number",
-        );
-        const recAdm = getField(
-          rec,
-          "admission_number", "Admission Number", "admission_no", "Admission No",
-          "adm_no", "Adm No", "adm_number", "Adm Number", "Adm. No",
-          "admNo", "admissionNumber", "admissionNo",
-        );
-        const schoolMatch = recSchoolCode === fileSchoolCode;
-        const idMatch =
-          (recRoll !== "" && recRoll === fileRollNumber) ||
-          (recAdm  !== "" && recAdm  === fileRollNumber);
-        return schoolMatch && idMatch;
-      });
-
-      if (byName.length > 0) return byName;
-
-      // ── Strategy 2: value-scan (column-name-agnostic) ────────────────────
-      // For each record, collect data-column values (skip meta keys + long text
-      // like addresses).  A record matches if it has BOTH fileSchoolCode and
-      // fileRollNumber as values in DIFFERENT columns.
-      return dataRecords.filter((rec) => {
-        const values = Object.entries(rec)
-          .filter(([k]) => !META_KEYS.has(k))
-          .map(([, v]) => normVal(v))
-          .filter((v) => v.length > 0 && v.length <= 20); // ignore long text fields
-        const hasSchool = values.includes(fileSchoolCode);
-        const hasRoll   = values.includes(fileRollNumber);
-        return hasSchool && hasRoll && fileSchoolCode !== fileRollNumber;
-      });
-    };
-
-    loaded.forEach(({ file: f, dataUrl }) => {
-      // Strip extension
-      const basename = f.name.replace(/\.[^.]+$/, "");
-      const parts = basename.split("_");
-
-      // Filenames with at least 2 underscore-separated parts are matched using
-      // the format:  <school_code>_<roll_number>_[...rest]
-      // e.g.  145_3_Yash_katiyar.jpg  →  school_code=145, roll_number=3
-      if (parts.length < 2) {
-        unmatched.push({
-          filename: f.name,
-          reason: 'Invalid filename format — must contain underscore separator (e.g. 145_3_Name.jpg)',
-        });
-        return;
-      }
-
-      const fileSchoolCode = normVal(parts[0]);
-      const fileRollNumber = normVal(parts[1]);
-
-      // Both parts must be non-empty to attempt matching
-      if (!fileSchoolCode || !fileRollNumber) {
-        unmatched.push({
-          filename: f.name,
-          reason: 'Could not extract school code or roll number from filename',
-        });
-        return;
-      }
-
-      const hits = findMatches(fileSchoolCode, fileRollNumber);
-
-      if (hits.length === 0) {
-        // Build a debug hint showing the actual field keys in the first record
-        const sampleKeys = dataRecords.length > 0
-          ? Object.keys(dataRecords[0])
-              .filter((k) => !META_KEYS.has(k))
-              .slice(0, 6)
-              .join(", ")
-          : "no records loaded";
-        unmatched.push({
-          filename: f.name,
-          reason: `No match for school_code="${fileSchoolCode}" + id="${fileRollNumber}". ` +
-                  `Available columns: [${sampleKeys}]`,
-        });
-      } else if (hits.length > 1) {
-        const allMatchNames = hits.map(getName);
-        const rec = hits[0];
-        duplicates.push({ filename: f.name, allMatchNames, appliedName: getName(rec) });
-        // Still apply to first match
-        if (!usedUserIds.has(rec.id)) {
-          usedUserIds.add(rec.id);
-          matched.push({
-            userId: rec.id,
-            name: getName(rec),
-            filename: f.name,
-            dataUrl,
-          });
-        }
-      } else {
-        const rec = hits[0];
-        if (usedUserIds.has(rec.id)) {
-          duplicates.push({
-            filename: f.name,
-            allMatchNames: [getName(rec)],
-            appliedName: '(already assigned to another file)',
-          });
-        } else {
-          usedUserIds.add(rec.id);
-          matched.push({
-            userId: rec.id,
-            name: getName(rec),
-            filename: f.name,
-            dataUrl,
-          });
-        }
-      }
-    });
-
-    setBulkImageResults({ matched, unmatched, duplicates });
+    const results = matchImages(loaded, dataRecords as Record<string, unknown>[]);
+    setBulkImageResults(results);
     setBulkImageProcessing(false);
   };
 
@@ -1480,14 +1473,31 @@ export function ProjectDetail() {
   const handleApplyBulkImages = () => {
     if (!id || !bulkImageResults) return;
     const updated = [...dataRecords];
-    bulkImageResults.matched.forEach(({ userId, dataUrl }) => {
-      const i = updated.findIndex((r) => r.id === userId);
+    const urlMap = bulkImageDataUrlsRef.current;
+
+    // Apply auto-matched images (with optional manual override for weak/duplicate matches)
+    bulkImageResults.matched.forEach(({ userId, dataUrl, filename }) => {
+      const targetId = manualAssign[filename] ?? userId;
+      const i = updated.findIndex((r) => r.id === targetId);
       if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
     });
+
+    // Apply manually reassigned unmatched images
+    bulkImageResults.unmatched.forEach(({ filename }) => {
+      const targetId = manualAssign[filename];
+      if (!targetId) return;
+      const dataUrl = urlMap.get(filename);
+      if (!dataUrl) return;
+      const i = updated.findIndex((r) => r.id === targetId);
+      if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
+    });
+
     saveDataRecords(id, dataCategory, updated);
     setDataRecords(updated);
     setIsBulkImageUploadOpen(false);
     setBulkImageResults(null);
+    setManualAssign({});
+    bulkImageDataUrlsRef.current = new Map();
   };
 
   // ── Generate Bar Code (draws Code128-style bars onto a canvas per record) ──
@@ -1610,8 +1620,8 @@ export function ProjectDetail() {
     const templateFromGroup = dataGroups
       .find((group) => selectedRecords.some((record) => record.groupId === group.id) && Boolean(group.templateId))
       ?.templateId;
-    const defaultTemplate = templates.find((template) => template.id === templateFromGroup)
-      || templates[0]
+    const defaultTemplate = previewTemplates.find((template) => template.id === templateFromGroup)
+      || previewTemplates[0]
       || null;
 
     setPreviewForm((prev) => ({
@@ -1633,9 +1643,9 @@ export function ProjectDetail() {
   const handleGeneratePreviewPdf = async () => {
     if (!id) return;
 
-    const selectedTemplate = templates.find((template) => template.id === previewForm.templateId);
+    const selectedTemplate = previewTemplates.find((template) => template.id === previewForm.templateId);
     const selectedTemplateSlug = selectedTemplate ? getTemplateSlugForRender(selectedTemplate) : "";
-    const selectedTemplateDiagnostics = selectedTemplate ? templateDiagnosticsMap[selectedTemplate.id] : undefined;
+    const selectedTemplateDiagnostics = selectedTemplate ? previewTemplateDiagnosticsMap[selectedTemplate.id] : undefined;
     const sheetWidthMm = printLayout.sheetWidthMm;
     const sheetHeightMm = printLayout.sheetHeightMm;
     const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
@@ -2138,7 +2148,9 @@ export function ProjectDetail() {
                 </div>
                 <div className="flex justify-end gap-2 pt-2">
                   <Button variant="outline" onClick={() => setIsCreateTemplateOpen(false)}>Cancel</Button>
-                  <Button onClick={handleCreateTemplate}>Create Template</Button>
+                  <Button onClick={handleCreateTemplate} disabled={isTemplateSaving}>
+                    {isTemplateSaving ? "Saving..." : "Create Template"}
+                  </Button>
                 </div>
               </div>
             </DialogContent>
@@ -2203,7 +2215,7 @@ export function ProjectDetail() {
               <div className="flex items-center justify-between">
                 <CardTitle>Project Templates</CardTitle>
                 <div className="flex gap-2">
-                  <Button size="sm" variant="outline" className="gap-2" onClick={() => templates.length > 0 && setPreviewTemplate(templates[0])} disabled={templates.length === 0}>
+                  <Button size="sm" variant="outline" className="gap-2" onClick={() => previewTemplates.length > 0 && setPreviewTemplate(previewTemplates[0])} disabled={previewTemplates.length === 0}>
                     <Download className="h-4 w-4" />Generate Preview
                   </Button>
                   <Button size="sm" className="gap-2" onClick={() => setIsCreateTemplateOpen(true)}>
@@ -2213,7 +2225,12 @@ export function ProjectDetail() {
               </div>
             </CardHeader>
             <CardContent>
-              {templates.length === 0 ? (
+              {remoteTemplatesLoading && previewTemplates.length === 0 ? (
+                <div className="text-center py-12">
+                  <Loader2 className="h-8 w-8 mx-auto text-muted-foreground mb-3 animate-spin" />
+                  <p className="text-muted-foreground text-sm">Loading templates…</p>
+                </div>
+              ) : previewTemplates.length === 0 ? (
                 <div className="text-center py-12">
                   <Layers className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
                   <p className="text-muted-foreground mb-4">No templates created yet</p>
@@ -2223,7 +2240,7 @@ export function ProjectDetail() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {templates.map((tmpl) => {
+                  {previewTemplates.map((tmpl) => {
                     const previewDiagnostics = templateDiagnosticsMap[tmpl.id];
                     const canRenderCardImage = Boolean(
                       tmpl.thumbnail
@@ -2250,11 +2267,19 @@ export function ProjectDetail() {
                               className="max-h-full max-w-full object-contain rounded shadow"
                               onError={() => markTemplatePreviewBroken(tmpl.id)}
                             />
+                          ) : tmpl.thumbnail && !brokenTemplatePreviewIds[tmpl.id] ? (
+                            // Show preview image even when canvasJSON is absent (remote template with stored preview)
+                            <img
+                              src={tmpl.thumbnail}
+                              alt={tmpl.templateName}
+                              className="max-h-full max-w-full object-contain rounded shadow"
+                              onError={() => markTemplatePreviewBroken(tmpl.id)}
+                            />
                           ) : (
                             <div className="h-full w-full bg-muted/20 flex flex-col items-center justify-center gap-1.5 px-3 text-center">
                               <Layers className="h-5 w-5 text-muted-foreground" />
                               <p className="text-[11px] text-muted-foreground leading-snug">
-                                {previewDiagnostics?.fallbackMessage || "Preview image unavailable for this template."}
+                                {previewDiagnostics?.fallbackMessage || "Open in designer to generate a preview."}
                               </p>
                             </div>
                           )}
@@ -2275,9 +2300,9 @@ export function ProjectDetail() {
                               </Badge>
                             )}
                           </div>
-                          {!previewDiagnostics?.hasDesignElements && (
+                          {!previewDiagnostics?.hasDesignElements && !tmpl.thumbnail && (
                             <p className="text-[11px] text-destructive mt-1">
-                              No preview available. Please configure the template.
+                              No preview available. Open in designer to configure.
                             </p>
                           )}
                           {Boolean(previewDiagnostics?.missingFieldKeys.length) && (
@@ -2312,10 +2337,33 @@ export function ProjectDetail() {
                                     canvas: tmpl.canvas,
                                     margin: normalizedMargin,
                                   };
+                                  // Sync remote-only templates to localStorage so the designer can load them
+                                  const existingLocal = id ? loadProjectTemplates(id).find(
+                                    (t) => t.id === tmpl.id || t.remoteId === tmpl.id
+                                  ) : undefined;
+                                  let localTemplateId = tmpl.id;
+                                  if (!existingLocal && id) {
+                                    const synced = addProjectTemplate({
+                                      projectId: id,
+                                      clientId: currentClientId,
+                                      templateName: tmpl.templateName,
+                                      templateType: tmpl.templateType,
+                                      canvas: tmpl.canvas,
+                                      margin: normalizedMargin,
+                                      applicableFor: tmpl.applicableFor,
+                                      canvasJSON: tmpl.canvasJSON,
+                                      thumbnail: tmpl.thumbnail,
+                                      isPublic: tmpl.isPublic ?? false,
+                                      remoteId: tmpl.id,
+                                    });
+                                    localTemplateId = synced.id;
+                                  } else if (existingLocal) {
+                                    localTemplateId = existingLocal.id;
+                                  }
                                   localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
                                   localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
                                     projectId: project.id,
-                                    templateId: tmpl.id,
+                                    templateId: localTemplateId,
                                     projectName: project.name,
                                     templateName: tmpl.templateName,
                                   }));
@@ -3247,7 +3295,7 @@ export function ProjectDetail() {
                     <Select
                       value={previewForm.templateId || "__none__"}
                       onValueChange={(value) => {
-                        const selectedTemplate = templates.find((template) => template.id === value);
+                        const selectedTemplate = previewTemplates.find((template) => template.id === value);
                         setPreviewForm((prev) => ({
                           ...prev,
                           templateId: value === "__none__" ? "" : value,
@@ -3260,13 +3308,41 @@ export function ProjectDetail() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="__none__">Select a template</SelectItem>
-                        {templates.map((template) => (
-                          <SelectItem key={template.id} value={template.id}>
-                            {template.templateName}
-                          </SelectItem>
-                        ))}
+                        {remoteTemplatesLoading ? (
+                          <div className="px-2 py-1 text-xs text-muted-foreground">Loading templates...</div>
+                        ) : previewTemplates.length === 0 ? (
+                          <div className="px-2 py-1 text-xs text-muted-foreground">No templates available.</div>
+                        ) : (
+                          <>
+                            {previewTemplateGroups.projectTemplates.length > 0 && (
+                              <div className="px-2 py-1 text-xs text-muted-foreground">Project Templates</div>
+                            )}
+                            {previewTemplateGroups.projectTemplates.map((template) => (
+                              <SelectItem key={template.id} value={template.id}>
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="truncate">{template.templateName}</span>
+                                  <Badge variant="outline" className="text-[10px]">Project</Badge>
+                                </div>
+                              </SelectItem>
+                            ))}
+                            {previewTemplateGroups.globalTemplates.length > 0 && (
+                              <div className="px-2 py-1 text-xs text-muted-foreground">Public Templates</div>
+                            )}
+                            {previewTemplateGroups.globalTemplates.map((template) => (
+                              <SelectItem key={template.id} value={template.id}>
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="truncate">{template.templateName}</span>
+                                  <Badge variant="secondary" className="text-[10px]">Global</Badge>
+                                </div>
+                              </SelectItem>
+                            ))}
+                          </>
+                        )}
                       </SelectContent>
                     </Select>
+                    {remoteTemplatesError ? (
+                      <p className="text-xs text-destructive">{remoteTemplatesError}</p>
+                    ) : null}
                   </div>
 
                   <div className="sm:col-span-2 space-y-1.5">
@@ -3507,7 +3583,7 @@ export function ProjectDetail() {
           </Dialog>
 
           {/* ── Bulk Image Upload Dialog ── */}
-          <Dialog open={isBulkImageUploadOpen} onOpenChange={(o) => { setIsBulkImageUploadOpen(o); if (!o) setBulkImageResults(null); }}>
+          <Dialog open={isBulkImageUploadOpen} onOpenChange={(o) => { setIsBulkImageUploadOpen(o); if (!o) { setBulkImageResults(null); setManualAssign({}); } }}>
             <DialogContent className="sm:max-w-[500px] max-h-[85vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle className="flex items-center gap-2">
@@ -3559,13 +3635,40 @@ export function ProjectDetail() {
                         <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
                       </summary>
                       {bulkImageResults.matched.length > 0 && (
-                        <ul className="text-xs text-green-700 space-y-0.5 max-h-36 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
-                          {bulkImageResults.matched.map((m) => (
-                            <li key={m.userId} className="flex gap-1.5 items-center">
-                              <img src={m.dataUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
-                              <span className="truncate">{m.filename} → <strong>{m.name}</strong></span>
-                            </li>
-                          ))}
+                        <ul className="text-xs text-green-700 space-y-1 max-h-48 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
+                          {bulkImageResults.matched.map((m) => {
+                            const weak = m.confidenceScore < 80;
+                            return (
+                              <li key={m.userId + m.filename} className={`flex gap-1.5 items-center rounded px-1 py-0.5 ${weak ? 'bg-amber-50 border border-amber-200' : ''}`}>
+                                <img src={m.dataUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
+                                <span className="truncate flex-1">{m.filename} → <strong>{m.name}</strong></span>
+                                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
+                                  m.confidenceScore >= 95 ? 'bg-green-200 text-green-800' :
+                                  m.confidenceScore >= 80 ? 'bg-blue-100 text-blue-700' :
+                                  'bg-amber-200 text-amber-800'
+                                }`}>
+                                  {m.confidenceScore}%
+                                </span>
+                                {weak && (
+                                  <Select
+                                    value={manualAssign[m.filename] ?? m.userId}
+                                    onValueChange={(v) => setManualAssign((prev) => ({ ...prev, [m.filename]: v }))}
+                                  >
+                                    <SelectTrigger className="h-5 text-[10px] w-32 shrink-0 border-amber-300 bg-white">
+                                      <SelectValue placeholder="Reassign…" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      {dataRecords.map((rec) => (
+                                        <SelectItem key={rec.id} value={rec.id} className="text-xs">
+                                          {String(rec['Name'] ?? rec['name'] ?? rec['full_name'] ?? rec['Full Name'] ?? rec.id)}
+                                        </SelectItem>
+                                      ))}
+                                    </SelectContent>
+                                  </Select>
+                                )}
+                              </li>
+                            );
+                          })}
                         </ul>
                       )}
                     </details>
@@ -3575,24 +3678,44 @@ export function ProjectDetail() {
                       <details className="rounded-lg border border-amber-200 bg-amber-50 overflow-hidden">
                         <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-amber-800 [list-style:none] [&::-webkit-details-marker]:hidden">
                           <AlertTriangle className="h-4 w-4 shrink-0" />
-                          <span>{bulkImageResults.duplicates.length} duplicate match{bulkImageResults.duplicates.length !== 1 ? 'es' : ''}</span>
-                          <span className="text-xs font-normal ml-1 opacity-60">(applied to first)</span>
+                          <span>{bulkImageResults.duplicates.length} ambiguous match{bulkImageResults.duplicates.length !== 1 ? 'es' : ''}</span>
+                          <span className="text-xs font-normal ml-1 opacity-60">(best applied — please verify)</span>
                           <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
                         </summary>
                         <ul className="text-xs space-y-3 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-amber-200">
                           {bulkImageResults.duplicates.map((d, i) => (
                             <li key={i}>
-                              <p className="font-semibold text-amber-900 truncate mb-1">📄 {d.filename}</p>
-                              <ul className="pl-3 space-y-0.5">
-                                {d.allMatchNames.map((name, ni) => (
+                              <p className="font-semibold text-amber-900 truncate mb-0.5">📄 {d.filename}</p>
+                              <p className="text-[10px] text-amber-700 mb-1.5 opacity-80">{d.reason}</p>
+                              <ul className="pl-3 space-y-0.5 mb-1.5">
+                                {d.allMatches.map((m, ni) => (
                                   <li key={ni} className="flex items-center gap-1.5 text-amber-800">
-                                    <span className={ni === 0 ? 'font-semibold' : 'opacity-60'}>{ni + 1}. {name}</span>
+                                    <span className={ni === 0 ? 'font-semibold' : 'opacity-60'}>{ni + 1}. {m.name}</span>
+                                    <span className="text-[10px] px-1 rounded bg-amber-100">{m.score}%</span>
                                     {ni === 0 && (
                                       <span className="text-[10px] font-bold bg-amber-300 text-amber-900 px-1.5 py-0.5 rounded">APPLIED</span>
                                     )}
                                   </li>
                                 ))}
                               </ul>
+                              {/* Reassign dropdown */}
+                              <div className="pl-3">
+                                <Select
+                                  value={manualAssign[d.filename] ?? d.appliedUserId}
+                                  onValueChange={(v) => setManualAssign((prev) => ({ ...prev, [d.filename]: v }))}
+                                >
+                                  <SelectTrigger className="h-6 text-[11px] w-full border-amber-300 bg-white">
+                                    <SelectValue placeholder="Reassign to different student…" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {d.allMatches.map((m) => (
+                                      <SelectItem key={m.userId} value={m.userId} className="text-xs">
+                                        {m.name} ({m.score}%)
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
                             </li>
                           ))}
                         </ul>
@@ -3609,9 +3732,26 @@ export function ProjectDetail() {
                         </summary>
                         <ul className="text-xs space-y-2 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-muted">
                           {bulkImageResults.unmatched.map((u, i) => (
-                            <li key={i}>
+                            <li key={i} className="space-y-1">
                               <p className="font-medium text-foreground/80 truncate">📄 {u.filename}</p>
                               <p className="text-[11px] pl-3 text-muted-foreground mt-0.5">↳ {u.reason}</p>
+                              <div className="pl-3">
+                                <Select
+                                  value={manualAssign[u.filename] ?? ''}
+                                  onValueChange={(v) => setManualAssign((prev) => ({ ...prev, [u.filename]: v }))}
+                                >
+                                  <SelectTrigger className="h-6 text-[11px] w-full border-dashed">
+                                    <SelectValue placeholder="Manually assign to student…" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {dataRecords.map((rec) => (
+                                      <SelectItem key={rec.id} value={rec.id} className="text-xs">
+                                        {String(rec['Name'] ?? rec['name'] ?? rec['full_name'] ?? rec['Full Name'] ?? rec.id)}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
                             </li>
                           ))}
                         </ul>
@@ -3623,15 +3763,15 @@ export function ProjectDetail() {
               </div>
 
               <div className="flex gap-3 pt-2">
-                <Button variant="outline" className="flex-1" onClick={() => { setIsBulkImageUploadOpen(false); setBulkImageResults(null); }}>
+                <Button variant="outline" className="flex-1" onClick={() => { setIsBulkImageUploadOpen(false); setBulkImageResults(null); setManualAssign({}); }}>
                   Cancel
                 </Button>
                 <Button
                   className="flex-1"
-                  disabled={!bulkImageResults || bulkImageResults.matched.length === 0 || bulkImageProcessing}
+                  disabled={!bulkImageResults || (bulkImageResults.matched.length === 0 && Object.keys(manualAssign).length === 0) || bulkImageProcessing}
                   onClick={handleApplyBulkImages}
                 >
-                  Apply {bulkImageResults?.matched.length ? `(${bulkImageResults.matched.length})` : ""} Images
+                  Apply {bulkImageResults ? `(${bulkImageResults.matched.length + Object.values(manualAssign).filter(Boolean).length})` : ""} Images
                 </Button>
               </div>
             </DialogContent>

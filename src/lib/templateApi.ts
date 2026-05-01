@@ -3,7 +3,9 @@ import { API_BASE as API_ROOT, resolveProfileImageUrl } from './apiService';
 export interface TemplateRecord {
   _id: string;
   productId: string;
+  projectId?: string;
   createdBy?: string;
+  isGlobal?: boolean;
   templateName: string;
   description?: string;
   category: 'Business' | 'Wedding' | 'Minimal' | 'Corporate' | 'Festival' | 'Other';
@@ -35,6 +37,7 @@ export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_i
 
 type TemplateSaveInput = {
   productId: string;
+  projectId?: string;
   templateName: string;
   userId?: string;
   description?: string;
@@ -45,6 +48,8 @@ type TemplateSaveInput = {
   isActive?: boolean;
   preview_image?: string;
   previewCanvas?: HTMLCanvasElement;
+  isGlobal?: boolean;
+  isPublic?: boolean;
 };
 
 type TemplateUploadInput = {
@@ -131,8 +136,8 @@ export async function createTemplate(input: TemplateSaveInput): Promise<Template
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       ...input,
-      preview_image: preview,
-      previewImageUrl: preview,
+      preview_image: preview || '',
+      previewImageUrl: preview || '',
     }),
   });
 

@@ -55,6 +55,7 @@ import {
   updateProjectTemplate, type Project,
 } from "../../lib/projectStore";
 import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
+import { createTemplate, updateTemplate } from "../../lib/templateApi";
 import { normalizeShapePreviewSvg, type ShapeItem } from "../../lib/shapesGallery";
 
 // --- Types --------------------------------------------------------------------
@@ -69,6 +70,11 @@ type ToolId =
 
 const EMPTY_CANVAS_JSON = { objects: [] as object[] };
 const DESIGNER_IMPORT_MODE_KEY = "vendor_designer_import_mode";
+const MONGO_ID_REGEX = /^[a-f\d]{24}$/i;
+
+function isMongoId(value?: string | null): boolean {
+  return Boolean(value && MONGO_ID_REGEX.test(value));
+}
 
 function resolveTemplateMargin(rawTemplate: any, fallback: TemplateConfig["margin"]): TemplateConfig["margin"] {
   const rawMargin = rawTemplate?.margin ?? {};
@@ -1191,7 +1197,7 @@ export function DesignerStudio() {
     }
 
     if (designerContext) {
-      saveToProject(designerContext.projectId, designerContext.templateId, config.templateName);
+      void saveToProject(designerContext.projectId, designerContext.templateId, config.templateName);
     } else {
       setSaveTemplateName(config.templateName || "");
       setSaveProjectId(projects.length > 0 ? projects[0].id : "");
@@ -1199,7 +1205,7 @@ export function DesignerStudio() {
     }
   };
 
-  const saveToProject = (projectId: string, existingId: string | null, tName: string) => {
+  const saveToProject = async (projectId: string, existingId: string | null, tName: string) => {
     if (!projectId) { toast.error("Please select a project"); return; }
     const name    = tName.trim() || config.templateName || "Untitled Template";
     const snap    = buildPagesSnapshot();
@@ -1218,7 +1224,17 @@ export function DesignerStudio() {
       isPublic: saveIsPublic,
       canJSON,
     });
-    const thumb   = canvasRef.current?.toPNG() ?? undefined;
+    // toPNG can throw if cross-origin images taint the canvas — fall back to empty string
+    let thumb: string | undefined;
+    try { thumb = canvasRef.current?.toPNG() ?? undefined; } catch { thumb = undefined; }
+    const proj    = projects.find((p) => p.id === projectId);
+    const designData = {
+      templateType: config.templateType,
+      canvas: config.canvas,
+      margin: config.margin,
+      applicableFor: proj?.name ?? "",
+      canvasJSON: canJSON,
+    };
     setIsSaving(true);
     try {
       const hasExisting = Boolean(existingId) && loadProjectTemplates(projectId).some((t) => t.id === existingId);
@@ -1228,15 +1244,63 @@ export function DesignerStudio() {
           canvas: config.canvas, margin: config.margin,
           canvasJSON: canJSON, thumbnail: thumb, isPublic: saveIsPublic,
         });
+
+        const existingTemplate = loadProjectTemplates(projectId).find((t) => t.id === existingId);
+        const remoteId = existingTemplate?.remoteId;
+        try {
+          if (isMongoId(remoteId) || isMongoId(existingId)) {
+            await updateTemplate((remoteId && isMongoId(remoteId)) ? remoteId : existingId, {
+              productId: projectId,
+              projectId,
+              templateName: name,
+              preview_image: thumb || '',
+              designData,
+              isGlobal: saveIsPublic,
+              isPublic: saveIsPublic,
+            });
+          } else {
+            const created = await createTemplate({
+              productId: projectId,
+              projectId,
+              templateName: name,
+              preview_image: thumb || '',
+              category: "Other",
+              designData,
+              isGlobal: saveIsPublic,
+              isPublic: saveIsPublic,
+            });
+            updateProjectTemplate(existingId, { remoteId: created._id });
+          }
+        } catch (error) {
+          console.warn("[designer] Failed to persist template to MongoDB", error);
+          toast.warning("Template updated locally. MongoDB save failed.");
+        }
+
         lastPersistedHashRef.current = persistHash;
         toast.success(`Template "${name}" updated`);
       } else {
-        const proj = projects.find((p) => p.id === projectId);
-        addProjectTemplate({
+        const savedLocal = addProjectTemplate({
           projectId, templateName: name, templateType: config.templateType,
           canvas: config.canvas, margin: config.margin, applicableFor: proj?.name ?? "",
           canvasJSON: canJSON, thumbnail: thumb, isPublic: saveIsPublic,
         });
+        try {
+          const created = await createTemplate({
+            productId: projectId,
+            projectId,
+            templateName: name,
+            preview_image: thumb || '',
+            category: "Other",
+            designData,
+            isGlobal: saveIsPublic,
+            isPublic: saveIsPublic,
+          });
+          updateProjectTemplate(savedLocal.id, { remoteId: created._id });
+          console.log('[designer] Template saved to MongoDB', { _id: created._id, projectId, templateName: name });
+        } catch (error) {
+          console.warn("[designer] Failed to persist template to MongoDB", error);
+          toast.warning("Template saved locally. MongoDB save failed.");
+        }
         const saved = loadProjectTemplates(projectId).at(-1);
         if (saved) {
           const ctx: DesignerContext = {
@@ -2287,7 +2351,7 @@ export function DesignerStudio() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setSaveDialogOpen(false)} disabled={isSaving}>Cancel</Button>
             <Button
-              onClick={() => saveToProject(saveProjectId, null, saveTemplateName)}
+              onClick={() => void saveToProject(saveProjectId, null, saveTemplateName)}
               disabled={isSaving || !saveProjectId}
             >
               {isSaving ? "Saving�" : "Save Template"}

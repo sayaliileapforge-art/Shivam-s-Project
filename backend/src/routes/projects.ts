@@ -1,8 +1,29 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import Project from '../models/Project';
+import ProductTemplate from '../models/ProductTemplate';
 
 const router = Router();
+
+// Get templates for a specific project (matches both projectId string field and legacy productId ObjectId field)
+router.get('/:id/templates', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      res.status(400).json({ success: false, error: 'Invalid project id' });
+      return;
+    }
+    const conditions: Record<string, any>[] = [
+      { projectId: id },
+      { productId: new mongoose.Types.ObjectId(id) },
+    ];
+    const templates = await ProductTemplate.find({ $or: conditions }).sort({ updatedAt: -1 });
+    console.log(`[Projects] GET /${id}/templates — found ${templates.length} templates`);
+    res.json({ success: true, data: templates });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
 
 // Get all projects (optionally filtered by clientId)
 router.get('/', async (req: Request, res: Response) => {
