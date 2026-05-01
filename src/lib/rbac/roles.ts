@@ -78,6 +78,7 @@ export const ROLE_DEFINITIONS: Record<Role, RoleDefinition> = {
       Permission.DATA__UPLOAD_PHOTOS,
       Permission.DATA__AUTO_MATCH_PHOTOS,
       Permission.DATA__EDIT_RECORDS,
+      Permission.PROJECTS__DELETE,
     ],
   },
 

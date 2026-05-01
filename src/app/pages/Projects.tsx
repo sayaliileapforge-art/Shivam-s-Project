@@ -16,9 +16,9 @@ import {
   Edit,
   Trash2,
   Calendar,
-  User,
   FolderKanban,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -52,6 +52,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../components/ui/select";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "../components/ui/alert-dialog";
 import { Can } from "../../lib/rbac";
 import { Permission } from "../../lib/rbac";
 import {
@@ -126,11 +136,11 @@ const mapApiProjectToUi = (p: any): Project => {
 interface ProjectCardProps {
   project: Project;
   clientUniqueId: string;
-  onDelete: (id: string) => void;
+  onDeleteRequest: (id: string, name: string) => void;
   onEdit: (project: Project) => void;
 }
 
-const ProjectCard = ({ project, clientUniqueId, onDelete, onEdit }: ProjectCardProps) => {
+const ProjectCard = ({ project, clientUniqueId, onDeleteRequest, onEdit }: ProjectCardProps) => {
   const [{ isDragging }, drag] = useDrag(() => ({
     type: "PROJECT",
     item: { id: project.id, stage: project.stage },
@@ -142,7 +152,7 @@ const ProjectCard = ({ project, clientUniqueId, onDelete, onEdit }: ProjectCardP
       ref={(node) => {
         drag(node);
       }}
-      className={`bg-white rounded-lg border shadow-sm p-4 cursor-move hover:shadow-md transition-shadow ${
+      className={`bg-white rounded-lg border shadow-sm p-4 cursor-move hover:shadow-md transition-shadow overflow-hidden ${
         isDragging ? "opacity-50" : ""
       }`}
     >
@@ -178,14 +188,14 @@ const ProjectCard = ({ project, clientUniqueId, onDelete, onEdit }: ProjectCardP
                 Edit Project
               </DropdownMenuItem>
             </Can>
-            <Can permission={Permission.PROJECTS__OVERRIDE_STAGE}>
+            <Can permission={Permission.PROJECTS__DELETE}>
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                className="text-destructive"
-                onClick={() => onDelete(project.id)}
+                className="text-destructive focus:text-destructive"
+                onClick={() => onDeleteRequest(project.id, project.client)}
               >
                 <Trash2 className="h-4 w-4 mr-2" />
-                Delete
+                Delete Project
               </DropdownMenuItem>
             </Can>
           </DropdownMenuContent>
@@ -233,11 +243,11 @@ interface KanbanColumnProps {
   projects: Project[];
   resolveClientUniqueId: (project: Project) => string;
   onDrop: (id: string, stage: string) => void;
-  onDelete: (id: string) => void;
+  onDeleteRequest: (id: string, name: string) => void;
   onEdit: (project: Project) => void;
 }
 
-const KanbanColumn = ({ stage, projects, resolveClientUniqueId, onDrop, onDelete, onEdit }: KanbanColumnProps) => {
+const KanbanColumn = ({ stage, projects, resolveClientUniqueId, onDrop, onDeleteRequest, onEdit }: KanbanColumnProps) => {
   const [{ isOver }, drop] = useDrop(() => ({
     accept: "PROJECT",
     drop: (item: { id: string; stage: string }) => {
@@ -255,7 +265,7 @@ const KanbanColumn = ({ stage, projects, resolveClientUniqueId, onDrop, onDelete
       ref={(node) => {
         drop(node);
       }}
-      className={`flex-shrink-0 w-80 rounded-lg border-2 ${stage.color} ${
+      className={`flex-shrink-0 w-[300px] rounded-lg border-2 ${stage.color} ${
         isOver ? "ring-2 ring-secondary" : ""
       }`}
     >
@@ -268,13 +278,13 @@ const KanbanColumn = ({ stage, projects, resolveClientUniqueId, onDrop, onDelete
         </div>
       </div>
       <ScrollArea className="h-[calc(100vh-300px)]">
-        <div className="p-4 space-y-3">
+        <div className="p-4 space-y-3 w-full">
           {stageProjects.map((project) => (
             <ProjectCard
               key={project.id}
               project={project}
               clientUniqueId={resolveClientUniqueId(project)}
-              onDelete={onDelete}
+              onDeleteRequest={onDeleteRequest}
               onEdit={onEdit}
             />
           ))}
@@ -300,6 +310,8 @@ export function Projects() {
   const [editForm, setEditForm] = useState(emptyForm);
   const [editErrors, setEditErrors] = useState<Partial<typeof emptyForm>>({});
   const [version, setVersion] = useState(0);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -495,10 +507,26 @@ export function Projects() {
     }
   };
 
-  const handleDelete = async (id: string) => {
-    const ok = await apiDeleteProject(id);
-    if (ok) {
-      setVersion((v) => v + 1);
+  const handleDeleteRequest = (id: string, name: string) => {
+    setDeleteTarget({ id, name });
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setIsDeleting(true);
+    try {
+      const ok = await apiDeleteProject(deleteTarget.id);
+      if (ok) {
+        setAllProjects((prev) => prev.filter((p) => p.id !== deleteTarget.id));
+        toast.success(`"${deleteTarget.name}" deleted successfully`);
+      } else {
+        toast.error("Failed to delete project. Please try again.");
+      }
+    } catch {
+      toast.error("An unexpected error occurred while deleting.");
+    } finally {
+      setIsDeleting(false);
+      setDeleteTarget(null);
     }
   };
 
@@ -835,8 +863,8 @@ export function Projects() {
         <DndProvider backend={HTML5Backend}>
           <Card className="shadow-md">
             <CardContent className="p-4">
-              <ScrollArea className="w-full whitespace-nowrap">
-                <div className="flex gap-4 pb-4">
+              <ScrollArea className="w-full">
+                <div className="flex gap-4 pb-4 min-w-max">
                   {stages.map((stage) => (
                     <KanbanColumn
                       key={stage.id}
@@ -844,7 +872,7 @@ export function Projects() {
                       projects={filtered}
                       resolveClientUniqueId={resolveClientUniqueId}
                       onDrop={handleDrop}
-                      onDelete={handleDelete}
+                      onDeleteRequest={handleDeleteRequest}
                       onEdit={handleEditOpen}
                     />
                   ))}
@@ -891,6 +919,31 @@ export function Projects() {
           </CardContent>
         </Card>
       )}
+
+      {/* Delete Confirmation Dialog */}
+      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => { if (!open && !isDeleting) setDeleteTarget(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete{" "}
+              <span className="font-semibold text-foreground">"{deleteTarget?.name}"</span>{" "}
+              and all associated templates, student data, and files.
+              This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={isDeleting}
+              onClick={handleConfirmDelete}
+            >
+              {isDeleting ? "Deleting..." : "Delete Project"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

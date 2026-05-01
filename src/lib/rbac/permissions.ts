@@ -28,6 +28,7 @@ export const Permission = {
   PROJECTS__VIEW_ALL: "projects:view_all",
   PROJECTS__VIEW_ASSIGNED: "projects:view_assigned",
   PROJECTS__CREATE: "projects:create",
+  PROJECTS__DELETE: "projects:delete",
   PROJECTS__OVERRIDE_STAGE: "projects:override_stage",
 
   // ── Leads & Quotes ─────────────────────────────────────────────

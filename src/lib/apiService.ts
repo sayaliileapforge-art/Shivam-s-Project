@@ -158,7 +158,12 @@ export async function updateProject(id: string, data: Record<string, any>) {
 
 export async function deleteProject(id: string) {
   try {
-    await fetch(`${API_BASE}/projects/${id}`, { method: 'DELETE' });
+    const response = await fetch(`${API_BASE}/projects/${id}`, { method: 'DELETE' });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({})) as { error?: string };
+      console.error('Delete project failed:', body.error ?? response.statusText);
+      return false;
+    }
     return true;
   } catch (error) {
     console.error('Delete project failed:', error);

@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import Project from '../models/Project';
 import ProductTemplate from '../models/ProductTemplate';
+import DataRecord from '../models/DataRecord';
 
 const router = Router();
 
@@ -88,15 +89,35 @@ router.put('/:id', async (req: Request, res: Response) => {
   }
 });
 
-// Delete project
+// Delete project (cascades to templates and data records)
 router.delete('/:id', async (req: Request, res: Response) => {
   try {
-    const project = await Project.findByIdAndDelete(req.params.id);
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      res.status(400).json({ success: false, error: 'Invalid project id' });
+      return;
+    }
+
+    const project = await Project.findById(id);
     if (!project) {
       res.status(404).json({ success: false, error: 'Project not found' });
       return;
     }
-    res.json({ success: true, message: 'Project deleted' });
+
+    const objectId = new mongoose.Types.ObjectId(id);
+
+    // Delete all related data in parallel
+    await Promise.all([
+      DataRecord.deleteMany({ projectId: objectId }),
+      ProductTemplate.deleteMany({
+        $or: [{ projectId: id }, { productId: objectId }],
+      }),
+    ]);
+
+    await project.deleteOne();
+
+    console.log(`[Projects] DELETE /${id} — project and related data deleted`);
+    res.json({ success: true, message: 'Project and all related data deleted' });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });
   }
