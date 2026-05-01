@@ -236,6 +236,48 @@ export interface ProjectTemplate {
 
 const TMPL_KEY = "vendor_project_templates";
 
+/**
+ * Strip heavy fields before persisting to localStorage to avoid QuotaExceededError.
+ * canvasJSON can be several MB; thumbnail is a base64 PNG.
+ * Both are persisted to MongoDB via remoteId, so they are safe to omit locally.
+ */
+function stripHeavyFields(t: ProjectTemplate): ProjectTemplate {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { canvasJSON: _c, thumbnail: _t, ...rest } = t;
+  return rest as ProjectTemplate;
+}
+
+/**
+ * Attempt to write templates to localStorage.
+ * Falls back to stripping thumbnails if quota is exceeded.
+ * Silently skips the write if still over quota (app remains functional via MongoDB).
+ */
+function saveTemplatesLocalStorage(items: ProjectTemplate[]): void {
+  const tryWrite = (data: ProjectTemplate[]) => {
+    localStorage.setItem(TMPL_KEY, JSON.stringify(data));
+  };
+  try {
+    tryWrite(items);
+  } catch (e: unknown) {
+    const isQuota =
+      e instanceof DOMException &&
+      (e.name === "QuotaExceededError" || e.name === "NS_ERROR_DOM_QUOTA_REACHED");
+    if (!isQuota) throw e;
+    // Retry without thumbnails only
+    try {
+      tryWrite(items.map((t) => { const { thumbnail: _t, ...rest } = t; return rest as ProjectTemplate; }));
+    } catch {
+      // Still over quota – strip canvasJSON too and try one last time
+      try {
+        tryWrite(items.map(stripHeavyFields));
+      } catch {
+        // Give up silently; MongoDB is the source of truth
+        console.warn("[projectStore] localStorage quota exceeded – template metadata not cached locally.");
+      }
+    }
+  }
+}
+
 export function loadAllProjectTemplates(): ProjectTemplate[] {
   try {
     const raw = localStorage.getItem(TMPL_KEY);
@@ -297,20 +339,20 @@ export function addProjectTemplate(data: Omit<ProjectTemplate, "id" | "createdAt
     id: `TMPL-${Date.now()}`,
     createdAt: new Date().toLocaleDateString("en-IN"),
   };
-  localStorage.setItem(TMPL_KEY, JSON.stringify([...all, item]));
+  saveTemplatesLocalStorage([...all, item]);
   return item;
 }
 
 export function updateProjectTemplate(id: string, data: Partial<Omit<ProjectTemplate, "id" | "createdAt">>): void {
   const raw = localStorage.getItem(TMPL_KEY);
   const all: ProjectTemplate[] = raw ? JSON.parse(raw) : [];
-  localStorage.setItem(TMPL_KEY, JSON.stringify(all.map((t) => t.id === id ? { ...t, ...data } : t)));
+  saveTemplatesLocalStorage(all.map((t) => t.id === id ? { ...t, ...data } : t));
 }
 
 export function deleteProjectTemplate(id: string): void {
   const raw = localStorage.getItem(TMPL_KEY);
   const all: ProjectTemplate[] = raw ? JSON.parse(raw) : [];
-  localStorage.setItem(TMPL_KEY, JSON.stringify(all.filter((t) => t.id !== id)));
+  saveTemplatesLocalStorage(all.filter((t) => t.id !== id));
 }
 
 // ─── Project Data Records ────────────────────────────────────────────────────
