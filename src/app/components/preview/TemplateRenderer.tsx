@@ -1,7 +1,49 @@
-import { CSSProperties, ReactNode } from "react";
+import { CSSProperties, ReactNode, useEffect, useMemo, useState } from "react";
 import { resolveProfileImageUrl } from "../../../lib/apiService";
 import { type ProjectDataRecord, type ProjectTemplate } from "../../../lib/projectStore";
 import "./id-card.css";
+
+/** Convert any absolute upload URL to a relative /uploads/ proxy path.
+ *  The Vite dev-server proxy routes /uploads/* → http://72.62.241.170 (Hostinger)
+ *  where all uploaded files are stored. This avoids CORS issues and ensures
+ *  both <img> rendering and html2canvas fetch pre-loading work correctly.
+ */
+function normalizeUploadUrl(url: string): string {
+  if (!url) return url;
+  // Strip any absolute origin from upload paths → relative /uploads/ proxy
+  if (/^https?:\/\/[^\/]+\/uploads\//i.test(url)) {
+    return url.replace(/^https?:\/\/[^\/]+\/uploads\//i, '/uploads/');
+  }
+  return url;
+}
+
+const GRID_PAGE_SIZE = 6;
+
+// ── Module-level template data cache ─────────────────────────────────────────
+// Keyed by templateId + canvasJSON byte-length so the same template is parsed
+// at most ONCE per browser session regardless of how many cards are rendered.
+interface CachedTemplateData {
+  config: ResolvedTemplateConfig;
+  dynamicTexts: DynamicTextObject[];
+}
+const _tmplCache = new Map<string, CachedTemplateData>();
+
+function getTemplateCached(template: ProjectTemplate): CachedTemplateData {
+  const key = `${template.id}:${template.canvasJSON?.length ?? 0}:${template.thumbnail ? template.thumbnail.slice(0, 16) : ""}`;
+  const hit = _tmplCache.get(key);
+  if (hit) return hit;
+  const result: CachedTemplateData = {
+    config: resolveTemplateConfig(template),
+    dynamicTexts: extractDynamicTextObjects(template),
+  };
+  if (_tmplCache.size >= 30) {
+    // Evict oldest entry to keep memory bounded
+    const firstKey = _tmplCache.keys().next().value;
+    if (firstKey !== undefined) _tmplCache.delete(firstKey);
+  }
+  _tmplCache.set(key, result);
+  return result;
+}
 
 export type SupportedTemplateSlug = "template_1" | "template_2" | "template_3";
 
@@ -141,10 +183,122 @@ function getRecordField(record: ProjectDataRecord, fieldName: TemplateFieldName)
 
 function resolveStudentPhotoUrl(record: ProjectDataRecord): string {
   const photoRaw = getRecordField(record, "photo");
-  const normalized = resolveProfileImageUrl(photoRaw);
-  if (!normalized) return FALLBACK_AVATAR;
-  const isAllowed = /^(data:image\/|blob:|https?:\/\/|\/uploads\/|uploads\/|\/)/i.test(normalized);
+  const resolved = resolveProfileImageUrl(photoRaw);
+  if (!resolved) return FALLBACK_AVATAR;
+  // Convert absolute URLs to relative proxy paths so html2canvas never makes
+  // cross-origin requests and the Vite proxy routes to the correct server.
+  const normalized = normalizeUploadUrl(resolved);
+  const isAllowed = /^(data:image\/|blob:|\/backend-uploads\/|\/uploads\/|uploads\/|\/)/i.test(normalized);
   return isAllowed ? normalized : FALLBACK_AVATAR;
+}
+
+/** Returns true if the record has a real (non-fallback) photo URL. */
+export function studentHasPhoto(record: ProjectDataRecord): boolean {
+  const photoRaw = getRecordField(record, "photo");
+  const normalized = resolveProfileImageUrl(photoRaw);
+  return Boolean(normalized && /^(data:image\/|blob:|https?:\/\/|\/uploads\/|uploads\/|\/)/i.test(normalized));
+}
+
+/**
+ * Canonical variable name (all lowercase, only a-z0-9) → possible field names in
+ * the student record.  This bridges the gap between template variable naming
+ * conventions (e.g. {{FULL_NAME}}) and CSV column headers (e.g. "Name").
+ */
+const TEMPLATE_VAR_ALIASES: Record<string, string[]> = {
+  // name / full name
+  fullname:     ["Name", "name", "fullName", "FullName", "studentName", "StudentName", "full_name", "FULL_NAME"],
+  name:         ["Name", "name", "fullName", "FullName", "studentName"],
+  studentname:  ["Name", "name", "studentName", "StudentName"],
+  // class / section
+  classname:    ["Class", "class", "className", "ClassName", "standard", "Standard"],
+  class:        ["Class", "class", "className", "standard", "Standard"],
+  section:      ["Section", "section", "Stream", "stream", "Division", "div"],
+  classsection: ["Class", "class", "Section", "section"],
+  // parents
+  fathername:   ["Father Name", "fatherName", "FatherName", "father_name", "Father"],
+  mothername:   ["Mother Name", "motherName", "MotherName", "mother_name", "Mother"],
+  fathermobile: ["Father Mobile", "fatherMobile", "FatherMobile", "father_mobile", "Father Mobile Number"],
+  mothermobile: ["Mother Mobile", "motherMobile", "MotherMobile", "mother_mobile", "Mother Mobile Number"],
+  // contact / address
+  address:      ["Address", "address", "addr", "Village", "village", "City", "city"],
+  phone:        ["Phone", "phone", "Mobile", "mobile", "Contact", "contact"],
+  mobile:       ["Mobile", "mobile", "Phone", "phone", "Contact"],
+  // admission
+  admissionno:  ["Admission Number", "admissionNo", "AdmissionNo", "admission_no", "Admission No", "Admn No", "rollNo", "Roll No"],
+  admissionnumber: ["Admission Number", "admissionNo", "AdmissionNo", "admission_no"],
+  rollno:       ["Roll No", "rollNo", "roll_no", "admissionNo", "Admission Number"],
+  // misc
+  dob:          ["DOB", "dob", "Date of Birth", "dateOfBirth", "birthDate"],
+  schoolcode:   ["School Code", "schoolCode", "school_code", "SchoolCode"],
+  gender:       ["Gender", "gender", "Sex", "sex"],
+};
+
+/**
+ * Replace all {{KEY}} placeholders in a template string with values from the
+ * student record.  Resolution order:
+ *   1. Exact key match ("Name" finds student["Name"])
+ *   2. Alias table ("FULL_NAME" → norm "fullname" → tries "Name", "name", …)
+ *   3. Any record key whose lowercase-alphanumeric form equals the normalised key
+ */
+function mapData(text: string, student: ProjectDataRecord): string {
+  return text.replace(/\{\{([^}]+)\}\}/g, (_, rawKey: string) => {
+    const key = rawKey.trim();
+
+    // 1. Direct exact-key lookup
+    const direct = String(student[key] ?? "").trim();
+    if (direct) return direct;
+
+    // 2. Alias table lookup
+    const norm = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const candidates = TEMPLATE_VAR_ALIASES[norm] ?? [];
+    for (const alias of candidates) {
+      const val = String(student[alias] ?? "").trim();
+      if (val) return val;
+    }
+
+    // 3. Fuzzy fallback: any record key that normalises to the same string
+    const entry = Object.entries(student).find(
+      ([k]) => k.toLowerCase().replace(/[^a-z0-9]/g, "") === norm
+    );
+    return entry ? String(entry[1] ?? "").trim() : "";
+  });
+}
+
+interface DynamicTextObject {
+  text: string;
+  left: number;
+  top: number;
+  width: number;
+  fontSize: number;
+  fontWeight: string | number;
+  color: string;
+  textAlign: "left" | "center" | "right";
+}
+
+/**
+ * Extract text canvas objects that contain {{VARIABLE}} placeholders so they
+ * can be rendered dynamically with per-student substitution.
+ */
+function extractDynamicTextObjects(template: ProjectTemplate): DynamicTextObject[] {
+  const objects = extractTemplateObjects(template);
+  const result: DynamicTextObject[] = [];
+  for (const obj of objects) {
+    const raw = String(obj.text ?? obj.value ?? "").trim();
+    if (!raw || !/\{\{[^}]+\}\}/.test(raw)) continue;
+    result.push({
+      text: raw,
+      left: Number(obj.left ?? 0),
+      top: Number(obj.top ?? 0),
+      width: Number((obj.__boxWidth as number | undefined) ?? obj.width ?? 0) * (Number(obj.scaleX ?? 1) || 1),
+      fontSize: Number.isFinite(Number(obj.fontSize)) ? Number(obj.fontSize) : 13,
+      fontWeight: (obj.fontWeight as string | number | undefined) ?? "normal",
+      color: typeof obj.fill === "string" ? obj.fill : "#111827",
+      textAlign: (["left", "center", "right"].includes(String(obj.textAlign))
+        ? String(obj.textAlign)
+        : "left") as "left" | "center" | "right",
+    });
+  }
+  return result;
 }
 
 function extractTemplateObjects(template: ProjectTemplate): Array<Record<string, unknown>> {
@@ -178,7 +332,9 @@ function extractTemplateObjects(template: ProjectTemplate): Array<Record<string,
 }
 
 function getTemplateBackground(template: ProjectTemplate, slug: SupportedTemplateSlug): string {
-  if (template.thumbnail && template.thumbnail.trim()) return template.thumbnail;
+  if (template.thumbnail && template.thumbnail.trim()) {
+    return resolveProfileImageUrl(template.thumbnail.trim()) || template.thumbnail.trim();
+  }
   if (template.canvasJSON) {
     try {
       const parsed = JSON.parse(template.canvasJSON) as Record<string, unknown>;
@@ -188,7 +344,7 @@ function getTemplateBackground(template: ProjectTemplate, slug: SupportedTemplat
       const rootCanvas = (parsed.canvas as Record<string, unknown> | undefined) || pageCanvas || {};
       const bgObject = (rootCanvas.backgroundImage as Record<string, unknown> | undefined) || {};
       const bgSrc = String(bgObject.src || "").trim();
-      if (bgSrc) return bgSrc;
+      if (bgSrc) return resolveProfileImageUrl(bgSrc) || bgSrc;
     } catch {
       // ignore malformed JSON
     }
@@ -231,6 +387,36 @@ function deriveLayoutFromCanvas(template: ProjectTemplate): Partial<Record<Templ
   return result;
 }
 
+/**
+ * Read the actual Fabric.js canvas pixel dimensions from the serialised canvasJSON.
+ * These are in the same coordinate space as each object's left/top properties, so
+ * they must be used as the source dimensions when scaling to card display size.
+ *
+ * Falls back to null if the JSON is absent or contains no usable dimensions.
+ */
+function getCanvasDimensions(template: ProjectTemplate): { width: number; height: number } | null {
+  if (!template.canvasJSON) return null;
+  try {
+    const parsed = JSON.parse(template.canvasJSON) as Record<string, unknown>;
+    const tryRead = (node: unknown): { width: number; height: number } | null => {
+      if (!node || typeof node !== "object") return null;
+      const c = node as Record<string, unknown>;
+      const w = Number(c.width ?? 0);
+      const h = Number(c.height ?? 0);
+      return w > 10 && h > 10 ? { width: w, height: h } : null;
+    };
+    return (
+      tryRead(parsed.canvas) ??
+      tryRead(Array.isArray(parsed.pages)
+        ? (parsed.pages[0] as { canvas?: unknown } | undefined)?.canvas
+        : null) ??
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
 export function resolveTemplateConfig(template: ProjectTemplate | null): ResolvedTemplateConfig {
   const slug = template ? getTemplateSlugForRender(template) || "template_1" : "template_1";
   const defaults = DEFAULT_TEMPLATE_CONFIGS[slug as SupportedTemplateSlug] || DEFAULT_TEMPLATE_CONFIGS.template_1;
@@ -245,8 +431,13 @@ export function resolveTemplateConfig(template: ProjectTemplate | null): Resolve
   }
 
   const fromCanvas = deriveLayoutFromCanvas(template);
-  const sourceWidthPx = Math.max(1, Number(template.canvas?.width || 0) * MM_TO_PX || CARD_WIDTH_PX);
-  const sourceHeightPx = Math.max(1, Number(template.canvas?.height || 0) * MM_TO_PX || CARD_HEIGHT_PX);
+
+  // Prefer pixel dimensions read directly from the canvasJSON (they are in the
+  // same coordinate space as each object's left/top values).
+  // Only fall back to template.canvas * MM_TO_PX when the JSON has no dims.
+  const jsonDims = getCanvasDimensions(template);
+  const sourceWidthPx  = jsonDims?.width  ?? Math.max(1, Number(template.canvas?.width  || 0) * MM_TO_PX || CARD_WIDTH_PX);
+  const sourceHeightPx = jsonDims?.height ?? Math.max(1, Number(template.canvas?.height || 0) * MM_TO_PX || CARD_HEIGHT_PX);
   const usesCanvasScaling = Object.keys(fromCanvas).length > 0;
 
   return {
@@ -280,33 +471,147 @@ function getFieldStyle(layout: TemplateFieldLayout, scaleX: number, scaleY: numb
 export function IdCard({
   student,
   template,
+  precomputedConfig,
+  precomputedDynTexts,
 }: {
   student: ProjectDataRecord;
   template: ProjectTemplate | null;
+  /** Pre-computed by the parent grid — avoids per-card JSON.parse. */
+  precomputedConfig?: ResolvedTemplateConfig;
+  precomputedDynTexts?: DynamicTextObject[];
 }) {
-  const config = resolveTemplateConfig(template);
+  // Use parent-supplied pre-computed data when available (normal path inside
+  // IdCardGrid).  Fall back to computing here for standalone usage.
+  const { config, dynamicTexts } = useMemo(() => {
+    if (precomputedConfig && precomputedDynTexts) {
+      return { config: precomputedConfig, dynamicTexts: precomputedDynTexts };
+    }
+    return template
+      ? getTemplateCached(template)
+      : { config: resolveTemplateConfig(null), dynamicTexts: [] as DynamicTextObject[] };
+  }, [template, precomputedConfig, precomputedDynTexts]);
+
   const name = getRecordField(student, "name") || "-";
   const admissionNo = getRecordField(student, "admissionNo") || "-";
   const className = getRecordField(student, "class") || "-";
+  const hasPhoto = studentHasPhoto(student);
   const photoUrl = resolveStudentPhotoUrl(student);
-  const scaleX = config.usesCanvasScaling ? CARD_WIDTH_PX / config.sourceWidthPx : 1;
-  const scaleY = config.usesCanvasScaling ? CARD_HEIGHT_PX / config.sourceHeightPx : 1;
+
+  // Scale from canvas coordinate space → card pixels.
+  // Always computed from actual canvas dimensions so dynamic text positions
+  // are placed correctly regardless of whether tagged objects exist.
+  const dynScaleX = CARD_WIDTH_PX / config.sourceWidthPx;
+  const dynScaleY = CARD_HEIGHT_PX / config.sourceHeightPx;
+
+  // Static layout (name/admissionNo/class defaults) only scale when
+  // canvas-tagged objects were found; otherwise fall back to 1:1 defaults.
+  const layoutScaleX = config.usesCanvasScaling ? dynScaleX : 1;
+  const layoutScaleY = config.usesCanvasScaling ? dynScaleY : 1;
+
+  // When the canvas has {{VARIABLE}} text objects, render those instead of
+  // static fields so the same data is never drawn twice (no overlap).
+  const hasCanvasText = dynamicTexts.length > 0;
+
+  const photoStyle: CSSProperties = {
+    position: "absolute",
+    zIndex: 5,
+    ...getFieldStyle(config.layout.photo, layoutScaleX, layoutScaleY),
+  };
 
   return (
     <article className="card" style={{ width: CARD_WIDTH_PX, height: CARD_HEIGHT_PX }}>
-      <img className="bg" src={config.background} alt="Template background" crossOrigin="anonymous" draggable={false} />
-
+      {/* Background image — lowest layer */}
       <img
-        className="photo"
-        src={photoUrl}
-        alt={name || "Student"}
+        className="bg"
+        src={config.background}
+        alt=""
         crossOrigin="anonymous"
-        style={getFieldStyle(config.layout.photo, scaleX, scaleY)}
+        draggable={false}
+        loading="lazy"
+        style={{ zIndex: 0 }}
+        onError={(e) => {
+          const img = e.currentTarget;
+          if (!img.src.includes('placeholder')) {
+            img.onerror = null;
+            img.setAttribute('src', FALLBACK_AVATAR);
+            img.src = FALLBACK_AVATAR;
+          }
+        }}
       />
 
-      <p className="id-field text name" style={getFieldStyle(config.layout.name, scaleX, scaleY)}>{name}</p>
-      <p className="id-field text" style={getFieldStyle(config.layout.admissionNo, scaleX, scaleY)}>{admissionNo}</p>
-      <p className="id-field text" style={getFieldStyle(config.layout.class, scaleX, scaleY)}>{className}</p>
+      {/* Student photo */}
+      {hasPhoto ? (
+        <img
+          className="photo"
+          src={photoUrl}
+          alt={name}
+          crossOrigin="anonymous"
+          loading="lazy"
+          style={photoStyle}
+          onError={(e) => {
+            const img = e.currentTarget;
+            if (!img.src.includes('placeholder')) {
+              img.onerror = null;
+              img.setAttribute('src', FALLBACK_AVATAR);
+              img.src = FALLBACK_AVATAR;
+            }
+          }}
+        />
+      ) : (
+        <div
+          className="photo"
+          style={{
+            ...photoStyle,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "#e2e8f0",
+            borderRadius: 4,
+            fontSize: 10,
+            color: "#94a3b8",
+          }}
+        >
+          No Image
+        </div>
+      )}
+
+      {/* Static fields — only rendered when the template has NO canvas text objects.
+          When canvas objects with {{...}} exist they are the authoritative source;
+          rendering both would cause visible overlap. */}
+      {!hasCanvasText && (
+        <>
+          <p className="id-field text name" style={{ position: "absolute", zIndex: 10, ...getFieldStyle(config.layout.name, layoutScaleX, layoutScaleY) }}>{name}</p>
+          <p className="id-field text" style={{ position: "absolute", zIndex: 10, ...getFieldStyle(config.layout.admissionNo, layoutScaleX, layoutScaleY) }}>{admissionNo}</p>
+          <p className="id-field text" style={{ position: "absolute", zIndex: 10, ...getFieldStyle(config.layout.class, layoutScaleX, layoutScaleY) }}>{className}</p>
+        </>
+      )}
+
+      {/* Dynamic {{VARIABLE}} text objects from canvas JSON — correctly scaled
+          to card pixel space from the canvas coordinate system. */}
+      {hasCanvasText && dynamicTexts.map((obj, i) => (
+        <p
+          key={`dyn-${i}`}
+          className="id-field"
+          style={{
+            position: "absolute",
+            zIndex: 10,
+            top: `${obj.top * dynScaleY}px`,
+            left: `${obj.left * dynScaleX}px`,
+            width: obj.width ? `${obj.width * dynScaleX}px` : undefined,
+            fontSize: `${obj.fontSize * ((dynScaleX + dynScaleY) / 2)}px`,
+            fontWeight: obj.fontWeight,
+            color: obj.color,
+            textAlign: obj.textAlign,
+            margin: 0,
+            lineHeight: 1.15,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {mapData(obj.text, student)}
+        </p>
+      ))}
     </article>
   );
 }
@@ -322,6 +627,34 @@ export function IdCardGrid({
   containerClassName?: string;
   children?: ReactNode;
 }) {
+  const [page, setPage] = useState(1);
+
+  // Reset to page 1 whenever the dataset or template changes.
+  // MUST be before any conditional returns so hooks are called in consistent order.
+  useEffect(() => {
+    setPage(1);
+  }, [students.length, template?.id]);
+
+  // Pre-compute template config + dynamic texts ONCE for all cards in this grid.
+  // Without this, each IdCard would independently call JSON.parse(canvasJSON).
+  const { precomputedConfig, precomputedDynTexts } = useMemo(() => {
+    if (!template) {
+      return {
+        precomputedConfig: resolveTemplateConfig(null),
+        precomputedDynTexts: [] as DynamicTextObject[],
+      };
+    }
+    const cached = getTemplateCached(template);
+    return { precomputedConfig: cached.config, precomputedDynTexts: cached.dynamicTexts };
+  }, [template]);
+
+  // Compute visible slice before conditional returns (hooks rule).
+  const visible = useMemo(
+    () => students.slice(0, page * GRID_PAGE_SIZE),
+    [students, page]
+  );
+  const hasMore = visible.length < students.length;
+
   if (!template) {
     return (
       <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-xs text-slate-600">
@@ -341,10 +674,30 @@ export function IdCardGrid({
   return (
     <div className={containerClassName || "id-preview-scroll"}>
       <div className="id-preview-grid">
-        {students.map((student, index) => (
-          <IdCard key={`${student.id}-${index}`} student={student} template={template} />
+        {visible.map((student, index) => (
+          <IdCard
+            key={`${student.id}-${index}`}
+            student={student}
+            template={template}
+            precomputedConfig={precomputedConfig}
+            precomputedDynTexts={precomputedDynTexts}
+          />
         ))}
       </div>
+      {hasMore && (
+        <div className="mt-3 flex items-center justify-between px-1">
+          <span className="text-xs text-muted-foreground">
+            Showing {visible.length} of {students.length}
+          </span>
+          <button
+            type="button"
+            className="text-xs text-primary underline underline-offset-2 hover:no-underline"
+            onClick={() => setPage((p) => p + 1)}
+          >
+            Show more
+          </button>
+        </div>
+      )}
       {children}
     </div>
   );

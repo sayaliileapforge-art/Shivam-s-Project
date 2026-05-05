@@ -48,11 +48,17 @@ import {
   updateProject as apiUpdateProject,
   deleteProject as apiDeleteProject,
   resolveProfileImageUrl,
+  uploadImages,
+  uploadZipImages,
+  fetchProjectRecords,
+  saveProjectRecords,
+  updateRecordPhoto,
   API_BASE,
 } from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
+import { toast } from "sonner";
 import { BulkImportWizard } from "../components/BulkImportWizard";
-import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
+import { IdCard, IdCardGrid, getTemplateSlugForRender, studentHasPhoto } from "../components/preview/TemplateRenderer";
 import { createTemplate, type TemplateRecord } from "../../lib/templateApi";
 import { matchImages, type BulkMatchResult } from "../../lib/imageMatchEngine";
 
@@ -518,6 +524,23 @@ const MM_TO_PX = 96 / 25.4;
 const PREVIEW_CARD_WIDTH_PX = 250;
 const PREVIEW_CARD_HEIGHT_PX = 350;
 
+/**
+ * Returns a copy of records with base64 data URLs removed from the `photo` field.
+ * Base64 images can be hundreds of KB each — storing them in MongoDB causes the
+ * document to exceed the 16 MB BSON limit and the save fails silently.
+ * Only server-relative paths ("/uploads/...") or absolute https:// URLs are kept.
+ */
+function toDbSafeRecords(records: ProjectDataRecord[]): ProjectDataRecord[] {
+  return records.map((r) => {
+    const photo = String((r as Record<string, unknown>).photo ?? "");
+    if (photo.startsWith("data:")) {
+      const { photo: _stripped, ...rest } = r as Record<string, unknown>;
+      return rest as ProjectDataRecord;
+    }
+    return r;
+  });
+}
+
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -573,13 +596,44 @@ export function ProjectDetail() {
   const [newGroupTemplateId, setNewGroupTemplateId] = useState("");
   const [newGroupFilters, setNewGroupFilters] = useState({ ...emptyNewGroupFilters });
 
-  // Reload data from localStorage whenever project id or category changes
+  // Reload data records: prefer backend (persistent), fall back to localStorage
   useEffect(() => {
     if (!id) return;
-    setDataRecords(loadDataRecords(id, dataCategory));
+    // Immediately load from localStorage for a fast first render
+    const localRecords = loadDataRecords(id, dataCategory);
+    setDataRecords(localRecords);
     setDataFields(loadDataFields(id, dataCategory));
     setDataGroups(loadDataGroups(id, dataCategory));
     setDataSelectedIds(new Set());
+
+    // Hydrate from backend — backend is the source of truth for server-hosted images.
+    // MERGE strategy: if a DB record has no photo but the local record does (e.g. a
+    // base64 fallback from when the upload API was unavailable), keep the local photo
+    // so photos are never silently erased by a stale DB document.
+    let cancelled = false;
+    fetchProjectRecords(id, dataCategory).then((backendRecords) => {
+      if (cancelled) return; // component unmounted or deps changed — discard stale result
+      if (backendRecords && backendRecords.length > 0) {
+        const localById = new Map(localRecords.map((r) => [r.id, r]));
+        const merged: ProjectDataRecord[] = backendRecords.map((br) => {
+          const brTyped = br as ProjectDataRecord;
+          const brPhoto = String((brTyped as Record<string, unknown>).photo ?? "").trim();
+          if (!brPhoto) {
+            // DB record has no photo — preserve whatever is in localStorage for this record
+            const local = localById.get(brTyped.id);
+            const localPhoto = String((local as Record<string, unknown> | undefined)?.photo ?? "").trim();
+            if (localPhoto) return { ...brTyped, photo: localPhoto };
+          }
+          return brTyped;
+        });
+        setDataRecords(merged);
+        // Save merged back to localStorage, but strip any base64 photos to
+        // prevent QuotaExceededError (282+ records × ~100 KB each = localStorage overflow).
+        // Only server-relative /uploads/... paths survive in localStorage.
+        saveDataRecords(id, dataCategory, toDbSafeRecords(merged));
+      }
+    });
+    return () => { cancelled = true; };
   }, [id, dataCategory]);
 
   // ── Data action dialog state ──
@@ -593,6 +647,7 @@ export function ProjectDetail() {
   const [bulkImageResults, setBulkImageResults] = useState<BulkMatchResult | null>(null);
   const [manualAssign, setManualAssign] = useState<Record<string, string>>({}); // filename → userId override
   const bulkImageDataUrlsRef = useRef<Map<string, string>>(new Map()); // filename → dataUrl
+  const bulkImageFilesRef = useRef<Map<string, File>>(new Map()); // filename → File (for server upload)
   const [isAddDataOpen, setIsAddDataOpen] = useState(false);
   const [addDataDraft, setAddDataDraft] = useState<Record<string, string>>({});
   const [isBulkEditOpen, setIsBulkEditOpen] = useState(false);
@@ -603,6 +658,8 @@ export function ProjectDetail() {
   const [barcodeField, setBarcodeField] = useState("");
   const [isGeneratePreviewOpen, setIsGeneratePreviewOpen] = useState(false);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
+  // When true, the hidden off-screen print layout is mounted so html2canvas can capture it.
+  const [isPrintLayoutMounted, setIsPrintLayoutMounted] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [previewForm, setPreviewForm] = useState<PreviewGenerationForm>(emptyPreviewForm);
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
@@ -1027,9 +1084,26 @@ export function ProjectDetail() {
         return rec;
       });
       saveDataFields(projectId, category, newFields);
-      saveDataRecords(projectId, category, records);
+      // Strip any lingering photo values from fresh CSV records
+      const cleanRecords = records.map((r) => {
+        const { photo: _p, Photo: _P, ...rest } = r as Record<string, unknown>;
+        void _p; void _P;
+        return rest as ProjectDataRecord;
+      });
+      saveDataRecords(projectId, category, cleanRecords);
       setDataFields(newFields);
-      setDataRecords(records);
+      setDataRecords(cleanRecords);
+
+      // Persist to MongoDB so the ZIP-upload endpoint can match against fresh records.
+      // This is fire-and-forget from the user's perspective; errors are surfaced as toasts.
+      saveProjectRecords(projectId, category, cleanRecords).then((ok) => {
+        if (ok) {
+          console.log(`[CSV] ${cleanRecords.length} record(s) saved to MongoDB — ready for image mapping`);
+          toast.success(`${cleanRecords.length} record(s) imported and synced to server.`);
+        } else {
+          toast.error('CSV imported locally but failed to sync to server. Image mapping may not work.');
+        }
+      });
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -1329,82 +1403,92 @@ export function ProjectDetail() {
   };
 
   // Image Upload (match by filename, or direct assign when target set)
-  const handleImageUploadFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Images are uploaded to the backend so they persist across refreshes.
+  const handleImageUploadFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
-    if (!files.length || !id) return;
-    Promise.all(
-      files.map((file) =>
-        new Promise<{ file: File; dataUrl: string }>((resolve) => {
-          const r = new FileReader();
-          r.onload = (ev) => resolve({ file, dataUrl: ev.target!.result as string });
-          r.readAsDataURL(file);
-        })
-      )
-    ).then((results) => {
-      const updated = [...dataRecords];
-      const tgt = imageUploadTarget;
-      if (tgt !== "selection") {
-        if (results.length > 0) {
-          const i = updated.findIndex((r) => r.id === tgt);
-          if (i >= 0) updated[i] = { ...updated[i], photo: results[0].dataUrl };
-        }
-      } else {
-        const targets = dataSelectedIds.size > 0
-          ? filteredRecords.filter((r) => dataSelectedIds.has(r.id))
-          : filteredRecords;
-        if (targets.length === 1 && results.length === 1) {
-          const i = updated.findIndex((r) => r.id === targets[0].id);
-          if (i >= 0) updated[i] = { ...updated[i], photo: results[0].dataUrl };
-        } else {
-          results.forEach(({ file: f, dataUrl }) => {
-            const baseName = f.name.replace(/\.[^.]+$/, "").toLowerCase().trim();
-            const match = targets.find((r) => {
-              // 1. Match by SchoolCode_AdmissionNumber prefix (e.g. "44837_10_Nitin_.jpg")
-              const schoolCode = String(
-                r["School Code"] ?? r["schoolCode"] ?? r["school_code"] ?? ""
-              ).trim();
-              const admNo = String(
-                r["Admission Number"] ?? r["admissionNumber"] ?? r["admission_number"] ?? ""
-              ).trim();
-              if (schoolCode && admNo) {
-                const prefix = `${schoolCode}_${admNo}_`.toLowerCase();
-                if (baseName.startsWith(prefix)) return true;
-              }
-              // 2. Match by student name
-              const name = String(r["Name"] ?? r["name"] ?? "").toLowerCase().trim();
-              if (name === baseName || baseName.startsWith(name) || name.startsWith(baseName)) return true;
-              // 3. Match by name tokens appearing in filename segments
-              //    e.g. filename "44837_10_nitin_" contains segment "nitin" which matches name "nitin"
-              if (name) {
-                const segments = baseName.split("_").filter(Boolean);
-                const nameTokens = name.split(/\s+/);
-                if (nameTokens.every((token) => segments.includes(token))) return true;
-              }
-              // 4. Match by the record's existing photo field filename (for CSV-imported records
-              //    where the photo column contains a filename like "44837_10_Nitin_.jpg").
-              const existingPhoto = String(getRecordPhoto(r) || "");
-              const existingFilename = existingPhoto
-                .split("/").pop()!
-                .replace(/\.[^.]+$/, "")
-                .toLowerCase().trim();
-              return existingFilename.length > 0 && (
-                existingFilename === baseName ||
-                baseName.startsWith(existingFilename) ||
-                existingFilename.startsWith(baseName)
-              );
-            });
-            if (match) {
-              const i = updated.findIndex((r) => r.id === match.id);
-              if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
-            }
-          });
-        }
-      }
-      saveDataRecords(id, dataCategory, updated);
-      setDataRecords(updated);
-      setImageUploadTarget("selection");
-    });
     e.target.value = "";
+    if (!files.length || !id) return;
+
+    let uploadedUrls: string[];
+    try {
+      uploadedUrls = await uploadImages(files);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Photo upload failed: ${msg}. Please check your connection and try again.`);
+      return;
+    }
+
+    const updated = [...dataRecords];
+    const tgt = imageUploadTarget;
+
+    if (tgt !== "selection") {
+      if (uploadedUrls.length > 0) {
+        const i = updated.findIndex((r) => r.id === tgt);
+        if (i >= 0) updated[i] = { ...updated[i], photo: uploadedUrls[0] };
+      }
+    } else {
+      const targets = dataSelectedIds.size > 0
+        ? filteredRecords.filter((r) => dataSelectedIds.has(r.id))
+        : filteredRecords;
+      if (targets.length === 1 && uploadedUrls.length === 1) {
+        const i = updated.findIndex((r) => r.id === targets[0].id);
+        if (i >= 0) updated[i] = { ...updated[i], photo: uploadedUrls[0] };
+      } else {
+        files.forEach((f, idx) => {
+          const photoUrl = uploadedUrls[idx];
+          if (!photoUrl) return;
+          const baseName = f.name.replace(/\.[^.]+$/, "").toLowerCase().trim();
+          const match = targets.find((r) => {
+            // 1. Match by SchoolCode_AdmissionNumber prefix (e.g. "44837_10_Nitin_.jpg")
+            const schoolCode = String(
+              r["School Code"] ?? r["schoolCode"] ?? r["school_code"] ?? ""
+            ).trim();
+            const admNo = String(
+              r["Admission Number"] ?? r["admissionNumber"] ?? r["admission_number"] ?? ""
+            ).trim();
+            if (schoolCode && admNo) {
+              const prefix = `${schoolCode}_${admNo}_`.toLowerCase();
+              if (baseName.startsWith(prefix)) return true;
+            }
+            // 2. Match by student name
+            const name = String(r["Name"] ?? r["name"] ?? "").toLowerCase().trim();
+            if (name === baseName || baseName.startsWith(name) || name.startsWith(baseName)) return true;
+            // 3. Match by name tokens appearing in filename segments
+            if (name) {
+              const segments = baseName.split("_").filter(Boolean);
+              const nameTokens = name.split(/\s+/);
+              if (nameTokens.every((token) => segments.includes(token))) return true;
+            }
+            // 4. Match by the record's existing photo field filename
+            const existingPhoto = String(getRecordPhoto(r) || "");
+            const existingFilename = existingPhoto
+              .split("/").pop()!
+              .replace(/\.[^.]+$/, "")
+              .toLowerCase().trim();
+            return existingFilename.length > 0 && (
+              existingFilename === baseName ||
+              baseName.startsWith(existingFilename) ||
+              existingFilename.startsWith(baseName)
+            );
+          });
+          if (match) {
+            const i = updated.findIndex((r) => r.id === match.id);
+            if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
+          }
+        });
+      }
+    }
+
+    saveDataRecords(id, dataCategory, toDbSafeRecords(updated));
+    setDataRecords(updated);
+    setImageUploadTarget("selection");
+    saveProjectRecords(id, dataCategory, toDbSafeRecords(updated)).then((ok) => {
+      if (ok) {
+        toast.success("Photo saved to server — will persist after refresh.");
+      } else {
+        toast.error("Photo uploaded but failed to save to server. It may disappear after refresh.");
+      }
+    });
   };
 
   // ── Bulk Image Upload (ZIP or folder) ────────────────────────────────────
@@ -1415,7 +1499,12 @@ export function ProjectDetail() {
     setBulkImageResults(null);
     setManualAssign({});
 
-    // Read all images as data URLs
+    // Store File objects keyed by filename for uploading when the user applies
+    const fileMap = new Map<string, File>();
+    imageFiles.forEach((f) => fileMap.set(f.name, f));
+    bulkImageFilesRef.current = fileMap;
+
+    // Read all images as data URLs for the preview / matching UI
     const loaded = await Promise.all(
       imageFiles.map(
         (file) =>
@@ -1427,7 +1516,7 @@ export function ProjectDetail() {
       )
     );
 
-    // Store dataUrls for potential manual assignment later
+    // Store dataUrls for UI preview
     const urlMap = new Map<string, string>();
     loaded.forEach(({ name, dataUrl }) => urlMap.set(name, dataUrl));
     bulkImageDataUrlsRef.current = urlMap;
@@ -1446,58 +1535,163 @@ export function ProjectDetail() {
   const handleBulkImageZipChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const zipFile = e.target.files?.[0];
     e.target.value = "";
-    if (!zipFile) return;
+    if (!zipFile || !id) return;
+
     setBulkImageProcessing(true);
     setBulkImageResults(null);
+    // Clear any stale refs from a previous folder-upload session
+    bulkImageFilesRef.current    = new Map();
+    bulkImageDataUrlsRef.current = new Map();
+
     try {
-      const zip = new JSZip();
-      const loaded = await zip.loadAsync(zipFile);
-      const imageEntries = Object.values(loaded.files).filter(
-        (entry) => !entry.dir && /\.(jpe?g|png|webp|gif|bmp)$/i.test(entry.name)
-      );
-      const files: File[] = await Promise.all(
-        imageEntries.map(async (entry) => {
-          const blob = await entry.async("blob");
-          // Use only the basename (not nested folder path)
-          const basename = entry.name.split("/").pop() ?? entry.name;
-          return new File([blob], basename, { type: blob.type || "image/jpeg" });
-        })
-      );
-      // processBulkImageFiles will handle setBulkImageProcessing(false)
-      await processBulkImageFiles(files);
-    } catch {
+      // Send ZIP to backend: it extracts images, uploads to Hostinger via SFTP,
+      // matches filenames → student names, and updates MongoDB directly.
+      const result = await uploadZipImages(zipFile, id, dataCategory);
+
+      // Refresh records from backend so the updated photo URLs are shown immediately
+      const backendRecords = await fetchProjectRecords(id, dataCategory);
+      if (backendRecords && backendRecords.length > 0) {
+        const typed = backendRecords as ProjectDataRecord[];
+        saveDataRecords(id, dataCategory, toDbSafeRecords(typed));
+        setDataRecords(typed);
+      }
+
+      // Report to user
+      if (result.matched > 0) {
+        toast.success(
+          `${result.matched} photo(s) matched and saved on server — will persist after refresh.`
+        );
+      }
+      if (result.unmatched > 0) {
+        toast.error(
+          `${result.unmatched} image(s) had no matching student. ` +
+          `Rename files as "<number>__<First>_<Last>.jpg" to improve matching.`
+        );
+      }
+      if (result.errors.length > 0) {
+        console.error("[zip-upload] errors:", result.errors);
+        toast.error(`${result.errors.length} upload error(s). Check browser console for details.`);
+      }
+
+      // Expose results in the review panel (unmatched images shown for manual review)
+      if (result.unmatched > 0 || result.matched > 0) {
+        setBulkImageResults({
+          matched: result.results
+            .filter((r) => r.status === "matched" && r.matchedId)
+            .map((r) => ({
+              userId:          r.matchedId!,
+              name:            r.matchedName ?? r.filename,
+              filename:        r.filename,
+              dataUrl:         r.url, // server-hosted URL (not base64)
+              confidenceScore: 100,
+              matchType:       "exact_name" as const,
+            })),
+          duplicates: [],
+          unmatched: result.results
+            .filter((r) => r.status === "unmatched")
+            .map((r) => ({
+              filename:           r.filename,
+              reason:             "No matching student found",
+              normalizedFilename: r.filename,
+            })),
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`ZIP upload failed: ${msg}. Check your connection and try again.`);
+    } finally {
       setBulkImageProcessing(false);
+      setIsBulkImageUploadOpen(false);
     }
   };
 
-  const handleApplyBulkImages = () => {
+  const handleApplyBulkImages = async () => {
     if (!id || !bulkImageResults) return;
-    const updated = [...dataRecords];
-    const urlMap = bulkImageDataUrlsRef.current;
 
-    // Apply auto-matched images (with optional manual override for weak/duplicate matches)
-    bulkImageResults.matched.forEach(({ userId, dataUrl, filename }) => {
-      const targetId = manualAssign[filename] ?? userId;
-      const i = updated.findIndex((r) => r.id === targetId);
-      if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
+    const fileMap = bulkImageFilesRef.current;
+    const dataUrlMap = bulkImageDataUrlsRef.current;
+
+    // Collect the filenames that will actually be applied (matched + manually assigned unmatched)
+    const filesToUpload: { filename: string; file: File }[] = [];
+    const collect = (filename: string) => {
+      const file = fileMap.get(filename);
+      if (file) filesToUpload.push({ filename, file });
+    };
+    bulkImageResults.matched.forEach(({ filename }) => collect(filename));
+    bulkImageResults.unmatched.forEach(({ filename }) => {
+      if (manualAssign[filename]) collect(filename);
     });
 
-    // Apply manually reassigned unmatched images
+    // Show loading state while uploading
+    setBulkImageProcessing(true);
+
+    // Upload all required files to the server in chunks of 50
+    // (splitting avoids a single enormous multipart request and gives progress feedback)
+    const serverUrlByFilename = new Map<string, string>();
+    if (filesToUpload.length > 0) {
+      const CHUNK = 50;
+      try {
+        for (let i = 0; i < filesToUpload.length; i += CHUNK) {
+          const slice = filesToUpload.slice(i, i + CHUNK);
+          const urls = await uploadImages(slice.map((x) => x.file));
+          slice.forEach(({ filename }, idx) => {
+            if (urls[idx]) serverUrlByFilename.set(filename, urls[idx]);
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        toast.error(`Photo upload failed: ${msg}. Please check your connection and try again.`);
+        setBulkImageProcessing(false);
+        setIsBulkImageUploadOpen(false);
+        setBulkImageResults(null);
+        setManualAssign({});
+        bulkImageDataUrlsRef.current = new Map();
+        bulkImageFilesRef.current = new Map();
+        return;
+      }
+    }
+
+    const updated = [...dataRecords];
+
+    // Apply auto-matched images — only use server-hosted URLs (never base64)
+    bulkImageResults.matched.forEach(({ userId, filename }) => {
+      const targetId = manualAssign[filename] ?? userId;
+      const photoUrl = serverUrlByFilename.get(filename); // server URL only; no base64 fallback
+      if (!photoUrl) return;
+      const i = updated.findIndex((r) => r.id === targetId);
+      if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
+    });
+
+    // Apply manually reassigned unmatched images — only use server-hosted URLs
     bulkImageResults.unmatched.forEach(({ filename }) => {
       const targetId = manualAssign[filename];
       if (!targetId) return;
-      const dataUrl = urlMap.get(filename);
-      if (!dataUrl) return;
+      const photoUrl = serverUrlByFilename.get(filename); // server URL only; no base64 fallback
+      if (!photoUrl) return;
       const i = updated.findIndex((r) => r.id === targetId);
-      if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
+      if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
     });
 
-    saveDataRecords(id, dataCategory, updated);
+    saveDataRecords(id, dataCategory, toDbSafeRecords(updated));
     setDataRecords(updated);
+    setBulkImageProcessing(false);
     setIsBulkImageUploadOpen(false);
     setBulkImageResults(null);
     setManualAssign({});
     bulkImageDataUrlsRef.current = new Map();
+    bulkImageFilesRef.current = new Map();
+    // Count records that now have a server-hosted photo (any URL that isn't base64)
+    const savedCount = updated.filter((r) => {
+      const p = String((r as Record<string, unknown>).photo ?? "");
+      return p.length > 0 && !p.startsWith("data:");
+    }).length;
+    saveProjectRecords(id, dataCategory, toDbSafeRecords(updated)).then((ok) => {
+      if (ok) {
+        toast.success(`${savedCount} photo(s) saved to server — will persist after refresh.`);
+      } else {
+        toast.error("Photos uploaded but failed to save to server. They may disappear after refresh.");
+      }
+    });
   };
 
   // ── Generate Bar Code (draws Code128-style bars onto a canvas per record) ──
@@ -1595,9 +1789,32 @@ export function ProjectDetail() {
     return pages;
   }, [selectedRecords, printLayout.cardsPerPage]);
 
+  // Count students without a real photo to show a warning in the dialog.
+  const missingPhotosCount = useMemo(
+    () => selectedRecords.filter((r) => !studentHasPhoto(r)).length,
+    [selectedRecords]
+  );
+
   useEffect(() => {
     previewCapturePagesRef.current = previewCapturePagesRef.current.slice(0, previewPrintPages.length);
   }, [previewPrintPages.length]);
+
+  // When the hidden print layout is mounted (isPrintLayoutMounted flips to true),
+  // wait one animation frame so React has painted the DOM, then run the capture.
+  const runPdfCaptureRef = useRef<(() => Promise<void>) | null>(null);
+  useEffect(() => {
+    if (!isPrintLayoutMounted || !runPdfCaptureRef.current) return;
+    // Double rAF ensures React has finished painting all cards (including large
+    // datasets) before we start capturing with html2canvas.
+    const raf1 = requestAnimationFrame(() => {
+      const raf2 = requestAnimationFrame(() => {
+        void runPdfCaptureRef.current?.();
+      });
+      return raf2;
+    });
+    return () => cancelAnimationFrame(raf1);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPrintLayoutMounted]);
 
   const waitForImagesToLoad = async (element: HTMLElement) => {
     const images = Array.from(element.querySelectorAll("img"));
@@ -1661,14 +1878,6 @@ export function ProjectDetail() {
       setPreviewError("Please select a template.");
       return;
     }
-    if (!selectedTemplateSlug) {
-      setPreviewError("Selected template could not be mapped to a render layout.");
-      return;
-    }
-    if (!selectedTemplateDiagnostics?.hasDesignElements) {
-      setPreviewError("No preview available. Please configure the template.");
-      return;
-    }
     if (!previewForm.fileName.trim()) {
       setPreviewError("File name is required.");
       return;
@@ -1688,46 +1897,138 @@ export function ProjectDetail() {
 
     setPreviewError("");
     setIsGeneratingPreview(true);
-    try {
-      if (!previewPrintPages.length) {
-        throw new Error("No preview pages generated.");
-      }
 
-      const orientation = sheetWidthMm > sheetHeightMm ? "landscape" : "portrait";
-      const doc = new jsPDF({
-        orientation,
-        unit: "mm",
-        format: [sheetWidthMm, sheetHeightMm],
-        compress: true,
-      });
-
-      for (let pageIndex = 0; pageIndex < previewPrintPages.length; pageIndex += 1) {
-        const pageElement = previewCapturePagesRef.current[pageIndex];
-        if (!pageElement) {
-          throw new Error(`Unable to render preview page ${pageIndex + 1}.`);
+    // Store the capture logic in a ref so the useEffect can invoke it after
+    // the hidden print layout has been painted to the DOM.
+    runPdfCaptureRef.current = async () => {
+      try {
+        if (!previewPrintPages.length) {
+          throw new Error("No preview pages generated.");
         }
 
-        await waitForImagesToLoad(pageElement);
-        const canvas = await html2canvas(pageElement, {
-          useCORS: true,
-          scale: 2,
-          backgroundColor: "#ffffff",
+        const orientation = sheetWidthMm > sheetHeightMm ? "landscape" : "portrait";
+        const doc = new jsPDF({
+          orientation,
+          unit: "mm",
+          format: [sheetWidthMm, sheetHeightMm],
+          compress: true,
         });
-        const imageData = canvas.toDataURL("image/png", 1);
 
-        if (pageIndex > 0) {
-          doc.addPage([sheetWidthMm, sheetHeightMm], orientation);
+        for (let pageIndex = 0; pageIndex < previewPrintPages.length; pageIndex += 1) {
+          const pageElement = previewCapturePagesRef.current[pageIndex];
+          if (!pageElement) {
+            throw new Error(`Unable to render preview page ${pageIndex + 1}.`);
+          }
+
+          // ── Step 1: Pre-load all images as data: URIs ──────────────────────
+          // html2canvas re-fetches every img.src in isolation (inside an iframe).
+          // Converting them to inline data URIs before capture eliminates every
+          // cross-origin / 404 / proxy error that html2canvas would encounter.
+          const imgEls = Array.from(pageElement.querySelectorAll<HTMLImageElement>("img"));
+          const uniqueUrls = [...new Set(
+            imgEls
+              .map((img) => img.getAttribute("src") ?? "")
+              .filter((src) => src && !src.startsWith("data:") && !src.includes("placeholder"))
+          )];
+
+          const urlToDataUri = new Map<string, string>();
+          await Promise.all(
+            uniqueUrls.map(async (url) => {
+              try {
+                const controller = new AbortController();
+                const tid = setTimeout(() => controller.abort(), 6_000);
+                const resp = await fetch(url, {
+                  signal: controller.signal,
+                  credentials: "same-origin",
+                  cache: "force-cache",
+                });
+                clearTimeout(tid);
+                if (!resp.ok) { urlToDataUri.set(url, "/placeholder.png"); return; }
+                const blob = await resp.blob();
+                const dataUri = await new Promise<string>((res, rej) => {
+                  const reader = new FileReader();
+                  reader.onload = () => res(reader.result as string);
+                  reader.onerror = rej;
+                  reader.readAsDataURL(blob);
+                });
+                urlToDataUri.set(url, dataUri);
+              } catch {
+                urlToDataUri.set(url, "/placeholder.png");
+              }
+            })
+          );
+
+          // Mutate img attributes so html2canvas reads only data URIs.
+          imgEls.forEach((img) => {
+            const src = img.getAttribute("src") ?? "";
+            if (!src || src.startsWith("data:") || src.includes("placeholder")) return;
+            const replacement = urlToDataUri.get(src) ?? "/placeholder.png";
+            img.setAttribute("src", replacement);
+            img.removeAttribute("srcset");
+            img.removeAttribute("loading");
+            img.removeAttribute("crossorigin");
+          });
+
+          // ── Step 2: Capture with html2canvas ──────────────────────────────
+          const stripUnsupportedCss = (css: string) =>
+            css
+              .replace(/\bcolor-mix\((?:[^()]+|\([^()]*\))*\)/gi, "#6366f1")
+              .replace(/\boklch\([^)]*\)/gi, "#6366f1")
+              .replace(/\blch\([^)]*\)/gi, "#6366f1")
+              .replace(/\blab\([^)]*\)/gi, "#6366f1")
+              .replace(/\bcolor\(\s*(?:display-p3|srgb-linear|a98-rgb|prophoto-rgb)[^)]*\)/gi, "#6366f1");
+
+          const canvas = await html2canvas(pageElement, {
+            useCORS: true,
+            allowTaint: false,
+            scale: 2,
+            backgroundColor: "#ffffff",
+            imageTimeout: 8_000,
+            logging: false,
+            onclone: (_clonedDoc, clonedEl) => {
+              // Strip Tailwind v4 oklch/color-mix from injected <style> tags.
+              _clonedDoc.querySelectorAll<HTMLStyleElement>("style").forEach((s) => {
+                if (s.textContent) s.textContent = stripUnsupportedCss(s.textContent);
+              });
+              // Strip inline styles.
+              clonedEl.querySelectorAll<HTMLElement>("[style]").forEach((el) => {
+                const r = el.getAttribute("style");
+                if (r) el.setAttribute("style", stripUnsupportedCss(r));
+              });
+              // Safety net: any img that still has an http/https/relative src
+              // (not a data: URI) gets replaced with placeholder.
+              clonedEl.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
+                const src = img.getAttribute("src") ?? "";
+                if (!src.startsWith("data:") && !src.includes("placeholder")) {
+                  img.setAttribute("src", "/placeholder.png");
+                  img.removeAttribute("srcset");
+                  img.removeAttribute("loading");
+                }
+              });
+            },
+          });
+          const imageData = canvas.toDataURL("image/png", 1);
+
+          if (pageIndex > 0) {
+            doc.addPage([sheetWidthMm, sheetHeightMm], orientation);
+          }
+          doc.addImage(imageData, "PNG", 0, 0, sheetWidthMm, sheetHeightMm, undefined, "FAST");
         }
-        doc.addImage(imageData, "PNG", 0, 0, sheetWidthMm, sheetHeightMm, undefined, "FAST");
-      }
 
-      doc.save(`${previewForm.fileName.trim()}.pdf`);
-      setIsGeneratePreviewOpen(false);
-    } catch (error) {
-      setPreviewError((error as Error).message || "Failed to generate preview PDF.");
-    } finally {
-      setIsGeneratingPreview(false);
-    }
+        doc.save(`${previewForm.fileName.trim()}.pdf`);
+        setIsGeneratePreviewOpen(false);
+      } catch (error) {
+        setPreviewError((error as Error).message || "Failed to generate preview PDF.");
+      } finally {
+        setIsGeneratingPreview(false);
+        setIsPrintLayoutMounted(false);
+        runPdfCaptureRef.current = null;
+      }
+    };
+
+    // Mount the hidden print layout — the useEffect watching isPrintLayoutMounted
+    // will fire after React paints the DOM and then call runPdfCaptureRef.current().
+    setIsPrintLayoutMounted(true);
   };
 
   // ── Delete All student/staff Data ──
@@ -2813,6 +3114,8 @@ export function ProjectDetail() {
                       setDataFields(fields);
                       setDataRecords(records);
                       setShowImportWizard(false);
+                      // Persist imported records to backend for cross-device / post-refresh access
+                      void saveProjectRecords(id, dataCategory, toDbSafeRecords(records));
                     }}
                     onCancel={dataRecords.length > 0 ? () => setShowImportWizard(false) : undefined}
                   />
@@ -3245,7 +3548,10 @@ export function ProjectDetail() {
           <Dialog open={isGeneratePreviewOpen} onOpenChange={(open) => {
             if (isGeneratingPreview) return;
             setIsGeneratePreviewOpen(open);
-            if (!open) setPreviewError("");
+            if (!open) {
+              setPreviewError("");
+              setIsPrintLayoutMounted(false);
+            }
           }}>
             <DialogContent className="sm:max-w-[620px]">
               <DialogHeader>
@@ -3347,14 +3653,26 @@ export function ProjectDetail() {
 
                   <div className="sm:col-span-2 space-y-1.5">
                     <Label>Rendered template preview</Label>
-                    <IdCardGrid students={selectedRecords.slice(0, 1)} template={selectedGenerateTemplate} />
+                    <IdCardGrid students={selectedRecords} template={selectedGenerateTemplate} />
                     {selectedRecords.length > 1 && (
                       <p className="text-xs text-muted-foreground mt-1">
-                        Showing 1 of {selectedRecords.length} student(s). PDF will include all.
+                        Showing first 10 of {selectedRecords.length} student(s). PDF will include all.
                       </p>
                     )}
                   </div>
 
+                  {/* Missing images warning */}
+                  {missingPhotosCount > 0 && (
+                    <div className="sm:col-span-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
+                      <p className="text-xs font-medium text-amber-800">
+                        ⚠ {missingPhotosCount} of {selectedRecords.length} student{missingPhotosCount !== 1 ? "s" : ""} {missingPhotosCount !== 1 ? "have" : "has"} no photo.
+                        Upload a ZIP to map images, or "No Image" placeholders will appear in the PDF.
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Hidden off-screen print layout — only mounted when generating */}
+                  {isPrintLayoutMounted && (
                   <div aria-hidden className="pointer-events-none fixed -left-[10000px] top-0 opacity-0">
                     {previewPrintPages.map((pageRecords, pageIndex) => (
                       <div
@@ -3385,6 +3703,7 @@ export function ProjectDetail() {
                       </div>
                     ))}
                   </div>
+                  )} {/* end isPrintLayoutMounted */}
 
                   {selectedGenerateTemplateDiagnostics && (
                     <div className="sm:col-span-2 space-y-1">

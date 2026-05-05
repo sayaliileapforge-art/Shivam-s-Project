@@ -2,6 +2,7 @@ import mongoose, { Schema, Document } from 'mongoose';
 
 export interface IDataRecord extends Document {
   projectId: mongoose.Schema.Types.ObjectId;
+  category: string;
   variables: Record<string, any>;
   qrCode?: string;
   barcode?: string;
@@ -12,7 +13,8 @@ export interface IDataRecord extends Document {
 
 const DataRecordSchema = new Schema<IDataRecord>(
   {
-    projectId: { type: Schema.Types.ObjectId, ref: 'Project', required: true },
+    projectId: { type: Schema.Types.ObjectId, ref: 'Project', required: true, index: true },
+    category: { type: String, default: '', index: true },
     variables: { type: Schema.Types.Mixed, required: true },
     qrCode: String,
     barcode: String,

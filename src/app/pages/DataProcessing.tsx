@@ -20,6 +20,7 @@ import type { ImportedRecord } from "../../lib/importStore";
 import {
   CORE_IMPORT_FIELDS,
   SKIP_MAPPING_VALUE,
+  applySkipDefaults,
   autoMap,
   buildProjectFields,
   getDuplicateMappedColumns,
@@ -87,7 +88,8 @@ export function DataProcessing() {
         setHeaders(detectedHeaders);
         setRows(stringRows);
         const allFields = buildProjectFields(detectedHeaders);
-        setMapping(autoMap(detectedHeaders, allFields));
+        const initialMapping = autoMap(detectedHeaders, allFields);
+        setMapping(applySkipDefaults(initialMapping, allFields, detectedHeaders));
         setStep("mapping");
       } catch {
         setErrors(["Failed to parse the file. Make sure it is a valid Excel or CSV."]);

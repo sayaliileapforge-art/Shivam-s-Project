@@ -123,4 +123,113 @@ router.delete('/:id', async (req: Request, res: Response) => {
   }
 });
 
+// ── Data Records ──────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/projects/:id/records?category=xxx
+ * Returns all persisted data records for a project + category.
+ * Each record is returned as the plain variables object (i.e. what the frontend stored).
+ */
+router.get('/:id/records', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const category = req.query.category ? String(req.query.category) : undefined;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      res.status(400).json({ success: false, error: 'Invalid project id' });
+      return;
+    }
+
+    const filter: Record<string, any> = { projectId: new mongoose.Types.ObjectId(id) };
+    if (category !== undefined) filter.category = category;
+
+    const records = await DataRecord.find(filter).lean();
+    const data = records.map((r) => r.variables);
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+/**
+ * POST /api/projects/:id/records
+ * Bulk-replaces all records for a given project + category.
+ * Body: { category: string, records: object[] }
+ *
+ * Each element of `records` is stored verbatim in `variables`.
+ * Images should already be server-relative URL strings (e.g. "/uploads/filename.jpg"),
+ * NOT base64 data URLs.
+ */
+router.post('/:id/records', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { category, records } = req.body as { category: string; records: Record<string, any>[] };
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      res.status(400).json({ success: false, error: 'Invalid project id' });
+      return;
+    }
+    if (!Array.isArray(records)) {
+      res.status(400).json({ success: false, error: '`records` must be an array' });
+      return;
+    }
+
+    const projectId = new mongoose.Types.ObjectId(id);
+    const cat = String(category ?? '');
+
+    // Replace all existing records for this project + category
+    await DataRecord.deleteMany({ projectId, category: cat });
+
+    if (records.length > 0) {
+      await DataRecord.insertMany(
+        records.map((rec) => ({
+          projectId,
+          category: cat,
+          variables: rec,
+          status: 'pending',
+        }))
+      );
+    }
+
+    res.json({ success: true, count: records.length });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+/**
+ * PATCH /api/projects/:id/records/photo
+ * Updates the `photo` field of a single record identified by its frontend-generated id.
+ * Body: { category: string, frontendId: string, photoUrl: string }
+ */
+router.patch('/:id/records/photo', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { category, frontendId, photoUrl } = req.body as {
+      category: string;
+      frontendId: string;
+      photoUrl: string;
+    };
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      res.status(400).json({ success: false, error: 'Invalid project id' });
+      return;
+    }
+    if (!frontendId || !photoUrl) {
+      res.status(400).json({ success: false, error: 'frontendId and photoUrl are required' });
+      return;
+    }
+
+    const projectId = new mongoose.Types.ObjectId(id);
+    await DataRecord.updateOne(
+      { projectId, category: String(category ?? ''), 'variables.id': frontendId },
+      { $set: { 'variables.photo': photoUrl } }
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
 export default router;

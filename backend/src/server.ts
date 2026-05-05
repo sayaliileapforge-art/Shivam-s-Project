@@ -13,6 +13,7 @@ import templateRoutes from './routes/templates';
 import orderRoutes from './routes/orders';
 import authRoutes from './routes/auth';
 import previewRoutes from './routes/preview';
+import uploadImagesRoute from './routes/uploads';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -53,12 +54,13 @@ app.use('/api', apiCorsMiddleware);
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
+// Serve uploads from backend/public/uploads/ — consistent with uploads route
 const uploadsDir = process.env.UPLOADS_DIR?.trim()
   ? path.resolve(process.env.UPLOADS_DIR)
-  : path.resolve(backendRootDir, 'uploads');
+  : path.resolve(backendRootDir, 'public', 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
-  console.warn(`Uploads directory was missing and has been created: ${uploadsDir}`);
+  console.log(`[server] Uploads directory created: ${uploadsDir}`);
 }
 app.use('/uploads', express.static(uploadsDir));
 app.use('/images', express.static(uploadsDir));
@@ -90,6 +92,7 @@ app.use('/api/templates', templateRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/preview', previewRoutes);
+app.use('/api/upload-images', uploadImagesRoute);
 
 // API 404 handler
 app.use('/api', (req, res) => {

@@ -34,6 +34,7 @@
   object-fit: cover;
   user-select: none;
   pointer-events: none;
+  z-index: 0;
 }
 
 .photo {
@@ -42,6 +43,7 @@
   object-fit: cover;
   border: 1.5px solid #ffffff;
   box-shadow: 0 2px 8px rgba(2, 6, 23, 0.25);
+  z-index: 5;
 }
 
 .id-field {
@@ -51,6 +53,7 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  z-index: 10;
 }
 
 .name,

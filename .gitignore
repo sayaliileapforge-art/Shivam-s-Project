@@ -3,3 +3,11 @@ dist/
 .env
 .env.local
 *.log
+
+# Local upload artefacts
+backend/uploads/
+backend/src/uploads/
+
+# Editor
+.vscode/
+

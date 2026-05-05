@@ -21,6 +21,9 @@ export default defineConfig({
   assetsInclude: ['**/*.svg', '**/*.csv'],
 
   // API Proxy for development
+  // /api             → local backend (project data, auth, etc.)
+  // /uploads         → Hostinger file server (SFTP-uploaded student photos)
+  // /backend-uploads → local backend (fallback when SFTP disabled, stored at http://localhost:5000/uploads/)
   server: {
     proxy: {
       '/api': {
@@ -28,12 +31,17 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path,
       },
-      '/uploads': {
+      '/backend-uploads': {
         target: 'http://localhost:5000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/backend-uploads/, '/uploads'),
+      },
+      '/uploads': {
+        target: 'http://72.62.241.170',
         changeOrigin: true,
       },
       '/student-photos': {
-        target: 'http://localhost:5000',
+        target: 'http://72.62.241.170',
         changeOrigin: true,
       },
     },

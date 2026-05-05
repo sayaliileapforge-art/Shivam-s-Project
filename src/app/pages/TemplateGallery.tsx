@@ -1,117 +1,678 @@
-import { useEffect, useMemo, useState } from "react";
-import { Search, Globe, Lock } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
-import { Input } from "../components/ui/input";
-import { Badge } from "../components/ui/badge";
+import { useEffect, useMemo, useState, useCallback } from "react";
+import { useNavigate, useSearchParams } from "react-router";
+import {
+  Search, Globe, Star, Clock, Heart, ChevronLeft,
+  ChevronRight, RotateCcw, Eye, Plus, X, ChevronDown, ImageOff,
+} from "lucide-react";
+import { cn } from "../components/ui/utils";
 import { getTemplates, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+type TabType = "all" | "recommended" | "recent" | "favorites";
+type OrientationType = "all" | "portrait" | "landscape";
+const ITEMS_PER_PAGE = 12;
+
+const SIDEBAR_CATEGORIES = [
+  { label: "All Categories", value: "all" },
+  { label: "School ID",      value: "School ID" },
+  { label: "Corporate ID",   value: "Corporate ID" },
+  { label: "Event ID",       value: "Event ID" },
+  { label: "Membership",     value: "Membership" },
+  { label: "Other",          value: "Other" },
+];
+
+const SIDEBAR_SIZES = [
+  { label: "All Sizes", value: "all" },
+  { label: "58×89mm",   value: "58x89mm" },
+  { label: "54×86mm",   value: "54x86mm" },
+  { label: "A4",        value: "A4" },
+  { label: "A5",        value: "A5" },
+  { label: "Custom",    value: "custom" },
+];
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function deriveDisplayCategory(t: TemplateRecord): string {
+  const cat  = (t.category || "").toLowerCase();
+  const tags = (t.tags || []).map((x) => x.toLowerCase());
+  if (cat.includes("school") || tags.some((x) => x.includes("school")))          return "School ID";
+  if (cat.includes("event")  || cat === "festival" || tags.some((x) => x.includes("event"))) return "Event ID";
+  if (cat === "membership"   || cat === "wedding"  || tags.some((x) => x.includes("member"))) return "Membership";
+  if (cat.includes("corporate") || cat === "business" || tags.some((x) => x.includes("corporate"))) return "Corporate ID";
+  return "Other";
+}
+
+function deriveSize(t: TemplateRecord): string {
+  const dd = t.designData as Record<string, unknown> | undefined;
+  if (dd) {
+    const w = (dd.width ?? dd.canvasWidth) as number | undefined;
+    const h = (dd.height ?? dd.canvasHeight) as number | undefined;
+    if (w && h) {
+      const wmm = Math.round((w * 25.4) / 96);
+      const hmm = Math.round((h * 25.4) / 96);
+      return `${wmm}×${hmm}mm`;
+    }
+  }
+  for (const tag of t.tags ?? []) {
+    if (/^\d+[x×]\d+mm$/i.test(tag)) return tag.replace("x", "×");
+    if (tag === "A4" || tag === "A5")  return tag;
+  }
+  return "58×89mm";
+}
+
+function deriveSizeKey(t: TemplateRecord): string {
+  return deriveSize(t).replace("×", "x").toLowerCase();
+}
+
+function deriveOrientation(t: TemplateRecord): "portrait" | "landscape" {
+  const dd = t.designData as Record<string, unknown> | undefined;
+  if (dd) {
+    const w = ((dd.width ?? dd.canvasWidth ?? 0) as number);
+    const h = ((dd.height ?? dd.canvasHeight ?? 0) as number);
+    if (w && h) return w > h ? "landscape" : "portrait";
+  }
+  return "portrait";
+}
+
+function toggleCheckbox(
+  value: string,
+  current: string[],
+  allValues: string[],
+): string[] {
+  if (value === "all") return ["all"];
+  let next = current.filter((x) => x !== "all");
+  next = next.includes(value) ? next.filter((x) => x !== value) : [...next, value];
+  return next.length === 0 || next.length === allValues.length - 1 ? ["all"] : next;
+}
+
+// ─── TemplateCard ─────────────────────────────────────────────────────────────
+
+interface TemplateCardProps {
+  template: TemplateRecord;
+  onUse: (t: TemplateRecord) => void;
+  onPreview: (t: TemplateRecord) => void;
+  isFavorite: boolean;
+  onToggleFavorite: (id: string) => void;
+}
+
+function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavorite }: TemplateCardProps) {
+  const [imgError, setImgError] = useState(false);
+  const previewSrc = resolveTemplatePreview(t);
+  const displayCategory = deriveDisplayCategory(t);
+  const size = deriveSize(t);
+
+  return (
+    <div className="group relative flex flex-col rounded-xl border border-gray-200 bg-white shadow-sm hover:shadow-md transition-all duration-200 hover:-translate-y-0.5 overflow-hidden">
+      {/* Thumbnail */}
+      <div className="relative h-40 bg-gray-100 overflow-hidden">
+        {previewSrc && !imgError ? (
+          <img
+            src={previewSrc}
+            alt={t.templateName}
+            className="h-full w-full object-contain transition-transform duration-200 group-hover:scale-105"
+            onError={() => setImgError(true)}
+          />
+        ) : (
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-gray-400">
+            <ImageOff className="h-8 w-8" />
+            <span className="text-xs">No Preview Available</span>
+          </div>
+        )}
+        {/* Public badge */}
+        <div className="absolute left-2 top-2">
+          <span className="inline-flex items-center gap-1 rounded-full bg-white/90 px-2 py-0.5 text-xs font-medium text-gray-700 shadow-sm">
+            <Globe className="h-3 w-3 text-blue-500" />
+            Public
+          </span>
+        </div>
+        {/* Favorite */}
+        <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+          <button
+            onClick={() => onToggleFavorite(t._id)}
+            className="rounded-full bg-white/90 p-1 shadow-sm hover:bg-white transition-colors"
+          >
+            <Star className={cn("h-3.5 w-3.5", isFavorite ? "fill-yellow-400 text-yellow-400" : "text-gray-400")} />
+          </button>
+          <button className="rounded-full bg-white/90 p-1 shadow-sm hover:bg-white transition-colors text-gray-500">
+            <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 16 16">
+              <circle cx="8" cy="3" r="1.2"/><circle cx="8" cy="8" r="1.2"/><circle cx="8" cy="13" r="1.2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {/* Card body */}
+      <div className="flex flex-col gap-3 p-3">
+        <div>
+          <h3 className="text-sm font-semibold text-gray-900 line-clamp-1">{t.templateName}</h3>
+          <p className="text-xs text-gray-500 mt-0.5">{size} • {displayCategory}</p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => onUse(t)}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-blue-600 bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 active:bg-blue-800 transition-colors"
+          >
+            <Plus className="h-3.5 w-3.5" /> Use Template
+          </button>
+          <button
+            onClick={() => onPreview(t)}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+          >
+            <Eye className="h-3.5 w-3.5" /> Preview
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Preview Modal ────────────────────────────────────────────────────────────
+
+function PreviewModal({ template, onClose }: { template: TemplateRecord; onClose: () => void }) {
+  const previewSrc = resolveTemplatePreview(template);
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+      <div
+        className="relative w-full max-w-lg bg-white rounded-2xl overflow-hidden shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b">
+          <h3 className="font-semibold text-gray-900">{template.templateName}</h3>
+          <button onClick={onClose} className="rounded-lg p-1.5 hover:bg-gray-100 transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="p-6 bg-gray-50 min-h-56 flex items-center justify-center">
+          {previewSrc ? (
+            <img src={previewSrc} alt={template.templateName} className="max-h-96 max-w-full object-contain rounded-lg shadow" />
+          ) : (
+            <div className="flex flex-col items-center gap-2 text-gray-400">
+              <ImageOff className="h-12 w-12" />
+              <p className="text-sm">No preview available</p>
+            </div>
+          )}
+        </div>
+        <div className="flex gap-3 px-5 py-4 border-t bg-white">
+          <p className="text-xs text-gray-500 self-center flex-1">{deriveSize(template)} • {deriveDisplayCategory(template)}</p>
+          <button onClick={onClose} className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Skeleton Card ────────────────────────────────────────────────────────────
+
+function SkeletonCard() {
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white overflow-hidden animate-pulse">
+      <div className="h-40 bg-gray-200" />
+      <div className="p-3 space-y-2">
+        <div className="h-4 w-3/4 rounded bg-gray-200" />
+        <div className="h-3 w-1/2 rounded bg-gray-200" />
+        <div className="flex gap-2 pt-1">
+          <div className="h-7 flex-1 rounded-lg bg-gray-200" />
+          <div className="h-7 flex-1 rounded-lg bg-gray-200" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
+
 export function TemplateGallery() {
-  const [query, setQuery] = useState("");
-  const [templates, setTemplates] = useState<TemplateRecord[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const projectId = searchParams.get("projectId");
+
+  const [templates, setTemplates]   = useState<TemplateRecord[]>([]);
+  const [loading, setLoading]       = useState(false);
+  const [error, setError]           = useState("");
+
+  // Sidebar filters
+  const [selectedCategories, setSelectedCategories] = useState<string[]>(["all"]);
+  const [selectedSizes, setSelectedSizes]           = useState<string[]>(["all"]);
+  const [orientation, setOrientation]               = useState<OrientationType>("all");
+
+  // Top-bar filters
+  const [query, setQuery]                         = useState("");
+  const [dropdownSize, setDropdownSize]           = useState("all");
+  const [dropdownCategory, setDropdownCategory]   = useState("all");
+  const [dropdownOrientation, setDropdownOrientation] = useState("all");
+
+  const [activeTab, setActiveTab]       = useState<TabType>("all");
+  const [currentPage, setCurrentPage]   = useState(1);
+  const [previewTemplate, setPreviewTemplate] = useState<TemplateRecord | null>(null);
+
+  const [favorites, setFavorites] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("tg_favorites") ?? "[]") as string[]; } catch { return []; }
+  });
+  const [recentlyUsed, setRecentlyUsed] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("tg_recent") ?? "[]") as string[]; } catch { return []; }
+  });
 
   useEffect(() => {
     setLoading(true);
     setError("");
     getTemplates()
       .then((data) => setTemplates(data))
-      .catch((err) => setError((err as Error).message || "Failed to load templates"))
+      .catch((err) => setError((err as Error).message ?? "Failed to load templates"))
       .finally(() => setLoading(false));
   }, []);
 
-  const publicTemplates = useMemo(
-    () => templates.filter((t) => t.isActive !== false),
-    [templates]
-  );
+  useEffect(() => { localStorage.setItem("tg_favorites", JSON.stringify(favorites)); }, [favorites]);
+  useEffect(() => { localStorage.setItem("tg_recent", JSON.stringify(recentlyUsed)); }, [recentlyUsed]);
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return publicTemplates;
-    return publicTemplates.filter((t) => {
-      return (
-        t.templateName.toLowerCase().includes(q) ||
-        t.category.toLowerCase().includes(q) ||
-        (t.tags || []).some((tag) => tag.toLowerCase().includes(q))
-      );
+  const activeTemplates = useMemo(() => templates.filter((t) => t.isActive !== false), [templates]);
+
+  const applyFilters = useCallback((list: TemplateRecord[]) => {
+    const effSizes    = dropdownSize     !== "all" ? [dropdownSize]     : selectedSizes;
+    const effCats     = dropdownCategory !== "all" ? [dropdownCategory] : selectedCategories;
+    const effOrient   = dropdownOrientation !== "all" ? dropdownOrientation as OrientationType : orientation;
+
+    return list.filter((t) => {
+      if (query.trim()) {
+        const hay = [t.templateName, t.category, ...(t.tags ?? []), deriveDisplayCategory(t)].join(" ").toLowerCase();
+        if (!hay.includes(query.trim().toLowerCase())) return false;
+      }
+      if (!effCats.includes("all")) {
+        if (!effCats.includes(deriveDisplayCategory(t))) return false;
+      }
+      if (!effSizes.includes("all")) {
+        if (!effSizes.some((s) => s.toLowerCase() === deriveSizeKey(t))) return false;
+      }
+      if (effOrient !== "all" && deriveOrientation(t) !== effOrient) return false;
+      return true;
     });
-  }, [publicTemplates, query]);
+  }, [query, selectedCategories, selectedSizes, orientation, dropdownSize, dropdownCategory, dropdownOrientation]);
+
+  const tabFiltered = useMemo(() => {
+    let list = activeTemplates;
+    if (activeTab === "recommended") list = list.slice(0, 8);
+    else if (activeTab === "favorites") list = list.filter((t) => favorites.includes(t._id));
+    else if (activeTab === "recent") { const s = new Set(recentlyUsed); list = list.filter((t) => s.has(t._id)); }
+    return applyFilters(list);
+  }, [activeTemplates, activeTab, favorites, recentlyUsed, applyFilters]);
+
+  const recommended = useMemo(() => applyFilters(activeTemplates).slice(0, 6), [activeTemplates, applyFilters]);
+
+  const totalPages     = Math.max(1, Math.ceil(tabFiltered.length / ITEMS_PER_PAGE));
+  const pagedTemplates = tabFiltered.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE);
+
+  // Reset page on filter change
+  useEffect(() => { setCurrentPage(1); },
+    [query, selectedCategories, selectedSizes, orientation, activeTab, dropdownSize, dropdownCategory, dropdownOrientation]);
+
+  const handleUseTemplate = (t: TemplateRecord) => {
+    setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
+    navigate(`/designer-studio?templateId=${t._id}`);
+  };
+
+  const toggleFavorite = (id: string) =>
+    setFavorites((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+
+  const handleClearFilters = () => {
+    setQuery(""); setSelectedCategories(["all"]); setSelectedSizes(["all"]);
+    setOrientation("all"); setDropdownSize("all"); setDropdownCategory("all");
+    setDropdownOrientation("all"); setCurrentPage(1);
+  };
+
+  const tabs: { id: TabType; label: string; icon: React.ReactNode }[] = [
+    { id: "all",         label: "All Templates", icon: <span className="text-base leading-none">⊞</span> },
+    { id: "recommended", label: "Recommended",   icon: <Heart className="h-4 w-4" /> },
+    { id: "recent",      label: "Recently Used", icon: <Clock className="h-4 w-4" /> },
+    { id: "favorites",   label: "Favorites",     icon: <Star  className="h-4 w-4" /> },
+  ];
+
+  // Pagination page list
+  const pageNumbers = useMemo(() => {
+    if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1);
+    const pages: (number | "…")[] = [1];
+    if (currentPage > 3)        pages.push("…");
+    const lo = Math.max(2, currentPage - 1);
+    const hi = Math.min(totalPages - 1, currentPage + 1);
+    for (let p = lo; p <= hi; p++) pages.push(p);
+    if (currentPage < totalPages - 2) pages.push("…");
+    pages.push(totalPages);
+    return pages;
+  }, [currentPage, totalPages]);
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-1">
-        <h1 className="text-3xl font-bold tracking-tight">Template Gallery</h1>
-        <p className="text-muted-foreground">
-          Browse public templates, open any design, customize it in Designer Studio, and save as a new template.
-        </p>
+    <div className="flex min-h-screen flex-col bg-gray-50">
+      {/* ── Header ── */}
+      <div className="flex items-start justify-between border-b bg-white px-6 py-5">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Template Gallery</h1>
+          <p className="mt-0.5 text-sm text-gray-500">
+            Browse public templates, open any design, customize it in Designer Studio, and save as a new template.
+          </p>
+        </div>
+        <button
+          onClick={() => navigate(projectId ? `/projects/${projectId}` : "/projects")}
+          className="ml-4 flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors shadow-sm"
+        >
+          <ChevronLeft className="h-4 w-4" /> Back to Project
+        </button>
       </div>
 
-      <Card>
-        <CardContent className="pt-6">
-          <div className="relative max-w-xl">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search by name, type, or audience"
-              className="pl-9"
-            />
-          </div>
-          {error ? (
-            <p className="mt-3 text-sm text-destructive">{error}</p>
-          ) : null}
-        </CardContent>
-      </Card>
-
-      {filtered.length === 0 ? (
-        <Card>
-          <CardContent className="py-12 text-center text-muted-foreground">
-            {loading ? "Loading templates..." : "No public templates found."}
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {filtered.map((t) => (
-            <Card key={t._id} className="overflow-hidden">
-              <div className="relative h-44 bg-muted">
-                {t.preview_image || t.previewImageUrl ? (
-                  <img
-                    src={resolveTemplatePreview(t)}
-                    alt={t.templateName}
-                    className="h-full w-full object-contain"
-                  />
-                ) : (
-                  <div className="flex h-full items-center justify-center text-muted-foreground">
-                    No preview
-                  </div>
-                )}
-                <div className="absolute right-2 top-2">
-                  {t.isActive !== false ? (
-                    <Badge className="gap-1">
-                      <Globe className="h-3 w-3" /> Public
-                    </Badge>
-                  ) : (
-                    <Badge variant="outline" className="gap-1">
-                      <Lock className="h-3 w-3" /> Private
-                    </Badge>
-                  )}
-                </div>
-              </div>
-              <CardHeader className="pb-2">
-                <CardTitle className="line-clamp-1 text-base">{t.templateName}</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div className="flex flex-wrap gap-2 text-xs">
-                  <Badge variant="secondary">{t.category}</Badge>
-                  {t.tags?.slice(0, 2).map((tag) => (
-                    <Badge key={tag} variant="outline">{tag}</Badge>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
-          ))}
+      {/* ── Top filter bar ── */}
+      <div className="flex flex-wrap items-center gap-3 border-b bg-white px-6 py-3">
+        <div className="relative min-w-48 flex-1">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400 pointer-events-none" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search templates by name, type, or audience..."
+            className="w-full rounded-lg border border-gray-200 bg-white py-2 pl-9 pr-8 text-sm outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+          />
+          {query && (
+            <button onClick={() => setQuery("")} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
-      )}
+
+        {/* Size dropdown */}
+        <div className="relative">
+          <select
+            value={dropdownSize}
+            onChange={(e) => setDropdownSize(e.target.value)}
+            className="appearance-none rounded-lg border border-gray-200 bg-white py-2 pl-3 pr-7 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all cursor-pointer"
+          >
+            {SIDEBAR_SIZES.map((s) => (
+              <option key={s.value} value={s.value}>{s.value === "all" ? "Size" : s.label}</option>
+            ))}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+        </div>
+
+        {/* Category dropdown */}
+        <div className="relative">
+          <select
+            value={dropdownCategory}
+            onChange={(e) => setDropdownCategory(e.target.value)}
+            className="appearance-none rounded-lg border border-gray-200 bg-white py-2 pl-3 pr-7 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all cursor-pointer"
+          >
+            {SIDEBAR_CATEGORIES.map((c) => (
+              <option key={c.value} value={c.value}>{c.value === "all" ? "Category" : c.label}</option>
+            ))}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+        </div>
+
+        {/* Orientation dropdown */}
+        <div className="relative">
+          <select
+            value={dropdownOrientation}
+            onChange={(e) => setDropdownOrientation(e.target.value)}
+            className="appearance-none rounded-lg border border-gray-200 bg-white py-2 pl-3 pr-7 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all cursor-pointer"
+          >
+            <option value="all">Orientation</option>
+            <option value="portrait">Portrait</option>
+            <option value="landscape">Landscape</option>
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+        </div>
+
+        <button
+          onClick={handleClearFilters}
+          className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
+        >
+          <RotateCcw className="h-3.5 w-3.5" /> Clear Filters
+        </button>
+      </div>
+
+      {/* ── Body (sidebar + content) ── */}
+      <div className="flex flex-1 gap-5 px-6 py-5">
+
+        {/* ── LEFT SIDEBAR ── */}
+        <aside className="w-56 shrink-0">
+          <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-800">Refine Templates</h2>
+              <button onClick={handleClearFilters} className="flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700">
+                <RotateCcw className="h-3 w-3" /> Reset
+              </button>
+            </div>
+
+            {/* Category */}
+            <div className="mb-5">
+              <div className="mb-2.5 flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Category</span>
+                <ChevronDown className="h-3.5 w-3.5 text-gray-400" />
+              </div>
+              <div className="space-y-2">
+                {SIDEBAR_CATEGORIES.map((cat) => (
+                  <label key={cat.value} className="flex cursor-pointer items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={selectedCategories.includes(cat.value)}
+                      onChange={() => setSelectedCategories(toggleCheckbox(cat.value, selectedCategories, SIDEBAR_CATEGORIES.map((c) => c.value)))}
+                      className="h-3.5 w-3.5 rounded border-gray-300 accent-blue-600"
+                    />
+                    <span className="text-xs text-gray-700">{cat.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Size */}
+            <div className="mb-5">
+              <div className="mb-2.5 flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Size</span>
+                <ChevronDown className="h-3.5 w-3.5 text-gray-400" />
+              </div>
+              <div className="space-y-2">
+                {SIDEBAR_SIZES.map((sz) => (
+                  <label key={sz.value} className="flex cursor-pointer items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={selectedSizes.includes(sz.value)}
+                      onChange={() => setSelectedSizes(toggleCheckbox(sz.value, selectedSizes, SIDEBAR_SIZES.map((s) => s.value)))}
+                      className="h-3.5 w-3.5 rounded border-gray-300 accent-blue-600"
+                    />
+                    <span className="text-xs text-gray-700">{sz.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Orientation */}
+            <div>
+              <div className="mb-2.5 flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Orientation</span>
+                <ChevronDown className="h-3.5 w-3.5 text-gray-400" />
+              </div>
+              <div className="space-y-2">
+                {(["all", "portrait", "landscape"] as OrientationType[]).map((opt) => (
+                  <label key={opt} className="flex cursor-pointer items-center gap-2">
+                    <input
+                      type="radio"
+                      name="sidebar-orientation"
+                      value={opt}
+                      checked={orientation === opt}
+                      onChange={() => setOrientation(opt)}
+                      className="h-3.5 w-3.5 border-gray-300 accent-blue-600"
+                    />
+                    <span className="text-xs capitalize text-gray-700">
+                      {opt === "all" ? "All" : opt.charAt(0).toUpperCase() + opt.slice(1)}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        {/* ── RIGHT CONTENT ── */}
+        <div className="min-w-0 flex-1 flex flex-col gap-5">
+
+          {/* Tabs + sort */}
+          <div className="flex items-end border-b border-gray-200">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={cn(
+                  "flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-all",
+                  activeTab === tab.id
+                    ? "border-blue-600 text-blue-600"
+                    : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300",
+                )}
+              >
+                {tab.icon} {tab.label}
+              </button>
+            ))}
+            <div className="ml-auto mb-1 flex items-center gap-2">
+              <span className="text-xs text-gray-500">Sort by</span>
+              <select className="rounded-lg border border-gray-200 bg-white py-1.5 px-2.5 text-xs text-gray-700 outline-none focus:border-blue-400">
+                <option>Newest First</option>
+                <option>Oldest First</option>
+                <option>A–Z</option>
+              </select>
+              {/* Grid view */}
+              <button className="rounded-lg border border-blue-100 bg-blue-50 p-1.5 text-blue-600">
+                <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 16 16">
+                  <rect x="1" y="1" width="6" height="6" rx="1"/>
+                  <rect x="9" y="1" width="6" height="6" rx="1"/>
+                  <rect x="1" y="9" width="6" height="6" rx="1"/>
+                  <rect x="9" y="9" width="6" height="6" rx="1"/>
+                </svg>
+              </button>
+              {/* List view */}
+              <button className="rounded-lg border border-gray-200 bg-white p-1.5 text-gray-500 hover:bg-gray-50">
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 16 16">
+                  <line x1="2" y1="4"  x2="14" y2="4"/>
+                  <line x1="2" y1="8"  x2="14" y2="8"/>
+                  <line x1="2" y1="12" x2="14" y2="12"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
+          )}
+
+          {/* Recommended row (All tab only) */}
+          {activeTab === "all" && recommended.length > 0 && (
+            <section>
+              <div className="mb-3 flex items-center justify-between">
+                <h2 className="flex items-center gap-2 text-base font-semibold text-gray-900">
+                  <span>✨</span> Recommended for you
+                </h2>
+                <button className="text-xs font-medium text-blue-600 hover:underline">View all</button>
+              </div>
+              <div className="flex gap-4 overflow-x-auto pb-2 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+                {recommended.map((t) => (
+                  <div key={t._id} className="w-52 shrink-0">
+                    <TemplateCard
+                      template={t}
+                      onUse={handleUseTemplate}
+                      onPreview={setPreviewTemplate}
+                      isFavorite={favorites.includes(t._id)}
+                      onToggleFavorite={toggleFavorite}
+                    />
+                  </div>
+                ))}
+                <button className="flex shrink-0 items-center self-center rounded-full border border-gray-200 bg-white p-2 shadow-sm hover:shadow-md transition-all">
+                  <ChevronRight className="h-4 w-4 text-gray-600" />
+                </button>
+              </div>
+            </section>
+          )}
+
+          {/* All Templates grid */}
+          <section className="flex flex-col gap-4">
+            {!loading && (
+              <h2 className="text-base font-semibold text-gray-900">
+                {activeTab === "all" ? "All Templates" : tabs.find((t) => t.id === activeTab)?.label}
+                {" "}
+                <span className="font-normal text-gray-500">({tabFiltered.length})</span>
+              </h2>
+            )}
+
+            {loading ? (
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                {Array.from({ length: 8 }).map((_, i) => <SkeletonCard key={i} />)}
+              </div>
+            ) : pagedTemplates.length === 0 ? (
+              <div className="flex flex-col items-center justify-center rounded-xl border border-gray-200 bg-white py-20 text-center">
+                <ImageOff className="mb-3 h-12 w-12 text-gray-300" />
+                <p className="text-base font-medium text-gray-500">No templates available</p>
+                <p className="mt-1 text-sm text-gray-400">Try adjusting your filters or search query</p>
+                <button onClick={handleClearFilters} className="mt-4 text-sm font-medium text-blue-600 hover:underline">
+                  Clear all filters
+                </button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                {pagedTemplates.map((t) => (
+                  <TemplateCard
+                    key={t._id}
+                    template={t}
+                    onUse={handleUseTemplate}
+                    onPreview={setPreviewTemplate}
+                    isFavorite={favorites.includes(t._id)}
+                    onToggleFavorite={toggleFavorite}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* Pagination */}
+          {!loading && totalPages > 1 && (
+            <div className="flex items-center justify-between pt-2">
+              <p className="text-xs text-gray-500">
+                Showing {(currentPage - 1) * ITEMS_PER_PAGE + 1}–{Math.min(currentPage * ITEMS_PER_PAGE, tabFiltered.length)} of {tabFiltered.length} templates
+              </p>
+              <div className="flex items-center gap-1">
+                <button
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage((p) => p - 1)}
+                  className="rounded-lg border border-gray-200 p-1.5 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                {pageNumbers.map((p, i) =>
+                  p === "…" ? (
+                    <span key={`ellipsis-${i}`} className="px-1 text-sm text-gray-400">…</span>
+                  ) : (
+                    <button
+                      key={p}
+                      onClick={() => setCurrentPage(p)}
+                      className={cn(
+                        "h-8 w-8 rounded-lg text-sm font-medium transition-colors",
+                        currentPage === p
+                          ? "bg-blue-600 text-white"
+                          : "border border-gray-200 text-gray-700 hover:bg-gray-50",
+                      )}
+                    >
+                      {p}
+                    </button>
+                  )
+                )}
+                <button
+                  disabled={currentPage === totalPages}
+                  onClick={() => setCurrentPage((p) => p + 1)}
+                  className="rounded-lg border border-gray-200 p-1.5 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Preview modal */}
+      {previewTemplate && <PreviewModal template={previewTemplate} onClose={() => setPreviewTemplate(null)} />}
     </div>
   );
 }

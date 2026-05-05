@@ -179,6 +179,33 @@ export function normalizeMapping(mapping: Record<string, string>, fields: Import
   return enforceMutualExclusion(normalized);
 }
 
+export function applySkipDefaults(
+  mapping: Record<string, string>,
+  fields: ImportSystemField[],
+  headers: string[] = []
+): Record<string, string> {
+  const next = { ...mapping };
+  const headerSet = new Set(headers.map((header) => String(header).trim()));
+
+  for (const field of fields) {
+    const value = next[field.key];
+    if (value === SKIP_MAPPING_VALUE) continue;
+
+    if (value == null || value === "" || value === "__none__" || value === "Select column") {
+      next[field.key] = SKIP_MAPPING_VALUE;
+      continue;
+    }
+
+    // Validate that mapped column actually exists in CSV headers
+    const mappedColumnName = String(value).trim();
+    if (headers.length > 0 && !headerSet.has(mappedColumnName)) {
+      next[field.key] = SKIP_MAPPING_VALUE;
+    }
+  }
+
+  return next;
+}
+
 export function autoMap(headers: string[], fields: ImportSystemField[]): Record<string, string> {
   const mapping: Record<string, string> = {};
 

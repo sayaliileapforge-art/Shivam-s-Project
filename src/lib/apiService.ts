@@ -42,37 +42,85 @@ function resolveBackendOrigin(): string {
 }
 
 export const BACKEND_ORIGIN = resolveBackendOrigin();
-export const UPLOADS_BASE_URL = `${BACKEND_ORIGIN}/uploads/`;
+
+/** Resolves the origin that serves /uploads/ assets.
+ * Priority: VITE_UPLOADS_BASE_URL > empty string (relative, proxied by Vite).
+ * Returning '' means all /uploads/* requests use a relative path, which the
+ * Vite dev-server proxy silently forwards to the real file server — no CORS.
+ */
+function resolveUploadsOrigin(): string {
+  const env = (import.meta as any).env as Record<string, string | boolean | undefined>;
+  const raw = typeof env.VITE_UPLOADS_BASE_URL === 'string' ? env.VITE_UPLOADS_BASE_URL.trim() : undefined;
+  if (raw) {
+    const normalized = raw.replace(/\/$/, '');
+    try { return new URL(normalized).origin; } catch { return normalized; }
+  }
+  // No explicit override → use relative paths so the Vite proxy (or same-origin
+  // production deploy) handles the request without CORS.
+  return '';
+}
+
+export const UPLOADS_ORIGIN = resolveUploadsOrigin();
+export const UPLOADS_BASE_URL = `${UPLOADS_ORIGIN}/uploads/`;
 if (typeof window !== 'undefined') {
   console.info('[apiService] API_BASE', resolveApiBase());
   console.info('[apiService] BACKEND_ORIGIN', BACKEND_ORIGIN);
+  console.info('[apiService] UPLOADS_ORIGIN', UPLOADS_ORIGIN);
 }
+
+/** Hostinger server that stores all uploaded files. */
+export const HOSTINGER_UPLOADS_ORIGIN = 'http://72.62.241.170';
 
 export function resolveProfileImageUrl(profilePic?: string): string {
   const raw = String(profilePic || '').trim();
   if (!raw) return '';
 
-  if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) {
+  if (/^(data:image\/|blob:)/i.test(raw)) {
+    return raw;
+  }
+
+  // Absolute URL: if it points to localhost/127.0.0.1 with an /uploads/ path,
+  // the file actually lives on Hostinger — rewrite the origin so it resolves
+  // through the /uploads/ Vite proxy (→ Hostinger) instead of local Express.
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/uploads\//i.test(raw)) {
+    return raw.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i, '/');
+  }
+
+  // Other absolute URLs: return as-is (could be Hostinger direct URL, CDN, etc.).
+  if (/^https?:\/\//i.test(raw)) {
     return raw;
   }
 
   const normalized = raw.replace(/\\/g, '/');
+
+  // Encode a single path segment safely:
+  // - Decode first to prevent double-encoding if the value is already percent-encoded.
+  // - Re-encode with encodeURIComponent but restore commas (valid in filenames,
+  //   and nginx serves files with commas in their names without decoding %2C).
+  const encodeSeg = (seg: string) => {
+    let decoded: string;
+    try { decoded = decodeURIComponent(seg); } catch { decoded = seg; }
+    return encodeURIComponent(decoded).replace(/%2C/gi, ',');
+  };
+  const encodeSegments = (filePath: string) => filePath.split('/').map(encodeSeg).join('/');
+
   if (normalized.startsWith('/uploads/')) {
-    return `${BACKEND_ORIGIN}${normalized}`;
+    return `${UPLOADS_ORIGIN}/uploads/${encodeSegments(normalized.slice('/uploads/'.length))}`;
   }
 
   if (normalized.startsWith('uploads/')) {
-    return `${BACKEND_ORIGIN}/${normalized}`;
+    return `${UPLOADS_ORIGIN}/uploads/${encodeSegments(normalized.slice('uploads/'.length))}`;
   }
 
   if (normalized.startsWith('/')) {
-    return `${BACKEND_ORIGIN}${normalized}`;
+    return `${UPLOADS_ORIGIN}${normalized}`;
   }
 
   if (normalized.includes('/')) {
-    return `${UPLOADS_BASE_URL}${normalized}`;
+    return `${UPLOADS_BASE_URL}${encodeSegments(normalized)}`;
   }
 
+  // Bare filename — just encode and append to uploads base.
   return `${UPLOADS_BASE_URL}${encodeURIComponent(normalized)}`;
 }
 
@@ -301,5 +349,160 @@ export async function checkBackendHealth() {
     return response.ok;
   } catch {
     return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Image Upload API
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Upload one or more image files to the backend.
+ * Returns an array of server-relative URL paths like ["/uploads/1234-photo.jpg"].
+ * These paths are safe to store in records and resolve via resolveProfileImageUrl().
+ */
+export async function uploadImages(files: File[]): Promise<string[]> {
+  if (!files.length) return [];
+
+  const form = new FormData();
+  files.forEach((f) => form.append('images', f));
+
+  const response = await fetch(`${API_BASE}/upload-images`, {
+    method: 'POST',
+    body: form,
+  });
+
+  // Backend returns { success, urls } directly — no `data` wrapper
+  const json = await response.json() as { success: boolean; urls?: string[]; error?: string };
+  if (!json.success || !Array.isArray(json.urls)) {
+    throw new Error(json.error || 'Image upload failed');
+  }
+  return json.urls;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ZIP Bulk Image Upload API
+// ─────────────────────────────────────────────────────────────
+
+export interface ZipUploadImageResult {
+  filename: string;
+  url: string;
+  matchedName?: string;
+  matchedId?: string;
+  status: 'matched' | 'unmatched' | 'error';
+}
+
+export interface ZipUploadSummary {
+  success: boolean;
+  total: number;
+  uploaded: number;
+  matched: number;
+  unmatched: number;
+  errors: string[];
+  results: ZipUploadImageResult[];
+}
+
+/**
+ * Upload a ZIP file to the backend.
+ * The server extracts images, uploads each to Hostinger via SFTP, and then
+ * auto-maps filenames to student records in MongoDB using name normalization.
+ *
+ * Filename convention:  "145__Vanshika_Katiyar.jpg" → "vanshika katiyar"
+ *
+ * @param zipFile   ZIP File object from an <input type="file"> element
+ * @param projectId MongoDB project ID (required for auto-matching)
+ * @param category  Data category, e.g. "student" (default "student")
+ */
+export async function uploadZipImages(
+  zipFile: File,
+  projectId: string,
+  category = 'student',
+): Promise<ZipUploadSummary> {
+  const form = new FormData();
+  form.append('zip', zipFile);
+  form.append('projectId', projectId);
+  form.append('category', category);
+
+  const response = await fetch(`${API_BASE}/upload-images/zip`, {
+    method: 'POST',
+    body: form,
+  });
+
+  // Backend returns the summary fields directly — no `data` wrapper
+  const json = await response.json() as ZipUploadSummary & { error?: string };
+  if (!json.success) {
+    throw new Error((json as unknown as { error?: string }).error || 'ZIP upload failed');
+  }
+  return json;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Project Data Records API
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Load all data records for a project + category from the backend.
+ * Returns null on network failure so callers can fall back to localStorage.
+ */
+export async function fetchProjectRecords(
+  projectId: string,
+  category: string
+): Promise<Record<string, any>[] | null> {
+  try {
+    const url = `${API_BASE}/projects/${encodeURIComponent(projectId)}/records?category=${encodeURIComponent(category)}`;
+    const response = await fetch(url);
+    const result = await parseApiResponse<Record<string, any>[]>(response);
+    return result.success && Array.isArray(result.data) ? result.data : null;
+  } catch (error) {
+    console.warn('[apiService] fetchProjectRecords error:', error);
+    return null;
+  }
+}
+
+/**
+ * Persist all data records for a project + category to the backend (bulk replace).
+ * Returns true on success, false on failure (never throws).
+ */
+export async function saveProjectRecords(
+  projectId: string,
+  category: string,
+  records: Record<string, any>[]
+): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/records`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category, records }),
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      console.error('[apiService] saveProjectRecords failed:', response.status, body);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.warn('[apiService] saveProjectRecords error:', error);
+    return false;
+  }
+}
+
+/**
+ * Update the photo URL of a single record without replacing the whole collection.
+ * Useful for updating individual record photos after a single-image upload.
+ */
+export async function updateRecordPhoto(
+  projectId: string,
+  category: string,
+  frontendId: string,
+  photoUrl: string
+): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/records/photo`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category, frontendId, photoUrl }),
+    });
+  } catch (error) {
+    console.warn('[apiService] updateRecordPhoto error:', error);
   }
 }
