@@ -37,7 +37,7 @@ import {
   loadProjectProducts, addProjectProduct, deleteProjectProduct,
   loadProjectTasks, addProjectTask, updateProjectTask, deleteProjectTask,
   loadProjectFiles, addProjectFile, deleteProjectFile,
-  loadProjectTemplates, addProjectTemplate, deleteProjectTemplate, updateProjectTemplate,
+  loadProjectTemplates, updateProjectTemplate, syncProjectTemplatesFromRemote,
   loadDataFields, saveDataFields, loadDataGroups, addDataGroup, deleteDataGroup, updateDataGroup,
   loadDataRecords, saveDataRecords, deleteDataRecord, updateDataRecord,
   type ProjectProduct, type ProjectTask, type ProjectFile, type ProjectTemplate,
@@ -59,8 +59,9 @@ import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { toast } from "sonner";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender, studentHasPhoto } from "../components/preview/TemplateRenderer";
-import { createTemplate, type TemplateRecord } from "../../lib/templateApi";
+import { createTemplate, deleteTemplate, mapTemplateRecordToProjectTemplate, migrateProjectTemplatesToDatabase, type TemplateRecord } from "../../lib/templateApi";
 import { matchImages, type BulkMatchResult } from "../../lib/imageMatchEngine";
+import { subscribeToTemplateUpdates } from "../../lib/realtime";
 
 // ─── Template dialog types ───────────────────────────────────────────────────
 type PageFormat = "a4" | "13x19" | "custom";
@@ -79,37 +80,9 @@ const TEMPLATE_TYPES: { value: ProjectTemplate["templateType"]; label: string }[
 type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean };
 
 function mapApiTemplateToProjectTemplate(template: TemplateRecord): PreviewTemplateOption {
-  const designData = (template.designData || {}) as Record<string, any>;
-  const canvas = (designData.canvas && typeof designData.canvas === "object") ? designData.canvas : {};
-  const margin = (designData.margin && typeof designData.margin === "object") ? designData.margin : {};
-  const canvasJSON = typeof designData.canvasJSON === "string"
-    ? designData.canvasJSON
-    : (typeof designData.canvasJson === "string" ? designData.canvasJson : "");
-  const rawApplicableFor = designData.applicableFor;
-  const applicableFor = Array.isArray(rawApplicableFor)
-    ? rawApplicableFor.join(", ")
-    : (rawApplicableFor ? String(rawApplicableFor) : "");
-
+  const mapped = mapTemplateRecordToProjectTemplate(template);
   return {
-    id: template._id,
-    projectId: String(template.projectId || template.productId || ""),
-    templateName: template.templateName,
-    templateType: (designData.templateType as ProjectTemplate["templateType"]) || "custom",
-    canvas: {
-      width: Number(canvas.width || 0) || 0,
-      height: Number(canvas.height || 0) || 0,
-    },
-    margin: {
-      top: Number(margin.top || 0) || 0,
-      left: Number(margin.left || 0) || 0,
-      right: Number(margin.right || 0) || 0,
-      bottom: Number(margin.bottom || 0) || 0,
-    },
-    applicableFor,
-    createdAt: template.createdAt,
-    canvasJSON: canvasJSON || undefined,
-    thumbnail: template.preview_image || template.previewImageUrl || undefined,
-    isPublic: template.isGlobal === true,
+    ...mapped,
     isGlobal: template.isGlobal === true,
   };
 }
@@ -182,6 +155,8 @@ const emptyPreviewForm: PreviewGenerationForm = {
 };
 
 const GROUP_FILTER_ALL = "__all__";
+const MONGO_ID_REGEX = /^[a-f\d]{24}$/i;
+const isMongoId = (value?: string | null) => Boolean(value && MONGO_ID_REGEX.test(value));
 
 const emptyNewGroupFilters = {
   classValue: GROUP_FILTER_ALL,
@@ -675,6 +650,12 @@ export function ProjectDetail() {
   const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>([]);
   const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(false);
   const [remoteTemplatesError, setRemoteTemplatesError] = useState("");
+  const templateMigrationRef = useRef(false);
+  const realtimeRefreshRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    templateMigrationRef.current = false;
+  }, [id]);
 
   const updateTemplateMargin = (key: keyof typeof emptyTemplateForm.margin, val: number) =>
     setTemplateForm((f) => ({ ...f, margin: { ...f.margin, [key]: val } }));
@@ -719,21 +700,52 @@ export function ProjectDetail() {
     setRemoteTemplatesLoading(true);
     setRemoteTemplatesError("");
 
-    fetch(requestUrl)
+    fetch(requestUrl, { cache: 'no-store' })
       .then(async (response) => {
         const json = await response.json();
         if (!response.ok || json?.success === false) {
           throw new Error(json?.error || "Failed to load templates");
         }
         const items = Array.isArray(json?.data) ? (json.data as TemplateRecord[]) : [];
-        console.log("Fetched Templates:", items);
         return items;
       })
-      .then((items) => {
+      .then(async (items) => {
         if (!mounted) return;
         const mapped = items.map(mapApiTemplateToProjectTemplate);
         const deduped = Array.from(new Map(mapped.map((t) => [t.id, t])).values());
         setRemoteTemplates(deduped);
+        syncProjectTemplatesFromRemote(id, deduped);
+
+        if (!templateMigrationRef.current) {
+          const legacy = loadProjectTemplates(id).filter(
+            (t) => t.projectId === id && !t.remoteId && !isMongoId(t.id)
+          );
+          templateMigrationRef.current = true;
+          if (legacy.length > 0) {
+            try {
+              const result = await migrateProjectTemplatesToDatabase(id, legacy);
+              result.saved.forEach((saved) => {
+                if (saved.sourceId) {
+                  updateProjectTemplate(saved.sourceId, { remoteId: saved._id });
+                }
+              });
+              // Re-fetch remote templates after migration to pick up DB ids.
+              if (mounted) {
+                const refreshResponse = await fetch(requestUrl, { cache: 'no-store' });
+                const refreshJson = await refreshResponse.json();
+                const refreshItems = Array.isArray(refreshJson?.data)
+                  ? (refreshJson.data as TemplateRecord[])
+                  : [];
+                const refreshMapped = refreshItems.map(mapApiTemplateToProjectTemplate);
+                const refreshDeduped = Array.from(new Map(refreshMapped.map((t) => [t.id, t])).values());
+                setRemoteTemplates(refreshDeduped);
+                syncProjectTemplatesFromRemote(id, refreshDeduped);
+              }
+            } catch (error) {
+              console.warn("[templates] Local migration failed", error);
+            }
+          }
+        }
       })
       .catch((error) => {
         if (!mounted) return;
@@ -756,23 +768,27 @@ export function ProjectDetail() {
   const files = id ? loadProjectFiles(id) : [];
   const templates = id ? loadProjectTemplates(id, project?.clientId ?? "") : [];
   const previewTemplates = useMemo(() => {
+    // DB (remoteTemplates) is ALWAYS the single source of truth.
+    // Every browser fetches from the same MongoDB, so all browsers show identical data.
+    // Local-only templates (no remoteId AND not a Mongo ID — legacy TMPL-xxx records
+    // that haven't been migrated yet) are appended as a fallback only when they have
+    // no DB equivalent. This prevents stale localStorage from masking fresh DB data.
     const merged = new Map<string, PreviewTemplateOption>();
-    const remoteIdSet = new Set(
-      templates
-        .map((template) => template.remoteId)
-        .filter((remoteId): remoteId is string => Boolean(remoteId))
-    );
 
-    remoteTemplates.forEach((template) => {
-      if (!remoteIdSet.has(template.id)) {
-        merged.set(template.id, template);
+    // Step 1: DB templates take unconditional priority.
+    remoteTemplates.forEach((t) => merged.set(t.id, t));
+
+    // Step 2: Append local-only templates that have no DB equivalent.
+    const remoteIds = new Set(remoteTemplates.map((t) => t.id));
+    templates.forEach((t) => {
+      // A template is considered synced when its remoteId is known to the DB,
+      // or when its own id is already a MongoDB ObjectId (fetched from DB previously).
+      const syncedToRemote = t.remoteId ? remoteIds.has(t.remoteId) : false;
+      if (!syncedToRemote && !isMongoId(t.id) && !merged.has(t.id)) {
+        merged.set(t.id, { ...t, isGlobal: false });
       }
     });
-    templates.forEach((template) => {
-      if (!merged.has(template.id)) {
-        merged.set(template.id, { ...template, isGlobal: false });
-      }
-    });
+
     return Array.from(merged.values());
   }, [remoteTemplates, templates]);
 
@@ -863,6 +879,25 @@ export function ProjectDetail() {
 
   const refresh = () => setVersion((v) => v + 1);
 
+  useEffect(() => {
+    if (!id) return;
+    const unsubscribe = subscribeToTemplateUpdates(id, () => {
+      if (realtimeRefreshRef.current) return;
+      realtimeRefreshRef.current = window.setTimeout(() => {
+        realtimeRefreshRef.current = null;
+        refresh();
+      }, 250);
+    });
+
+    return () => {
+      if (realtimeRefreshRef.current) {
+        window.clearTimeout(realtimeRefreshRef.current);
+        realtimeRefreshRef.current = null;
+      }
+      unsubscribe();
+    };
+  }, [id]);
+
   // ── Template handlers ──
   const validateTemplate = () => {
     const e: { templateName?: string; applicableFor?: string } = {};
@@ -897,16 +932,17 @@ export function ProjectDetail() {
   const handleCreateTemplate = async () => {
     if (!validateTemplate() || !id) return;
     const thumb = createBlankTemplateThumbnail(templateForm.canvas.width, templateForm.canvas.height);
-    const localTemplate = addProjectTemplate({
-      projectId: id,
-      clientId: project?.clientId ?? "",
-      templateName: templateForm.templateName,
-      templateType: templateForm.templateType,
-      canvas: templateForm.canvas,
-      margin: templateForm.margin,
-      applicableFor: templateForm.applicableFor,
-      thumbnail: thumb,
-      isPublic: templateForm.isPublic,
+    const blankCanvasJSON = JSON.stringify({
+      config: {
+        templateName: templateForm.templateName,
+        templateType: templateForm.templateType,
+        canvas: templateForm.canvas,
+        margin: templateForm.margin,
+      },
+      pages: [{ id: "page-1", name: "Page 1", canvas: { objects: [] } }],
+      activePageId: "page-1",
+      canvas: { objects: [] },
+      elementMetadata: [],
     });
 
     setTemplateForm(emptyTemplateForm);
@@ -919,26 +955,90 @@ export function ProjectDetail() {
       const remoteTemplate = await createTemplate({
         productId: id,
         projectId: id,
-        templateName: localTemplate.templateName,
+        templateName: templateForm.templateName,
         preview_image: thumb,
         category: "Other",
         designData: {
-          templateType: localTemplate.templateType,
-          canvas: localTemplate.canvas,
-          margin: localTemplate.margin,
-          applicableFor: localTemplate.applicableFor,
+          templateType: templateForm.templateType,
+          canvas: templateForm.canvas,
+          margin: templateForm.margin,
+          applicableFor: templateForm.applicableFor,
+          canvasJSON: blankCanvasJSON,
         },
-        isGlobal: localTemplate.isPublic,
-        isPublic: localTemplate.isPublic,
+        isGlobal: templateForm.isPublic,
+        isPublic: templateForm.isPublic,
       });
 
-      updateProjectTemplate(localTemplate.id, { remoteId: remoteTemplate._id });
-      console.log('[templates] Template persisted to DB', { _id: remoteTemplate._id });
+      const mapped = mapApiTemplateToProjectTemplate(remoteTemplate);
+      setRemoteTemplates((prev) => {
+        const next = [...prev.filter((t) => t.id !== mapped.id), mapped];
+        syncProjectTemplatesFromRemote(id, next);
+        return next;
+      });
     } catch (error) {
       console.warn("[templates] Failed to persist project template to MongoDB", error);
+      toast.error("Template could not be saved to the server.");
     } finally {
       setIsTemplateSaving(false);
       refresh();
+    }
+  };
+
+  const resolveRemoteTemplateId = (template: ProjectTemplate) => {
+    if (isMongoId(template.remoteId)) return template.remoteId as string;
+    if (isMongoId(template.id)) return template.id;
+    return "";
+  };
+
+  const handleDeleteTemplate = async (template: ProjectTemplate) => {
+    if (!id) return;
+    const remoteId = resolveRemoteTemplateId(template);
+    if (!remoteId) {
+      toast.error("Template is not synced to the server.");
+      return;
+    }
+    try {
+      await deleteTemplate(remoteId);
+      setRemoteTemplates((prev) => {
+        const next = prev.filter((t) => t.id !== remoteId);
+        syncProjectTemplatesFromRemote(id, next);
+        return next;
+      });
+    } catch (error) {
+      console.warn("[templates] Failed to delete template", error);
+      toast.error("Failed to delete template.");
+    }
+  };
+
+  const handleCloneTemplate = async (template: ProjectTemplate) => {
+    if (!id) return;
+    try {
+      const created = await createTemplate({
+        productId: id,
+        projectId: id,
+        templateName: `${template.templateName} (Copy)`,
+        preview_image: template.thumbnail || "",
+        category: "Other",
+        designData: {
+          templateType: template.templateType,
+          canvas: template.canvas,
+          margin: template.margin,
+          applicableFor: template.applicableFor,
+          canvasJSON: template.canvasJSON,
+        },
+        isGlobal: false,
+        isPublic: false,
+      });
+
+      const mapped = mapApiTemplateToProjectTemplate(created);
+      setRemoteTemplates((prev) => {
+        const next = [...prev.filter((t) => t.id !== mapped.id), mapped];
+        syncProjectTemplatesFromRemote(id, next);
+        return next;
+      });
+    } catch (error) {
+      console.warn("[templates] Failed to clone template", error);
+      toast.error("Failed to create template copy.");
     }
   };
 
@@ -2495,9 +2595,21 @@ export function ProjectDetail() {
                   )}
 
                   {Boolean(selectedPreviewTemplateDiagnostics?.missingFieldKeys.length) && (
-                    <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2">
-                      Missing field mapping: {selectedPreviewTemplateDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
-                    </p>
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 flex items-start gap-2.5">
+                      <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-amber-800">Some fields need mapping</p>
+                        <p className="text-xs text-amber-700 mt-0.5">
+                          {selectedPreviewTemplateDiagnostics!.missingFieldKeys.length} field{selectedPreviewTemplateDiagnostics!.missingFieldKeys.length > 1 ? "s" : ""} in this template are not connected to your data source yet.
+                        </p>
+                        <button
+                          className="text-xs font-medium text-amber-800 underline underline-offset-2 mt-1"
+                          onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
+                        >
+                          Set up field mapping →
+                        </button>
+                      </div>
+                    </div>
                   )}
 
                   <div className="space-y-1 text-sm">
@@ -2516,8 +2628,14 @@ export function ProjectDetail() {
               <div className="flex items-center justify-between">
                 <CardTitle>Project Templates</CardTitle>
                 <div className="flex gap-2">
-                  <Button size="sm" variant="outline" className="gap-2" onClick={() => previewTemplates.length > 0 && setPreviewTemplate(previewTemplates[0])} disabled={previewTemplates.length === 0}>
-                    <Download className="h-4 w-4" />Generate Preview
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-2"
+                    onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
+                    disabled={previewTemplates.length === 0}
+                  >
+                    <Settings2 className="h-4 w-4" />Generate Preview
                   </Button>
                   <Button size="sm" className="gap-2" onClick={() => setIsCreateTemplateOpen(true)}>
                     <Plus className="h-4 w-4" />Create new template
@@ -2602,14 +2720,14 @@ export function ProjectDetail() {
                             )}
                           </div>
                           {!previewDiagnostics?.hasDesignElements && !tmpl.thumbnail && (
-                            <p className="text-[11px] text-destructive mt-1">
-                              No preview available. Open in designer to configure.
-                            </p>
+                            <Badge variant="outline" className="text-[10px] mt-1 text-muted-foreground border-dashed">
+                              Draft
+                            </Badge>
                           )}
                           {Boolean(previewDiagnostics?.missingFieldKeys.length) && (
-                            <p className="text-[11px] text-amber-700 mt-1">
-                              Missing field mapping: {previewDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
-                            </p>
+                            <Badge variant="outline" className="text-[10px] mt-1 text-amber-700 border-amber-300 bg-amber-50 gap-1">
+                              <AlertTriangle className="h-2.5 w-2.5" />Needs Setup
+                            </Badge>
                           )}
                           {tmpl.applicableFor && <p className="text-xs text-muted-foreground mt-1 truncate">For: {tmpl.applicableFor}</p>}
                           <p className="text-xs text-muted-foreground">{tmpl.createdAt}</p>
@@ -2638,33 +2756,10 @@ export function ProjectDetail() {
                                     canvas: tmpl.canvas,
                                     margin: normalizedMargin,
                                   };
-                                  // Sync remote-only templates to localStorage so the designer can load them
-                                  const existingLocal = id ? loadProjectTemplates(id).find(
-                                    (t) => t.id === tmpl.id || t.remoteId === tmpl.id
-                                  ) : undefined;
-                                  let localTemplateId = tmpl.id;
-                                  if (!existingLocal && id) {
-                                    const synced = addProjectTemplate({
-                                      projectId: id,
-                                      clientId: currentClientId,
-                                      templateName: tmpl.templateName,
-                                      templateType: tmpl.templateType,
-                                      canvas: tmpl.canvas,
-                                      margin: normalizedMargin,
-                                      applicableFor: tmpl.applicableFor,
-                                      canvasJSON: tmpl.canvasJSON,
-                                      thumbnail: tmpl.thumbnail,
-                                      isPublic: tmpl.isPublic ?? false,
-                                      remoteId: tmpl.id,
-                                    });
-                                    localTemplateId = synced.id;
-                                  } else if (existingLocal) {
-                                    localTemplateId = existingLocal.id;
-                                  }
                                   localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
                                   localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
                                     projectId: project.id,
-                                    templateId: localTemplateId,
+                                    templateId: tmpl.id,
                                     projectName: project.name,
                                     templateName: tmpl.templateName,
                                   }));
@@ -2674,7 +2769,7 @@ export function ProjectDetail() {
                                 <Pencil className="h-3 w-3" />Edit
                               </Button>
                               {isOwnTemplate && (
-                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
+                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { void handleDeleteTemplate(tmpl); }}>
                                   <Trash2 className="h-3 w-3" />
                                 </Button>
                               )}
@@ -2686,20 +2781,7 @@ export function ProjectDetail() {
                               className="flex-1 text-xs gap-1"
                               title="Copy this global template to your project"
                               onClick={() => {
-                                if (!id) return;
-                                addProjectTemplate({
-                                  projectId: id,
-                                  clientId: currentClientId,
-                                  templateName: `${tmpl.templateName} (Copy)`,
-                                  templateType: tmpl.templateType,
-                                  canvas: tmpl.canvas,
-                                  margin: tmpl.margin,
-                                  applicableFor: tmpl.applicableFor,
-                                  canvasJSON: tmpl.canvasJSON,
-                                  thumbnail: tmpl.thumbnail,
-                                  isPublic: false,
-                                });
-                                refresh();
+                                void handleCloneTemplate(tmpl);
                               }}
                             >
                               <FilePlus className="h-3 w-3" />Use
@@ -3713,9 +3795,24 @@ export function ProjectDetail() {
                         </p>
                       )}
                       {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
-                        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
-                          Missing field mapping: {selectedGenerateTemplateDiagnostics.missingFieldKeys.map(formatFieldLabel).join(", ")}
-                        </p>
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 flex items-start gap-2.5">
+                          <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-semibold text-amber-800">
+                              {selectedGenerateTemplateDiagnostics.missingFieldKeys.length} field{selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 1 ? "s" : ""} not mapped
+                            </p>
+                            <p className="text-xs text-amber-700 mt-0.5">
+                              The preview may show placeholder text for unmapped fields. You can still generate.
+                            </p>
+                            <button
+                              className="text-xs font-medium text-amber-800 underline underline-offset-2 mt-1"
+                              onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
+                            >
+                              Fix in Rule Builder →
+                            </button>
+                          </div>
+
+                        </div>
                       )}
                     </div>
                   )}

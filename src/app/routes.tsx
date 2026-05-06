@@ -27,6 +27,7 @@ import { ProductTemplateSelection } from "./pages/ProductTemplateSelection";
 import { TemplateOrderPage } from "./pages/TemplateOrderPage";
 import { TemplateGallery } from "./pages/TemplateGallery";
 import DataMigration from "./pages/DataMigration";
+import { RuleBuilderWorkflow } from "./pages/RuleBuilderWorkflow";
 import { RouteGuard } from "../lib/rbac";
 import { Permission } from "../lib/rbac";
 
@@ -113,6 +114,14 @@ export const router = createBrowserRouter([
         element: (
           <RouteGuard anyOf={[Permission.PROJECTS__VIEW_ALL, Permission.PROJECTS__VIEW_ASSIGNED]}>
             <ProjectDetail />
+          </RouteGuard>
+        ),
+      },
+      {
+        path: "projects/:id/rule-builder",
+        element: (
+          <RouteGuard anyOf={[Permission.PROJECTS__VIEW_ALL, Permission.PROJECTS__VIEW_ASSIGNED]}>
+            <RuleBuilderWorkflow />
           </RouteGuard>
         ),
       },

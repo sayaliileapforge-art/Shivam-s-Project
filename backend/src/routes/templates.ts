@@ -8,6 +8,7 @@ import ProductTemplate from '../models/ProductTemplate';
 import Product from '../models/Product';
 import Project from '../models/Project';
 import TemplateSelection from '../models/TemplateSelection';
+import { emitRealtimeEvent } from '../realtime';
 
 const router = Router();
 
@@ -178,6 +179,8 @@ router.get('/', async (req: Request, res: Response) => {
       if (isValidObjectId(requestedProjectId)) {
         projectConditions.push({ productId: new mongoose.Types.ObjectId(requestedProjectId) });
       }
+      // Include global templates so all users see shared designs.
+      projectConditions.push({ isGlobal: true });
       filter = { $or: projectConditions };
     }
     const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
@@ -186,6 +189,7 @@ router.get('/', async (req: Request, res: Response) => {
       ids: templates.map((template) => String(template._id)),
     });
 
+    res.setHeader('Cache-Control', 'no-store');
     res.json({
       success: true,
       data: templates,
@@ -224,6 +228,7 @@ router.get('/product/:productId', async (req: Request, res: Response) => {
     });
 
     const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
+    res.setHeader('Cache-Control', 'no-store');
     console.log('[templates] Query result', {
       productId,
       count: templates.length,
@@ -254,6 +259,7 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    res.setHeader('Cache-Control', 'no-store');
     res.json({ success: true, data: template });
   } catch (error) {
     const err = error as Error;
@@ -368,6 +374,14 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       createdAt: savedTemplate.createdAt,
     });
 
+    emitRealtimeEvent({
+      type: 'template:created',
+      templateId: String(savedTemplate._id),
+      projectId: savedTemplate.projectId || savedTemplate.productId?.toString(),
+      productId: savedTemplate.productId?.toString(),
+      isGlobal: savedTemplate.isGlobal === true,
+    });
+
     res.status(201).json({ success: true, data: savedTemplate });
   } catch (error) {
     const err = error as Error;
@@ -418,10 +432,64 @@ router.put('/:id', async (req: Request, res: Response) => {
       updatedAt: template?.updatedAt,
     });
 
+    emitRealtimeEvent({
+      type: 'template:updated',
+      templateId: id,
+      projectId: template?.projectId || template?.productId?.toString(),
+      productId: template?.productId?.toString(),
+      isGlobal: template?.isGlobal === true,
+    });
+
     res.json({ success: true, data: template });
   } catch (error) {
     const err = error as Error;
     console.error('[templates] Template update failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.delete('/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      res.status(400).json({ success: false, error: 'Invalid template id' });
+      return;
+    }
+
+    const template = await ProductTemplate.findById(id);
+    if (!template) {
+      res.status(404).json({ success: false, error: 'Template not found' });
+      return;
+    }
+
+    await ProductTemplate.deleteOne({ _id: id });
+
+    const projectIdCandidate = template.projectId || template.productId?.toString();
+    if (projectIdCandidate && isValidObjectId(projectIdCandidate)) {
+      await Project.findByIdAndUpdate(
+        projectIdCandidate,
+        { $pull: { templates: template._id } },
+        { new: false }
+      ).catch((err: Error) => {
+        console.warn('[templates] Failed to update Project.templates array', err.message);
+      });
+    }
+
+    emitRealtimeEvent({
+      type: 'template:deleted',
+      templateId: id,
+      projectId: template.projectId || template.productId?.toString(),
+      productId: template.productId?.toString(),
+      isGlobal: template.isGlobal === true,
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    const err = error as Error;
+    console.error('[templates] Template delete failed', {
       error: err.message,
       stack: err.stack,
     });
@@ -499,8 +567,8 @@ router.post('/migration/sync-project-templates', async (req: Request, res: Respo
       database: mongoose.connection.name,
     });
 
-    const savedTemplates = [];
-    const errors = [];
+    const savedTemplates: Array<{ _id: string; templateName: string; sourceId?: string }> = [];
+    const errors: Array<{ templateName: string; error: string }> = [];
 
     for (const tpl of templates) {
       try {
@@ -527,6 +595,7 @@ router.post('/migration/sync-project-templates', async (req: Request, res: Respo
             canvas: tpl.canvas,
             margin: tpl.margin,
             applicableFor: tpl.applicableFor,
+            canvasJSON: (tpl as { canvasJSON?: string }).canvasJSON,
           },
           isActive: tpl.isPublic !== false,
           tags: [`migrated_${new Date().toISOString().split('T')[0]}`],
@@ -536,6 +605,7 @@ router.post('/migration/sync-project-templates', async (req: Request, res: Respo
         savedTemplates.push({
           _id: String(newTemplate._id),
           templateName: newTemplate.templateName,
+          sourceId: tpl.id,
         });
 
         console.log('[templates:migration] Template saved', {

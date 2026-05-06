@@ -47,6 +47,50 @@ function toLabel(key: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+// ─── Date normalization ────────────────────────────────────────────────────────
+
+const DATE_COLUMN_PATTERNS = [
+  /\bdob\b/i, /date.?of.?birth/i, /birth.?date/i, /adm.?date/i,
+  /admission.?date/i, /joining.?date/i, /created.?at/i, /expiry/i,
+  /valid.?till/i, /issue.?date/i,
+];
+
+function isDateColumn(key: string): boolean {
+  return DATE_COLUMN_PATTERNS.some((re) => re.test(key));
+}
+
+const EXCEL_EPOCH_MS = new Date(Date.UTC(1899, 11, 30)).getTime();
+
+function excelSerialToDDMMYYYY(serial: number): string | null {
+  const wholeDays = Math.floor(serial);
+  if (wholeDays < 1 || wholeDays > 2958465) return null;
+  const d = new Date(EXCEL_EPOCH_MS + wholeDays * 86400000);
+  if (isNaN(d.getTime())) return null;
+  const dd   = String(d.getUTCDate()).padStart(2, "0");
+  const mm   = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const yyyy = String(d.getUTCFullYear());
+  return `${dd}-${mm}-${yyyy}`;
+}
+
+/**
+ * Normalize a cell string value for a date column.
+ * Converts Excel serial numbers (e.g. "44413.00011574074") to DD-MM-YYYY.
+ * Leaves non-serial strings untouched.
+ */
+function normalizeDateCell(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  // Only attempt conversion if it looks like a numeric serial (5-7 digits + optional decimal)
+  if (/^\d{5,7}(\.\d+)?$/.test(trimmed)) {
+    const n = parseFloat(trimmed);
+    if (n >= 1000 && n <= 2958465) {
+      const converted = excelSerialToDDMMYYYY(n);
+      if (converted) return converted;
+    }
+  }
+  return trimmed;
+}
+
 // ─── CSV parsing ──────────────────────────────────────────────────────────────
 
 /**
@@ -76,7 +120,8 @@ export function parseCsvFile(file: File): Promise<ParsedCsv> {
         const rows: CsvRow[] = (result.data as CsvRow[]).map((row) => {
           const clean: CsvRow = {};
           fields.forEach(({ key }) => {
-            clean[key] = String(row[key] ?? "").trim();
+            const raw = String(row[key] ?? "").trim();
+            clean[key] = isDateColumn(key) ? normalizeDateCell(raw) : raw;
           });
           return clean;
         });
@@ -114,7 +159,8 @@ export function parseCsvString(csvText: string, sourceName = "paste"): ParsedCsv
   const rows: CsvRow[] = (result.data as CsvRow[]).map((row) => {
     const clean: CsvRow = {};
     fields.forEach(({ key }) => {
-      clean[key] = String(row[key] ?? "").trim();
+      const raw = String(row[key] ?? "").trim();
+      clean[key] = isDateColumn(key) ? normalizeDateCell(raw) : raw;
     });
     return clean;
   });

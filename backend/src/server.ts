@@ -14,6 +14,8 @@ import orderRoutes from './routes/orders';
 import authRoutes from './routes/auth';
 import previewRoutes from './routes/preview';
 import uploadImagesRoute from './routes/uploads';
+import realtimeRoutes from './routes/realtime';
+import rulesRoutes from './routes/rules';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -93,6 +95,8 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/preview', previewRoutes);
 app.use('/api/upload-images', uploadImagesRoute);
+app.use('/api/realtime', realtimeRoutes);
+app.use('/api/rules', rulesRoutes);
 
 // API 404 handler
 app.use('/api', (req, res) => {

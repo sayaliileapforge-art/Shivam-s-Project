@@ -330,6 +330,59 @@ export function loadProjectTemplates(projectId: string, clientId?: string): Proj
   return result;
 }
 
+/**
+ * Sync remote templates into localStorage so the designer can load them offline.
+ * Remote templates (Mongo) are treated as the source of truth.
+ */
+export function syncProjectTemplatesFromRemote(projectId: string, remoteTemplates: ProjectTemplate[]): void {
+  try {
+    const raw = localStorage.getItem(TMPL_KEY);
+    const all: ProjectTemplate[] = raw ? JSON.parse(raw) : [];
+    const remoteById = new Map(remoteTemplates.map((t) => [t.id, t]));
+
+    const next: ProjectTemplate[] = [];
+
+    for (const local of all) {
+      const remoteKey = local.remoteId && remoteById.has(local.remoteId)
+        ? local.remoteId
+        : (remoteById.has(local.id) ? local.id : null);
+
+      if (remoteKey) {
+        const remote = remoteById.get(remoteKey)!;
+        remoteById.delete(remoteKey);
+        next.push({
+          ...local,
+          ...remote,
+          id: local.id,
+          remoteId: local.remoteId ?? remote.id,
+        });
+        continue;
+      }
+
+      const isSameProject = local.projectId === projectId;
+      const isGlobal = local.isPublic === true;
+      if ((isSameProject || isGlobal) && local.remoteId) {
+        // Remote template was deleted; drop local cache.
+        continue;
+      }
+
+      next.push(local);
+    }
+
+    for (const remote of remoteById.values()) {
+      next.push({
+        ...remote,
+        id: remote.id,
+        remoteId: remote.id,
+      });
+    }
+
+    saveTemplatesLocalStorage(next);
+  } catch {
+    // Ignore sync errors; localStorage may be unavailable.
+  }
+}
+
 export function addProjectTemplate(data: Omit<ProjectTemplate, "id" | "createdAt">): ProjectTemplate {
   const raw = localStorage.getItem(TMPL_KEY);
   const all: ProjectTemplate[] = raw ? JSON.parse(raw) : [];

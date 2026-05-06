@@ -1,4 +1,5 @@
 import { API_BASE as API_ROOT, resolveProfileImageUrl } from './apiService';
+import type { ProjectTemplate } from './projectStore';
 
 export interface TemplateRecord {
   _id: string;
@@ -33,6 +34,42 @@ export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_i
     return raw;
   }
   return resolveProfileImageUrl(raw);
+}
+
+export function mapTemplateRecordToProjectTemplate(template: TemplateRecord): ProjectTemplate {
+  const designData = (template.designData || {}) as Record<string, any>;
+  const canvas = (designData.canvas && typeof designData.canvas === 'object') ? designData.canvas : {};
+  const margin = (designData.margin && typeof designData.margin === 'object') ? designData.margin : {};
+  const canvasJSON = typeof designData.canvasJSON === 'string'
+    ? designData.canvasJSON
+    : (typeof designData.canvasJson === 'string' ? designData.canvasJson : '');
+  const rawApplicableFor = designData.applicableFor;
+  const applicableFor = Array.isArray(rawApplicableFor)
+    ? rawApplicableFor.join(', ')
+    : (rawApplicableFor ? String(rawApplicableFor) : '');
+
+  return {
+    id: template._id,
+    remoteId: template._id,
+    projectId: String(template.projectId || template.productId || ''),
+    templateName: template.templateName,
+    templateType: (designData.templateType as ProjectTemplate['templateType']) || 'custom',
+    canvas: {
+      width: Number(canvas.width || 0) || 0,
+      height: Number(canvas.height || 0) || 0,
+    },
+    margin: {
+      top: Number(margin.top || 0) || 0,
+      left: Number(margin.left || 0) || 0,
+      right: Number(margin.right || 0) || 0,
+      bottom: Number(margin.bottom || 0) || 0,
+    },
+    applicableFor,
+    createdAt: template.createdAt,
+    canvasJSON: canvasJSON || undefined,
+    thumbnail: template.preview_image || template.previewImageUrl || undefined,
+    isPublic: template.isGlobal === true,
+  };
 }
 
 type TemplateSaveInput = {
@@ -96,7 +133,7 @@ export async function getTemplatesByProductId(productId: string, params?: { cate
   const queryString = query.toString();
 
   const requestUrl = `${TEMPLATE_API_BASE}/product/${productId}${queryString ? `?${queryString}` : ''}`;
-  const response = await fetch(requestUrl);
+  const response = await fetch(requestUrl, { cache: 'no-store' });
   const payload = await handleResponse<TemplateRecord[]>(response);
 
   console.info('[templateApi] /api/templates response', {
@@ -112,7 +149,7 @@ export async function getTemplates(params?: { productId?: string }): Promise<Tem
   const query = new URLSearchParams();
   if (params?.productId) query.set('productId', params.productId);
   const requestUrl = `${TEMPLATE_API_BASE}${query.toString() ? `?${query}` : ''}`;
-  const response = await fetch(requestUrl);
+  const response = await fetch(requestUrl, { cache: 'no-store' });
   const payload = await handleResponse<TemplateRecord[]>(response);
   console.info('[templateApi] GET templates', {
     url: requestUrl,
@@ -124,7 +161,7 @@ export async function getTemplates(params?: { productId?: string }): Promise<Tem
 
 export async function getTemplateById(templateId: string): Promise<TemplateRecord> {
   const requestUrl = `${TEMPLATE_API_BASE}/${templateId}`;
-  const response = await fetch(requestUrl);
+  const response = await fetch(requestUrl, { cache: 'no-store' });
   console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
   return handleResponse<TemplateRecord>(response);
 }
@@ -178,6 +215,13 @@ export async function updateTemplate(templateId: string, input: Partial<Template
   return handleResponse<TemplateRecord>(response);
 }
 
+export async function deleteTemplate(templateId: string): Promise<void> {
+  const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}`, {
+    method: 'DELETE',
+  });
+  await handleResponse<unknown>(response);
+}
+
 export async function saveSelectedTemplate(input: {
   userId?: string;
   productId: string;
@@ -198,7 +242,7 @@ export async function saveSelectedTemplate(input: {
  * This syncs locally-stored templates to the backend for persistence
  */
 export async function migrateProjectTemplatesToDatabase(projectId: string, templates: any[]): Promise<{
-  saved: Array<{ _id: string; templateName: string }>;
+  saved: Array<{ _id: string; templateName: string; sourceId?: string }>;
   errors: Array<{ templateName: string; error: string }>;
 }> {
   console.log('[templateApi:migration] Starting migration', {
@@ -220,12 +264,13 @@ export async function migrateProjectTemplatesToDatabase(projectId: string, templ
         thumbnail: t.thumbnail,
         isPublic: t.isPublic,
         applicableFor: t.applicableFor,
+        canvasJSON: t.canvasJSON,
       })),
     }),
   });
 
   const result = await handleResponse<{
-    saved: Array<{ _id: string; templateName: string }>;
+    saved: Array<{ _id: string; templateName: string; sourceId?: string }>;
     errors: Array<{ templateName: string; error: string }>;
   }>(response);
 

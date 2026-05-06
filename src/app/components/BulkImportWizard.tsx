@@ -62,6 +62,71 @@ function validPhone(v?: string | number) {
   return !!v && /^\+?\d{7,15}$/.test(String(v).replace(/[\s\-()]/g, ""));
 }
 
+// ─── Excel serial-date converter ──────────────────────────────────────────────
+// Excel serial: days since 1900-01-00 (with the 1900 leap-year bug).
+// SheetJS with cellDates:true converts most dates to JS Date objects,
+// but may still emit numeric serials for some cells (especially CSV mode).
+// This function handles both cases.
+
+const EXCEL_EPOCH = new Date(Date.UTC(1899, 11, 30)); // 1899-12-30 UTC
+
+/** Format a JS Date as DD-MM-YYYY */
+function formatDDMMYYYY(d: Date): string {
+  const dd   = String(d.getUTCDate()).padStart(2, "0");
+  const mm   = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const yyyy = String(d.getUTCFullYear());
+  return `${dd}-${mm}-${yyyy}`;
+}
+
+/** Convert an Excel serial number to DD-MM-YYYY, or return null if not a valid serial. */
+export function excelSerialToDate(serial: number): string | null {
+  // Valid Excel date serials are in range 1 – 2958465 (approx year 9999)
+  // Decimals beyond the dot represent time-of-day fractions — we strip them.
+  const wholeDays = Math.floor(serial);
+  if (wholeDays < 1 || wholeDays > 2958465) return null;
+  const ms = EXCEL_EPOCH.getTime() + wholeDays * 86400000;
+  const d  = new Date(ms);
+  if (isNaN(d.getTime())) return null;
+  return formatDDMMYYYY(d);
+}
+
+/**
+ * Detect whether a raw string value looks like an Excel date serial
+ * (a number with 5 digits and optional decimal, between 1 and 2958465).
+ */
+function looksLikeExcelSerial(v: string): boolean {
+  if (!/^\d{5,7}(\.\d+)?$/.test(v.trim())) return false;
+  const n = parseFloat(v);
+  return n >= 1000 && n <= 2958465;
+}
+
+/**
+ * Normalize any cell value coming from SheetJS:
+ * - JS Date  → DD-MM-YYYY
+ * - numeric serial (still a number) → DD-MM-YYYY
+ * - string that looks like serial → DD-MM-YYYY
+ * - anything else → String(v)
+ */
+export function normalizeExcelCellValue(v: unknown): string {
+  if (v == null) return "";
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return "";
+    return formatDDMMYYYY(v);
+  }
+  if (typeof v === "number") {
+    // Could be a serial date — only convert if it's in plausible date range
+    const converted = excelSerialToDate(v);
+    if (converted) return converted;
+    return String(v);
+  }
+  const str = String(v).trim();
+  if (looksLikeExcelSerial(str)) {
+    const converted = excelSerialToDate(parseFloat(str));
+    if (converted) return converted;
+  }
+  return str;
+}
+
 // ─── Step indicator ───────────────────────────────────────────────────────────
 
 function StepBar({ step }: { step: Step }) {
@@ -140,13 +205,15 @@ export function BulkImportWizard({ projectId, category, onComplete, onCancel }: 
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const wb = XLSX.read(e.target?.result, { type: "array" });
+        const wb = XLSX.read(e.target?.result, { type: "array", cellDates: true, dateNF: "DD-MM-YYYY" });
         const ws = wb.Sheets[wb.SheetNames[0]];
-        const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: "" });
+        const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: "", raw: false });
         if (!json.length) { setErrors(["The file appears to be empty."]); return; }
         const detectedHeaders = Object.keys(json[0]);
         const stringRows = json.map((row) =>
-          Object.fromEntries(Object.entries(row).map(([k, v]) => [k, String(v ?? "")]))
+          Object.fromEntries(
+            Object.entries(row).map(([k, v]) => [k, normalizeExcelCellValue(v)])
+          )
         ) as Record<string, string>[];
         setFilename(file.name);
         setHeaders(detectedHeaders);

@@ -47,15 +47,14 @@ import { CsvDataPanel } from "../components/designer/CsvDataPanel";
 import { HRuler, VRuler, RULER_THICKNESS } from "../components/designer/Ruler";
 import { rowToRenderInput, type ParsedCsv, type CsvRow } from "../../lib/csvBinding";
 import {
-  loadDesignerConfig, DEFAULT_CONFIG, DESIGNER_SAVE_KEY, DESIGNER_CONTEXT_KEY,
+  DEFAULT_CONFIG, DESIGNER_CONTEXT_KEY,
   mmToPx, PAGE_PRESETS, type TemplateConfig, type DesignerContext,
 } from "../../lib/fabricUtils";
 import {
-  loadProjects, loadProjectTemplates, addProjectTemplate,
-  updateProjectTemplate, type Project,
+  loadProjects, type Project, type ProjectTemplate,
 } from "../../lib/projectStore";
 import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
-import { createTemplate, updateTemplate } from "../../lib/templateApi";
+import { createTemplate, updateTemplate, getTemplateById, mapTemplateRecordToProjectTemplate } from "../../lib/templateApi";
 import { normalizeShapePreviewSvg, type ShapeItem } from "../../lib/shapesGallery";
 
 // --- Types --------------------------------------------------------------------
@@ -382,9 +381,9 @@ export function DesignerStudio() {
   const pendingUploadFieldKeyRef = useRef<string>("");
 
   // -- Core state -------------------------------------------------------------
-  const [config, setConfig] = useState<TemplateConfig>(
-    () => loadDesignerConfig() ?? DEFAULT_CONFIG
-  );
+  const [config, setConfig] = useState<TemplateConfig>(() => DEFAULT_CONFIG);
+  const [activeTemplate, setActiveTemplate] = useState<ProjectTemplate | null>(null);
+  const activeTemplateRef = useRef<ProjectTemplate | null>(null);
   const [isEditingName, setIsEditingName] = useState(false);
   const [showTopLabel,  setShowTopLabel]  = useState(false);
   const [showGuides,    setShowGuides]    = useState(true);
@@ -446,6 +445,10 @@ export function DesignerStudio() {
     (_r?: "debounce" | "unmount") => false
   );
 
+  useEffect(() => {
+    activeTemplateRef.current = activeTemplate;
+  }, [activeTemplate]);
+
   /**
    * DIRECT synchronous save — called immediately after deleteSelected().
    *
@@ -458,11 +461,14 @@ export function DesignerStudio() {
    *
    * This function bypasses all of that:
    *   1. Reads the live Fabric canvas directly → deleted object is already gone.
-   *   2. Calls updateProjectTemplate directly → no guards, no hash check.
+  *   2. Calls updateTemplate directly → no guards, no hash check.
    *   3. Resets lastPersistedHashRef so the debounce save afterwards also runs.
    */
   const forceSaveAfterDelete = () => {
     if (!designerContext?.templateId || !designerContext.projectId) return;
+
+    const existingTemplate = activeTemplateRef.current;
+    if (!existingTemplate) return;
 
     // Read current canvas state — fc.remove(obj) has already run synchronously.
     const currentCanvas = canvasRef.current?.toJSON();
@@ -485,10 +491,50 @@ export function DesignerStudio() {
       elementMetadata,
     });
 
-    // Write directly to localStorage — no guards, no async delays.
-    try {
-      updateProjectTemplate(designerContext.templateId, { canvasJSON: canJSON });
-    } catch { /* ignore — localStorage may be full */ }
+    const templateName = (config.templateName || existingTemplate.templateName || "Untitled Template").trim()
+      || "Untitled Template";
+    const remoteId = existingTemplate.remoteId;
+    const targetId = isMongoId(remoteId) ? remoteId : (isMongoId(existingTemplate.id) ? existingTemplate.id : null);
+
+    if (targetId) {
+      let thumb = existingTemplate.thumbnail;
+      try {
+        const rawThumb = canvasRef.current?.toPNG();
+        if (rawThumb && rawThumb.startsWith('data:')) thumb = rawThumb;
+      } catch {
+        // Keep existing thumbnail
+      }
+      void updateTemplate(targetId, {
+        productId: designerContext.projectId,
+        projectId: designerContext.projectId,
+        templateName,
+        preview_image: thumb || "",
+        designData: {
+          templateType: config.templateType,
+          canvas: config.canvas,
+          margin: config.margin,
+          applicableFor: existingTemplate.applicableFor ?? "",
+          canvasJSON: canJSON,
+        },
+        isGlobal: saveIsPublic,
+        isPublic: saveIsPublic,
+      }).catch((error) => {
+        console.warn("[designer] Failed to persist template to MongoDB", error);
+      });
+
+      setActiveTemplate((prev) => prev
+        ? {
+          ...prev,
+          templateName,
+          templateType: config.templateType,
+          canvas: config.canvas,
+          margin: config.margin,
+          thumbnail: thumb,
+          isPublic: saveIsPublic,
+          canvasJSON: canJSON,
+        }
+        : prev);
+    }
 
     // Update the hash so the 900ms debounce save doesn't re-run unnecessarily.
     lastPersistedHashRef.current = JSON.stringify({
@@ -505,7 +551,7 @@ export function DesignerStudio() {
   const initialTemplateLoadDoneRef = useRef(false);
 
   // -- Designer context -------------------------------------------------------
-  const [designerContext] = useState<DesignerContext | null>(() => {
+  const [designerContext, setDesignerContext] = useState<DesignerContext | null>(() => {
     try { const raw = localStorage.getItem(DESIGNER_CONTEXT_KEY); return raw ? JSON.parse(raw) : null; }
     catch { return null; }
   });
@@ -524,16 +570,7 @@ export function DesignerStudio() {
       return false;
     }
   });
-  const [saveIsPublic,     setSaveIsPublic]      = useState<boolean>(() => {
-    if (designerContext?.templateId) {
-      try {
-        const t = loadProjectTemplates(designerContext.projectId)
-          .find((t) => t.id === designerContext.templateId);
-        return t?.isPublic ?? true;
-      } catch { return true; }
-    }
-    return true;
-  });
+  const [saveIsPublic,     setSaveIsPublic]      = useState<boolean>(true);
 
   const refresh = useCallback(() => {
     setTick((t) => t + 1);
@@ -897,72 +934,90 @@ export function DesignerStudio() {
 
     initialTemplateLoadDoneRef.current = false;
 
-    const tmpl = loadProjectTemplates(designerContext.projectId)
-      .find((t) => t.id === designerContext.templateId);
-    if (!tmpl) {
-      initialTemplateLoadDoneRef.current = true;
-      return;
-    }
+    let mounted = true;
 
-    const resolvedMargin = resolveTemplateMargin(tmpl as any, DEFAULT_CONFIG.margin);
-
-    // Always apply template-level config so width/height/margins from modal
-    // are reflected even for newly created templates without canvasJSON.
-    setConfig((prev) => ({
-      ...prev,
-      templateName: tmpl.templateName || prev.templateName,
-      templateType: tmpl.templateType || prev.templateType,
-      canvas: tmpl.canvas || prev.canvas,
-      margin: resolvedMargin,
-    }));
-
-    if (!tmpl.canvasJSON) {
-      setPages([{ id: "page-1", name: "Page 1", canvas: EMPTY_CANVAS_JSON }]);
-      setActivePageId("page-1");
-      setPageCounter(1);
-      setPageLoadNonce((n) => n + 1);
-      refresh();
-      initialTemplateLoadDoneRef.current = true;
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      try {
-        const parsed = JSON.parse(tmpl.canvasJSON!);
-        if (parsed?.config) {
-          const parsedConfig = parsed.config as TemplateConfig;
-          setConfig({
-            ...parsedConfig,
-            // Template record values from modal form must win.
-            templateName: tmpl.templateName || parsedConfig.templateName,
-            templateType: tmpl.templateType || parsedConfig.templateType,
-            canvas: tmpl.canvas || parsedConfig.canvas,
-            margin: resolvedMargin,
-          });
-        }
-        if (Array.isArray(parsed?.pages)) {
-          const loaded = normalizePages(parsed.pages);
-          const nextActive = loaded.some((p) => p.id === parsed.activePageId)
-            ? parsed.activePageId : loaded[0].id;
-          setPages(loaded); setPageCounter(Math.max(loaded.length, 1)); setActivePageId(nextActive);
-          setPageLoadNonce((n) => n + 1);
-        } else if (parsed?.canvas) {
-          setPages([{ id: "page-1", name: "Page 1", canvas: parsed.canvas }]);
-          setActivePageId("page-1"); setPageCounter(1);
-          setPageLoadNonce((n) => n + 1);
-        }
-        refresh();
-      } catch { /* ignore */ }
-      finally {
+    const loadTemplate = async () => {
+      if (!isMongoId(designerContext.templateId)) {
         initialTemplateLoadDoneRef.current = true;
+        return;
       }
-    }, 300);
-    return () => clearTimeout(timer);
+
+      try {
+        const remote = await getTemplateById(designerContext.templateId);
+        if (!mounted) return;
+
+        const tmpl = mapTemplateRecordToProjectTemplate(remote);
+        setActiveTemplate(tmpl);
+        setSaveIsPublic(tmpl.isPublic ?? true);
+
+        const resolvedMargin = resolveTemplateMargin(tmpl as any, DEFAULT_CONFIG.margin);
+
+        // Always apply template-level config so width/height/margins from modal
+        // are reflected even for newly created templates without canvasJSON.
+        setConfig((prev) => ({
+          ...prev,
+          templateName: tmpl.templateName || prev.templateName,
+          templateType: tmpl.templateType || prev.templateType,
+          canvas: tmpl.canvas || prev.canvas,
+          margin: resolvedMargin,
+        }));
+
+        if (!tmpl.canvasJSON) {
+          setPages([{ id: "page-1", name: "Page 1", canvas: EMPTY_CANVAS_JSON }]);
+          setActivePageId("page-1");
+          setPageCounter(1);
+          setPageLoadNonce((n) => n + 1);
+          refresh();
+          initialTemplateLoadDoneRef.current = true;
+          return;
+        }
+
+        const timer = setTimeout(() => {
+          try {
+            const parsed = JSON.parse(tmpl.canvasJSON!);
+            if (parsed?.config) {
+              const parsedConfig = parsed.config as TemplateConfig;
+              setConfig({
+                ...parsedConfig,
+                // Template record values from modal form must win.
+                templateName: tmpl.templateName || parsedConfig.templateName,
+                templateType: tmpl.templateType || parsedConfig.templateType,
+                canvas: tmpl.canvas || parsedConfig.canvas,
+                margin: resolvedMargin,
+              });
+            }
+            if (Array.isArray(parsed?.pages)) {
+              const loaded = normalizePages(parsed.pages);
+              const nextActive = loaded.some((p) => p.id === parsed.activePageId)
+                ? parsed.activePageId : loaded[0].id;
+              setPages(loaded); setPageCounter(Math.max(loaded.length, 1)); setActivePageId(nextActive);
+              setPageLoadNonce((n) => n + 1);
+            } else if (parsed?.canvas) {
+              setPages([{ id: "page-1", name: "Page 1", canvas: parsed.canvas }]);
+              setActivePageId("page-1"); setPageCounter(1);
+              setPageLoadNonce((n) => n + 1);
+            }
+            refresh();
+          } catch { /* ignore */ }
+          finally {
+            initialTemplateLoadDoneRef.current = true;
+          }
+        }, 300);
+
+        return () => clearTimeout(timer);
+      } catch {
+        if (mounted) {
+          initialTemplateLoadDoneRef.current = true;
+          toast.error("Template could not be loaded from the server.");
+        }
+      }
+    };
+
+    void loadTemplate();
+    return () => { mounted = false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => { localStorage.setItem(DESIGNER_SAVE_KEY, JSON.stringify(config)); }, [config]);
 
   useEffect(() => {
     const activePage = pages.find((p) => p.id === activePageId);
@@ -1067,8 +1122,7 @@ export function DesignerStudio() {
     if (!designerContext?.templateId || !designerContext.projectId) return false;
     if (!initialTemplateLoadDoneRef.current || importMode || isSaving) return false;
 
-    const existingTemplate = loadProjectTemplates(designerContext.projectId)
-      .find((template) => template.id === designerContext.templateId);
+    const existingTemplate = activeTemplateRef.current;
     if (!existingTemplate) return false;
 
     const templateName = (config.templateName || existingTemplate.templateName || "Untitled Template").trim() || "Untitled Template";
@@ -1113,16 +1167,40 @@ export function DesignerStudio() {
     } catch {
       // Keep existing thumbnail — do NOT abort the save.
     }
+    const remoteId = existingTemplate.remoteId;
+    const targetId = isMongoId(remoteId) ? remoteId : (isMongoId(existingTemplate.id) ? existingTemplate.id : null);
+    if (targetId) {
+      void updateTemplate(targetId, {
+        productId: designerContext.projectId,
+        projectId: designerContext.projectId,
+        templateName,
+        preview_image: thumb || "",
+        designData: {
+          templateType: config.templateType,
+          canvas: config.canvas,
+          margin: config.margin,
+          applicableFor: existingTemplate.applicableFor ?? "",
+          canvasJSON: canJSON,
+        },
+        isGlobal: saveIsPublic,
+        isPublic: saveIsPublic,
+      }).catch((error) => {
+        console.warn("[designer] Failed to persist template to MongoDB", error);
+      });
+    }
 
-    updateProjectTemplate(designerContext.templateId, {
-      templateName,
-      templateType: config.templateType,
-      canvas: config.canvas,
-      margin: config.margin,
-      canvasJSON: canJSON,
-      thumbnail: thumb,
-      isPublic: saveIsPublic,
-    });
+    setActiveTemplate((prev) => prev
+      ? {
+        ...prev,
+        templateName,
+        templateType: config.templateType,
+        canvas: config.canvas,
+        margin: config.margin,
+        thumbnail: thumb,
+        isPublic: saveIsPublic,
+        canvasJSON: canJSON,
+      }
+      : prev);
 
     lastPersistedHashRef.current = persistHash;
     return true;
@@ -1214,16 +1292,6 @@ export function DesignerStudio() {
       canvas: snap.find((p) => p.id === activePageId)?.canvas ?? EMPTY_CANVAS_JSON,
       elementMetadata,
     });
-    const persistHash = JSON.stringify({
-      projectId,
-      templateId: existingId || "",
-      templateName: name,
-      templateType: config.templateType,
-      canvas: config.canvas,
-      margin: config.margin,
-      isPublic: saveIsPublic,
-      canJSON,
-    });
     // toPNG can throw if cross-origin images taint the canvas — fall back to empty string
     let thumb: string | undefined;
     try { thumb = canvasRef.current?.toPNG() ?? undefined; } catch { thumb = undefined; }
@@ -1237,78 +1305,64 @@ export function DesignerStudio() {
     };
     setIsSaving(true);
     try {
-      const hasExisting = Boolean(existingId) && loadProjectTemplates(projectId).some((t) => t.id === existingId);
-      if (existingId && hasExisting) {
-        updateProjectTemplate(existingId, {
-          templateName: name, templateType: config.templateType,
-          canvas: config.canvas, margin: config.margin,
-          canvasJSON: canJSON, thumbnail: thumb, isPublic: saveIsPublic,
+      if (existingId && isMongoId(existingId)) {
+        const updated = await updateTemplate(existingId, {
+          productId: projectId,
+          projectId,
+          templateName: name,
+          preview_image: thumb || "",
+          designData,
+          isGlobal: saveIsPublic,
+          isPublic: saveIsPublic,
         });
 
-        const existingTemplate = loadProjectTemplates(projectId).find((t) => t.id === existingId);
-        const remoteId = existingTemplate?.remoteId;
-        try {
-          if (isMongoId(remoteId) || isMongoId(existingId)) {
-            await updateTemplate((remoteId && isMongoId(remoteId)) ? remoteId : existingId, {
-              productId: projectId,
-              projectId,
-              templateName: name,
-              preview_image: thumb || '',
-              designData,
-              isGlobal: saveIsPublic,
-              isPublic: saveIsPublic,
-            });
-          } else {
-            const created = await createTemplate({
-              productId: projectId,
-              projectId,
-              templateName: name,
-              preview_image: thumb || '',
-              category: "Other",
-              designData,
-              isGlobal: saveIsPublic,
-              isPublic: saveIsPublic,
-            });
-            updateProjectTemplate(existingId, { remoteId: created._id });
-          }
-        } catch (error) {
-          console.warn("[designer] Failed to persist template to MongoDB", error);
-          toast.warning("Template updated locally. MongoDB save failed.");
-        }
+        const mapped = mapTemplateRecordToProjectTemplate(updated);
+        setActiveTemplate(mapped);
 
+        const persistHash = JSON.stringify({
+          projectId,
+          templateId: existingId,
+          templateName: name,
+          templateType: config.templateType,
+          canvas: config.canvas,
+          margin: config.margin,
+          isPublic: saveIsPublic,
+          canJSON,
+        });
         lastPersistedHashRef.current = persistHash;
         toast.success(`Template "${name}" updated`);
       } else {
-        const savedLocal = addProjectTemplate({
-          projectId, templateName: name, templateType: config.templateType,
-          canvas: config.canvas, margin: config.margin, applicableFor: proj?.name ?? "",
-          canvasJSON: canJSON, thumbnail: thumb, isPublic: saveIsPublic,
+        const created = await createTemplate({
+          productId: projectId,
+          projectId,
+          templateName: name,
+          preview_image: thumb || "",
+          category: "Other",
+          designData,
+          isGlobal: saveIsPublic,
+          isPublic: saveIsPublic,
         });
-        try {
-          const created = await createTemplate({
-            productId: projectId,
-            projectId,
-            templateName: name,
-            preview_image: thumb || '',
-            category: "Other",
-            designData,
-            isGlobal: saveIsPublic,
-            isPublic: saveIsPublic,
-          });
-          updateProjectTemplate(savedLocal.id, { remoteId: created._id });
-          console.log('[designer] Template saved to MongoDB', { _id: created._id, projectId, templateName: name });
-        } catch (error) {
-          console.warn("[designer] Failed to persist template to MongoDB", error);
-          toast.warning("Template saved locally. MongoDB save failed.");
-        }
-        const saved = loadProjectTemplates(projectId).at(-1);
-        if (saved) {
-          const ctx: DesignerContext = {
-            projectId, templateId: saved.id,
-            projectName: proj?.name, templateName: name,
-          };
-          localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify(ctx));
-        }
+
+        const mapped = mapTemplateRecordToProjectTemplate(created);
+        setActiveTemplate(mapped);
+
+        const ctx: DesignerContext = {
+          projectId, templateId: mapped.id,
+          projectName: proj?.name, templateName: name,
+        };
+        setDesignerContext(ctx);
+        localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify(ctx));
+
+        const persistHash = JSON.stringify({
+          projectId,
+          templateId: mapped.id,
+          templateName: name,
+          templateType: config.templateType,
+          canvas: config.canvas,
+          margin: config.margin,
+          isPublic: saveIsPublic,
+          canJSON,
+        });
         lastPersistedHashRef.current = persistHash;
         toast.success(`Template "${name}" saved`);
       }

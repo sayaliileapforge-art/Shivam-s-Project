@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import {
   Search, Globe, Star, Clock, Heart, ChevronLeft,
@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { cn } from "../components/ui/utils";
 import { getTemplates, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { subscribeToTemplateUpdates } from "../../lib/realtime";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -232,6 +233,7 @@ export function TemplateGallery() {
   const [templates, setTemplates]   = useState<TemplateRecord[]>([]);
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState("");
+  const realtimeRefreshRef = useRef<number | null>(null);
 
   // Sidebar filters
   const [selectedCategories, setSelectedCategories] = useState<string[]>(["all"]);
@@ -255,7 +257,7 @@ export function TemplateGallery() {
     try { return JSON.parse(localStorage.getItem("tg_recent") ?? "[]") as string[]; } catch { return []; }
   });
 
-  useEffect(() => {
+  const fetchTemplates = useCallback(() => {
     setLoading(true);
     setError("");
     getTemplates()
@@ -263,6 +265,28 @@ export function TemplateGallery() {
       .catch((err) => setError((err as Error).message ?? "Failed to load templates"))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    fetchTemplates();
+  }, [fetchTemplates]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeToTemplateUpdates(undefined, () => {
+      if (realtimeRefreshRef.current) return;
+      realtimeRefreshRef.current = window.setTimeout(() => {
+        realtimeRefreshRef.current = null;
+        fetchTemplates();
+      }, 300);
+    });
+
+    return () => {
+      if (realtimeRefreshRef.current) {
+        window.clearTimeout(realtimeRefreshRef.current);
+        realtimeRefreshRef.current = null;
+      }
+      unsubscribe();
+    };
+  }, [fetchTemplates]);
 
   useEffect(() => { localStorage.setItem("tg_favorites", JSON.stringify(favorites)); }, [favorites]);
   useEffect(() => { localStorage.setItem("tg_recent", JSON.stringify(recentlyUsed)); }, [recentlyUsed]);
