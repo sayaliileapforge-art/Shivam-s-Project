@@ -2,11 +2,12 @@ import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import {
   Search, Globe, Star, Clock, Heart, ChevronLeft,
-  ChevronRight, RotateCcw, Eye, Plus, X, ChevronDown, ImageOff,
+  ChevronRight, RotateCcw, Eye, Plus, X, ChevronDown, ImageOff, Loader2,
 } from "lucide-react";
 import { cn } from "../components/ui/utils";
-import { getTemplates, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { getTemplates, createTemplate, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
+import { toast } from "sonner";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -95,9 +96,11 @@ interface TemplateCardProps {
   onPreview: (t: TemplateRecord) => void;
   isFavorite: boolean;
   onToggleFavorite: (id: string) => void;
+  isAttaching?: boolean;
+  projectId?: string | null;
 }
 
-function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavorite }: TemplateCardProps) {
+function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavorite, isAttaching, projectId }: TemplateCardProps) {
   const [imgError, setImgError] = useState(false);
   const previewSrc = resolveTemplatePreview(t);
   const displayCategory = deriveDisplayCategory(t);
@@ -151,10 +154,14 @@ function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavor
         </div>
         <div className="flex gap-2">
           <button
-            onClick={() => onUse(t)}
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-blue-600 bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 active:bg-blue-800 transition-colors"
+            onClick={() => !isAttaching && onUse(t)}
+            disabled={isAttaching}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-blue-600 bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 active:bg-blue-800 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <Plus className="h-3.5 w-3.5" /> Use Template
+            {isAttaching
+              ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Attaching…</>
+              : <><Plus className="h-3.5 w-3.5" /> {projectId ? "Attach to Project" : "Use Template"}</>
+            }
           </button>
           <button
             onClick={() => onPreview(t)}
@@ -256,6 +263,7 @@ export function TemplateGallery() {
   const [recentlyUsed, setRecentlyUsed] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem("tg_recent") ?? "[]") as string[]; } catch { return []; }
   });
+  const [attachingTemplateId, setAttachingTemplateId] = useState<string | null>(null);
 
   const fetchTemplates = useCallback(() => {
     setLoading(true);
@@ -331,7 +339,32 @@ export function TemplateGallery() {
   useEffect(() => { setCurrentPage(1); },
     [query, selectedCategories, selectedSizes, orientation, activeTab, dropdownSize, dropdownCategory, dropdownOrientation]);
 
-  const handleUseTemplate = (t: TemplateRecord) => {
+  const handleUseTemplate = async (t: TemplateRecord) => {
+    if (projectId) {
+      // Attach (clone) the template into the current project
+      setAttachingTemplateId(t._id);
+      try {
+        await createTemplate({
+          productId: projectId,
+          projectId: projectId,
+          templateName: t.templateName,
+          preview_image: resolveTemplatePreview(t),
+          category: (t.category as any) || "Other",
+          designData: t.designData ?? {},
+          isGlobal: false,
+          isPublic: false,
+        });
+        setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
+        toast.success(`"${t.templateName}" attached to project.`);
+        navigate(`/projects/${projectId}`);
+      } catch (err) {
+        toast.error((err as Error).message || "Failed to attach template to project.");
+      } finally {
+        setAttachingTemplateId(null);
+      }
+      return;
+    }
+    // Default: open in Designer Studio
     setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
     navigate(`/designer-studio?templateId=${t._id}`);
   };
@@ -372,16 +405,29 @@ export function TemplateGallery() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Template Gallery</h1>
           <p className="mt-0.5 text-sm text-gray-500">
-            Browse public templates, open any design, customize it in Designer Studio, and save as a new template.
+            {projectId
+              ? "Browse public templates and click \"Attach to Project\" to add one to your project."
+              : "Browse public templates, open any design, customize it in Designer Studio, and save as a new template."}
           </p>
         </div>
         <button
           onClick={() => navigate(projectId ? `/projects/${projectId}` : "/projects")}
           className="ml-4 flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors shadow-sm"
         >
-          <ChevronLeft className="h-4 w-4" /> Back to Project
+          <ChevronLeft className="h-4 w-4" /> {projectId ? "Back to Project" : "Back"}
         </button>
       </div>
+
+      {/* ── Context banner when attaching to a project ── */}
+      {projectId && (
+        <div className="border-b bg-blue-50 px-6 py-3 flex items-center gap-3">
+          <Globe className="h-4 w-4 text-blue-600 shrink-0" />
+          <p className="text-sm text-blue-800">
+            You are selecting a template for project <strong className="font-semibold">{projectId}</strong>.
+            Click <strong className="font-semibold">"Attach to Project"</strong> on any template to add it to your project.
+          </p>
+        </div>
+      )}
 
       {/* ── Top filter bar ── */}
       <div className="flex flex-wrap items-center gap-3 border-b bg-white px-6 py-3">
@@ -597,10 +643,12 @@ export function TemplateGallery() {
                   <div key={t._id} className="w-52 shrink-0">
                     <TemplateCard
                       template={t}
-                      onUse={handleUseTemplate}
+                      onUse={(tmpl) => void handleUseTemplate(tmpl)}
                       onPreview={setPreviewTemplate}
                       isFavorite={favorites.includes(t._id)}
                       onToggleFavorite={toggleFavorite}
+                      isAttaching={attachingTemplateId === t._id}
+                      projectId={projectId}
                     />
                   </div>
                 ))}
@@ -640,10 +688,12 @@ export function TemplateGallery() {
                   <TemplateCard
                     key={t._id}
                     template={t}
-                    onUse={handleUseTemplate}
+                    onUse={(tmpl) => void handleUseTemplate(tmpl)}
                     onPreview={setPreviewTemplate}
                     isFavorite={favorites.includes(t._id)}
                     onToggleFavorite={toggleFavorite}
+                    isAttaching={attachingTemplateId === t._id}
+                    projectId={projectId}
                   />
                 ))}
               </div>

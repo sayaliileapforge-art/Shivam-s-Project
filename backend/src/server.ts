@@ -16,6 +16,12 @@ import previewRoutes from './routes/preview';
 import uploadImagesRoute from './routes/uploads';
 import realtimeRoutes from './routes/realtime';
 import rulesRoutes from './routes/rules';
+import importsRoutes from './routes/imports';
+import { bullBoardRouter } from './queues/bullBoard';
+// Start the BullMQ worker in-process (runs concurrently alongside Express).
+// For independent horizontal scaling, move this import to a separate entry
+// point (e.g. backend/src/worker.ts) and run it as its own process/container.
+import './workers/bulkImportWorker';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -97,6 +103,11 @@ app.use('/api/preview', previewRoutes);
 app.use('/api/upload-images', uploadImagesRoute);
 app.use('/api/realtime', realtimeRoutes);
 app.use('/api/rules', rulesRoutes);
+app.use('/api/imports', importsRoutes);
+
+// Bull Board queue monitoring dashboard — http://localhost:5000/admin/queues
+// ⚠️  Protect with auth middleware in production.
+app.use('/admin/queues', bullBoardRouter);
 
 // API 404 handler
 app.use('/api', (req, res) => {

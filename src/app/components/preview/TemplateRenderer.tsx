@@ -22,13 +22,13 @@ const GRID_PAGE_SIZE = 6;
 // ── Module-level template data cache ─────────────────────────────────────────
 // Keyed by templateId + canvasJSON byte-length so the same template is parsed
 // at most ONCE per browser session regardless of how many cards are rendered.
-interface CachedTemplateData {
+export interface CachedTemplateData {
   config: ResolvedTemplateConfig;
   dynamicTexts: DynamicTextObject[];
 }
 const _tmplCache = new Map<string, CachedTemplateData>();
 
-function getTemplateCached(template: ProjectTemplate): CachedTemplateData {
+export function getTemplateCached(template: ProjectTemplate): CachedTemplateData {
   const key = `${template.id}:${template.canvasJSON?.length ?? 0}:${template.thumbnail ? template.thumbnail.slice(0, 16) : ""}`;
   const hit = _tmplCache.get(key);
   if (hit) return hit;
@@ -168,7 +168,7 @@ function toCanonicalFieldKey(rawKey: string): TemplateFieldName | "" {
   return "";
 }
 
-function getRecordField(record: ProjectDataRecord, fieldName: TemplateFieldName): string {
+export function getRecordField(record: ProjectDataRecord, fieldName: TemplateFieldName): string {
   const aliases = FIELD_ALIASES[fieldName] || [fieldName];
   for (const alias of aliases) {
     const direct = String(record[alias] ?? "").trim();
@@ -181,7 +181,7 @@ function getRecordField(record: ProjectDataRecord, fieldName: TemplateFieldName)
   return "";
 }
 
-function resolveStudentPhotoUrl(record: ProjectDataRecord): string {
+export function resolveStudentPhotoUrl(record: ProjectDataRecord): string {
   const photoRaw = getRecordField(record, "photo");
   const resolved = resolveProfileImageUrl(photoRaw);
   if (!resolved) return FALLBACK_AVATAR;
@@ -240,7 +240,7 @@ const TEMPLATE_VAR_ALIASES: Record<string, string[]> = {
  *   2. Alias table ("FULL_NAME" → norm "fullname" → tries "Name", "name", …)
  *   3. Any record key whose lowercase-alphanumeric form equals the normalised key
  */
-function mapData(text: string, student: ProjectDataRecord): string {
+export function mapData(text: string, student: ProjectDataRecord): string {
   return text.replace(/\{\{([^}]+)\}\}/g, (_, rawKey: string) => {
     const key = rawKey.trim();
 
@@ -264,7 +264,7 @@ function mapData(text: string, student: ProjectDataRecord): string {
   });
 }
 
-interface DynamicTextObject {
+export interface DynamicTextObject {
   text: string;
   left: number;
   top: number;

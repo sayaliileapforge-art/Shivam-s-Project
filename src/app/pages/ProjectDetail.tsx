@@ -58,7 +58,7 @@ import {
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { toast } from "sonner";
 import { BulkImportWizard } from "../components/BulkImportWizard";
-import { IdCard, IdCardGrid, getTemplateSlugForRender, studentHasPhoto } from "../components/preview/TemplateRenderer";
+import { IdCard, IdCardGrid, getTemplateSlugForRender, studentHasPhoto, getTemplateCached, resolveStudentPhotoUrl, resolveTemplateConfig, mapData, getRecordField, type DynamicTextObject } from "../components/preview/TemplateRenderer";
 import { createTemplate, deleteTemplate, mapTemplateRecordToProjectTemplate, migrateProjectTemplatesToDatabase, type TemplateRecord } from "../../lib/templateApi";
 import { matchImages, type BulkMatchResult } from "../../lib/imageMatchEngine";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
@@ -632,10 +632,12 @@ export function ProjectDetail() {
   const [isGenerateBarcodeOpen, setIsGenerateBarcodeOpen] = useState(false);
   const [barcodeField, setBarcodeField] = useState("");
   const [isGeneratePreviewOpen, setIsGeneratePreviewOpen] = useState(false);
+  const [previewDialogStep, setPreviewDialogStep] = useState<1 | 2>(1);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
-  // When true, the hidden off-screen print layout is mounted so html2canvas can capture it.
-  const [isPrintLayoutMounted, setIsPrintLayoutMounted] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [previewProgressText, setPreviewProgressText] = useState("");
+  // Used to abort an in-progress generation when the dialog is closed.
+  const abortRef = useRef<AbortController | null>(null);
   const [previewForm, setPreviewForm] = useState<PreviewGenerationForm>(emptyPreviewForm);
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
 
@@ -1835,7 +1837,6 @@ export function ProjectDetail() {
   };
 
   const selectedRecords = dataRecords.filter((record) => dataSelectedIds.has(record.id));
-  const previewCapturePagesRef = useRef<Array<HTMLDivElement | null>>([]);
 
   const printLayout = useMemo(() => {
     const sheetWidthMm = Number(previewForm.sheetWidthMm);
@@ -1895,49 +1896,13 @@ export function ProjectDetail() {
     [selectedRecords]
   );
 
-  useEffect(() => {
-    previewCapturePagesRef.current = previewCapturePagesRef.current.slice(0, previewPrintPages.length);
-  }, [previewPrintPages.length]);
-
-  // When the hidden print layout is mounted (isPrintLayoutMounted flips to true),
-  // wait one animation frame so React has painted the DOM, then run the capture.
-  const runPdfCaptureRef = useRef<(() => Promise<void>) | null>(null);
-  useEffect(() => {
-    if (!isPrintLayoutMounted || !runPdfCaptureRef.current) return;
-    // Double rAF ensures React has finished painting all cards (including large
-    // datasets) before we start capturing with html2canvas.
-    const raf1 = requestAnimationFrame(() => {
-      const raf2 = requestAnimationFrame(() => {
-        void runPdfCaptureRef.current?.();
-      });
-      return raf2;
-    });
-    return () => cancelAnimationFrame(raf1);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPrintLayoutMounted]);
-
-  const waitForImagesToLoad = async (element: HTMLElement) => {
-    const images = Array.from(element.querySelectorAll("img"));
-    await Promise.all(
-      images.map((image) => new Promise<void>((resolve) => {
-        if (image.complete && image.naturalWidth > 0) {
-          resolve();
-          return;
-        }
-        const done = () => resolve();
-        image.addEventListener("load", done, { once: true });
-        image.addEventListener("error", done, { once: true });
-      }))
-    );
-  };
-
   const handleOpenGeneratePreview = () => {
-    if (!selectedRecords.length) return;
-
     const templateFromGroup = dataGroups
       .find((group) => selectedRecords.some((record) => record.groupId === group.id) && Boolean(group.templateId))
       ?.templateId;
+    // Prefer own (non-global) templates as default selection
     const defaultTemplate = previewTemplates.find((template) => template.id === templateFromGroup)
+      || previewTemplates.find((t) => !t.isGlobal)
       || previewTemplates[0]
       || null;
 
@@ -1953,16 +1918,16 @@ export function ProjectDetail() {
       sheetHeightMm: String(PAGE_SIZE_DIMENSIONS.A4.height),
       fileName: `${project?.name || "project"}_${dataCategory}_preview`,
     }));
+    setPreviewDialogStep(1);
     setPreviewError("");
+    setPreviewProgressText("");
     setIsGeneratePreviewOpen(true);
   };
 
   const handleGeneratePreviewPdf = async () => {
     if (!id) return;
 
-    const selectedTemplate = previewTemplates.find((template) => template.id === previewForm.templateId);
-    const selectedTemplateSlug = selectedTemplate ? getTemplateSlugForRender(selectedTemplate) : "";
-    const selectedTemplateDiagnostics = selectedTemplate ? previewTemplateDiagnosticsMap[selectedTemplate.id] : undefined;
+    const selectedTemplate = previewTemplates.find((t) => t.id === previewForm.templateId);
     const sheetWidthMm = printLayout.sheetWidthMm;
     const sheetHeightMm = printLayout.sheetHeightMm;
     const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
@@ -1970,165 +1935,131 @@ export function ProjectDetail() {
     const rowMarginMm = Number(previewForm.rowMarginMm || "0");
     const columnMarginMm = Number(previewForm.columnMarginMm || "0");
 
-    if (!selectedRecords.length) {
-      setPreviewError("Please select at least one record.");
-      return;
+    if (!selectedRecords.length) { setPreviewError("Please select at least one record."); return; }
+    if (!previewForm.templateId || !selectedTemplate) { setPreviewError("Please select a template."); return; }
+    if (!previewForm.fileName.trim()) { setPreviewError("File name is required."); return; }
+    if (!Number.isFinite(sheetWidthMm) || sheetWidthMm <= 0 || !Number.isFinite(sheetHeightMm) || sheetHeightMm <= 0) {
+      setPreviewError("Sheet size must be valid positive values."); return;
     }
-    if (!previewForm.templateId || !selectedTemplate) {
-      setPreviewError("Please select a template.");
-      return;
-    }
-    if (!previewForm.fileName.trim()) {
-      setPreviewError("File name is required.");
-      return;
-    }
-    if (!Number.isFinite(sheetWidthMm) || !Number.isFinite(sheetHeightMm) || sheetWidthMm <= 0 || sheetHeightMm <= 0) {
-      setPreviewError("Sheet size must be valid positive values.");
-      return;
-    }
-    if (!Number.isFinite(pageMarginTopMm) || !Number.isFinite(pageMarginLeftMm) || pageMarginTopMm < 0 || pageMarginLeftMm < 0) {
-      setPreviewError("Page margins cannot be negative.");
-      return;
-    }
-    if (!Number.isFinite(rowMarginMm) || !Number.isFinite(columnMarginMm) || rowMarginMm < 0 || columnMarginMm < 0) {
-      setPreviewError("Row and column margins cannot be negative.");
-      return;
+    if (pageMarginTopMm < 0 || pageMarginLeftMm < 0 || rowMarginMm < 0 || columnMarginMm < 0) {
+      setPreviewError("Margins cannot be negative."); return;
     }
 
     setPreviewError("");
     setIsGeneratingPreview(true);
+    setPreviewProgressText("Preparing template…");
 
-    // Store the capture logic in a ref so the useEffect can invoke it after
-    // the hidden print layout has been painted to the DOM.
-    runPdfCaptureRef.current = async () => {
-      try {
-        if (!previewPrintPages.length) {
-          throw new Error("No preview pages generated.");
-        }
+    try {
+      const cardWidthMm = selectedTemplate.canvas?.width || 54;
+      const cardHeightMm = selectedTemplate.canvas?.height || 86;
+      const cardWidthPx = Math.max(1, Math.round(cardWidthMm * MM_TO_PX));
+      const cardHeightPx = Math.max(1, Math.round(cardHeightMm * MM_TO_PX));
 
-        const orientation = sheetWidthMm > sheetHeightMm ? "landscape" : "portrait";
-        const doc = new jsPDF({
-          orientation,
-          unit: "mm",
-          format: [sheetWidthMm, sheetHeightMm],
-          compress: true,
-        });
-
-        for (let pageIndex = 0; pageIndex < previewPrintPages.length; pageIndex += 1) {
-          const pageElement = previewCapturePagesRef.current[pageIndex];
-          if (!pageElement) {
-            throw new Error(`Unable to render preview page ${pageIndex + 1}.`);
+      // ── Extract the first-page canvas object from the template JSON ───────
+      // Supported formats: { canvas: {...} }, { pages: [{canvas:{...}}] }, or
+      // the canvas object itself ({ objects: [...], ... }).
+      let canvasData: object | null = null;
+      if (selectedTemplate.canvasJSON) {
+        try {
+          const parsed = JSON.parse(selectedTemplate.canvasJSON) as Record<string, unknown>;
+          if (Array.isArray(parsed.pages) && parsed.pages.length > 0) {
+            canvasData = ((parsed.pages[0] as { canvas?: object }).canvas) ?? null;
+          } else if (parsed.canvas && typeof parsed.canvas === "object") {
+            canvasData = parsed.canvas as object;
+          } else if (Array.isArray((parsed as { objects?: unknown }).objects)) {
+            canvasData = parsed as object;
           }
-
-          // ── Step 1: Pre-load all images as data: URIs ──────────────────────
-          // html2canvas re-fetches every img.src in isolation (inside an iframe).
-          // Converting them to inline data URIs before capture eliminates every
-          // cross-origin / 404 / proxy error that html2canvas would encounter.
-          const imgEls = Array.from(pageElement.querySelectorAll<HTMLImageElement>("img"));
-          const uniqueUrls = [...new Set(
-            imgEls
-              .map((img) => img.getAttribute("src") ?? "")
-              .filter((src) => src && !src.startsWith("data:") && !src.includes("placeholder"))
-          )];
-
-          const urlToDataUri = new Map<string, string>();
-          await Promise.all(
-            uniqueUrls.map(async (url) => {
-              try {
-                const controller = new AbortController();
-                const tid = setTimeout(() => controller.abort(), 6_000);
-                const resp = await fetch(url, {
-                  signal: controller.signal,
-                  credentials: "same-origin",
-                  cache: "force-cache",
-                });
-                clearTimeout(tid);
-                if (!resp.ok) { urlToDataUri.set(url, "/placeholder.png"); return; }
-                const blob = await resp.blob();
-                const dataUri = await new Promise<string>((res, rej) => {
-                  const reader = new FileReader();
-                  reader.onload = () => res(reader.result as string);
-                  reader.onerror = rej;
-                  reader.readAsDataURL(blob);
-                });
-                urlToDataUri.set(url, dataUri);
-              } catch {
-                urlToDataUri.set(url, "/placeholder.png");
-              }
-            })
-          );
-
-          // Mutate img attributes so html2canvas reads only data URIs.
-          imgEls.forEach((img) => {
-            const src = img.getAttribute("src") ?? "";
-            if (!src || src.startsWith("data:") || src.includes("placeholder")) return;
-            const replacement = urlToDataUri.get(src) ?? "/placeholder.png";
-            img.setAttribute("src", replacement);
-            img.removeAttribute("srcset");
-            img.removeAttribute("loading");
-            img.removeAttribute("crossorigin");
-          });
-
-          // ── Step 2: Capture with html2canvas ──────────────────────────────
-          const stripUnsupportedCss = (css: string) =>
-            css
-              .replace(/\bcolor-mix\((?:[^()]+|\([^()]*\))*\)/gi, "#6366f1")
-              .replace(/\boklch\([^)]*\)/gi, "#6366f1")
-              .replace(/\blch\([^)]*\)/gi, "#6366f1")
-              .replace(/\blab\([^)]*\)/gi, "#6366f1")
-              .replace(/\bcolor\(\s*(?:display-p3|srgb-linear|a98-rgb|prophoto-rgb)[^)]*\)/gi, "#6366f1");
-
-          const canvas = await html2canvas(pageElement, {
-            useCORS: true,
-            allowTaint: false,
-            scale: 2,
-            backgroundColor: "#ffffff",
-            imageTimeout: 8_000,
-            logging: false,
-            onclone: (_clonedDoc, clonedEl) => {
-              // Strip Tailwind v4 oklch/color-mix from injected <style> tags.
-              _clonedDoc.querySelectorAll<HTMLStyleElement>("style").forEach((s) => {
-                if (s.textContent) s.textContent = stripUnsupportedCss(s.textContent);
-              });
-              // Strip inline styles.
-              clonedEl.querySelectorAll<HTMLElement>("[style]").forEach((el) => {
-                const r = el.getAttribute("style");
-                if (r) el.setAttribute("style", stripUnsupportedCss(r));
-              });
-              // Safety net: any img that still has an http/https/relative src
-              // (not a data: URI) gets replaced with placeholder.
-              clonedEl.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
-                const src = img.getAttribute("src") ?? "";
-                if (!src.startsWith("data:") && !src.includes("placeholder")) {
-                  img.setAttribute("src", "/placeholder.png");
-                  img.removeAttribute("srcset");
-                  img.removeAttribute("loading");
-                }
-              });
-            },
-          });
-          const imageData = canvas.toDataURL("image/png", 1);
-
-          if (pageIndex > 0) {
-            doc.addPage([sheetWidthMm, sheetHeightMm], orientation);
-          }
-          doc.addImage(imageData, "PNG", 0, 0, sheetWidthMm, sheetHeightMm, undefined, "FAST");
+        } catch {
+          /* ignore JSON errors — fall back to thumbnail below */
         }
-
-        doc.save(`${previewForm.fileName.trim()}.pdf`);
-        setIsGeneratePreviewOpen(false);
-      } catch (error) {
-        setPreviewError((error as Error).message || "Failed to generate preview PDF.");
-      } finally {
-        setIsGeneratingPreview(false);
-        setIsPrintLayoutMounted(false);
-        runPdfCaptureRef.current = null;
       }
-    };
 
-    // Mount the hidden print layout — the useEffect watching isPrintLayoutMounted
-    // will fire after React paints the DOM and then call runPdfCaptureRef.current().
-    setIsPrintLayoutMounted(true);
+      const baseJsonStr = canvasData ? JSON.stringify(canvasData) : null;
+      const hasThumbnail = typeof selectedTemplate.thumbnail === "string" && selectedTemplate.thumbnail.trim().length > 0;
+
+      if (!baseJsonStr && !hasThumbnail) {
+        throw new Error("Template has no design. Open it in the Designer and save first.");
+      }
+
+      // ── Layout calculation ────────────────────────────────────────────────
+      const usableWidthMm  = sheetWidthMm  - pageMarginLeftMm * 2;
+      const usableHeightMm = sheetHeightMm - pageMarginTopMm  * 2;
+      const columns     = Math.max(1, Math.floor((usableWidthMm  + columnMarginMm) / (cardWidthMm  + columnMarginMm)));
+      const rows        = Math.max(1, Math.floor((usableHeightMm + rowMarginMm)    / (cardHeightMm + rowMarginMm)));
+      const cardsPerPage = columns * rows;
+
+      const orientation = sheetWidthMm > sheetHeightMm ? "landscape" : "portrait";
+      const doc = new jsPDF({ orientation, unit: "mm", format: [sheetWidthMm, sheetHeightMm], compress: true });
+
+      // ── Render each record ────────────────────────────────────────────────
+      for (let i = 0; i < selectedRecords.length; i += 1) {
+        const record = selectedRecords[i];
+        const cardIndexOnPage = i % cardsPerPage;
+        const pageNum = Math.floor(i / cardsPerPage);
+
+        if (cardIndexOnPage === 0 && pageNum > 0) {
+          doc.addPage([sheetWidthMm, sheetHeightMm], orientation);
+        }
+
+        setPreviewProgressText(`Rendering card ${i + 1} of ${selectedRecords.length}…`);
+
+        const col  = cardIndexOnPage % columns;
+        const row  = Math.floor(cardIndexOnPage / columns);
+        const xMm  = pageMarginLeftMm + col * (cardWidthMm  + columnMarginMm);
+        const yMm  = pageMarginTopMm  + row * (cardHeightMm + rowMarginMm);
+
+        let pngDataUri: string | null = null;
+
+        // ── Path A: Render via Fabric.js with {{VARIABLE}} substitution ──
+        if (baseJsonStr) {
+          try {
+            // Substitute all {{KEY}} placeholders with values from the record.
+            // JSON.stringify(val).slice(1,-1) gives a properly JSON-escaped string
+            // so special characters like `"` or `\n` don't corrupt the JSON.
+            const substituted = baseJsonStr.replace(/\{\{([^}]+)\}\}/g, (_, rawKey: string) => {
+              const val = mapData(`{{${rawKey}}}`, record);
+              return JSON.stringify(val).slice(1, -1);
+            });
+
+            const canvasEl = document.createElement("canvas");
+            const fc = new fabric.StaticCanvas(canvasEl, {
+              width: cardWidthPx,
+              height: cardHeightPx,
+              renderOnAddRemove: false,
+              enableRetinaScaling: false,
+            } as ConstructorParameters<typeof fabric.StaticCanvas>[1]);
+            try {
+              await fc.loadFromJSON(substituted);
+              fc.renderAll();
+              pngDataUri = fc.toDataURL({ format: "png", multiplier: 2 } as Parameters<typeof fc.toDataURL>[0]);
+            } finally {
+              fc.dispose();
+            }
+          } catch (fabricErr) {
+            console.warn("[PDF] Fabric render failed for card", i + 1, fabricErr);
+            pngDataUri = null; // fall through to thumbnail
+          }
+        }
+
+        // ── Path B: Thumbnail fallback ────────────────────────────────────
+        if (!pngDataUri && hasThumbnail) {
+          pngDataUri = selectedTemplate.thumbnail!;
+        }
+
+        if (pngDataUri) {
+          doc.addImage(pngDataUri, "PNG", xMm, yMm, cardWidthMm, cardHeightMm);
+        }
+      }
+
+      setPreviewProgressText("Saving PDF…");
+      doc.save(`${previewForm.fileName.trim()}.pdf`);
+      setIsGeneratePreviewOpen(false);
+    } catch (error) {
+      setPreviewError((error as Error).message || "Failed to generate preview PDF.");
+    } finally {
+      setIsGeneratingPreview(false);
+      setPreviewProgressText("");
+    }
   };
 
   // ── Delete All student/staff Data ──
@@ -2625,15 +2556,23 @@ export function ProjectDetail() {
 
           <Card className="shadow-md">
             <CardHeader>
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between flex-wrap gap-2">
                 <CardTitle>Project Templates</CardTitle>
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   <Button
                     size="sm"
                     variant="outline"
                     className="gap-2"
-                    onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
-                    disabled={previewTemplates.length === 0}
+                    onClick={() => id && navigate(`/template-gallery?projectId=${id}`)}
+                  >
+                    <Globe className="h-4 w-4" />Open Template Gallery
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-2"
+                    onClick={handleOpenGeneratePreview}
+                    disabled={previewTemplateGroups.projectTemplates.length === 0}
                   >
                     <Settings2 className="h-4 w-4" />Generate Preview
                   </Button>
@@ -2649,32 +2588,29 @@ export function ProjectDetail() {
                   <Loader2 className="h-8 w-8 mx-auto text-muted-foreground mb-3 animate-spin" />
                   <p className="text-muted-foreground text-sm">Loading templates…</p>
                 </div>
-              ) : previewTemplates.length === 0 ? (
+              ) : previewTemplateGroups.projectTemplates.length === 0 ? (
                 <div className="text-center py-12">
                   <Layers className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
-                  <p className="text-muted-foreground mb-4">No templates created yet</p>
-                  <Button variant="outline" onClick={() => setIsCreateTemplateOpen(true)}>
-                    <Plus className="h-4 w-4 mr-2" />Create new template
-                  </Button>
+                  <p className="text-muted-foreground mb-4">No templates attached to this project yet</p>
+                  <p className="text-sm text-muted-foreground mb-4">Use Template Gallery to browse and attach public templates.</p>
+                  <div className="flex gap-2 justify-center">
+                    <Button variant="outline" onClick={() => id && navigate(`/template-gallery?projectId=${id}`)}>Browse Template Gallery</Button>
+                    <Button variant="outline" onClick={() => setIsCreateTemplateOpen(true)}>
+                      <Plus className="h-4 w-4 mr-2" />Create new template
+                    </Button>
+                  </div>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {previewTemplates.map((tmpl) => {
+                  {previewTemplateGroups.projectTemplates.map((tmpl) => {
                     const previewDiagnostics = templateDiagnosticsMap[tmpl.id];
                     const canRenderCardImage = Boolean(
                       tmpl.thumbnail
                       && previewDiagnostics?.hasDesignElements
                       && !brokenTemplatePreviewIds[tmpl.id]
                     );
-                    const currentClientId = project?.clientId ?? "";
-                    // Own project's template
+                    // Own project's template (has edit/delete rights)
                     const isOwnTemplate = tmpl.projectId === id;
-                    // Same client but different project
-                    const isSameClientTemplate = !isOwnTemplate
-                      && Boolean(currentClientId)
-                      && (tmpl.clientId === currentClientId);
-                    // Public template from a different client — read-only, clone only
-                    const isPublicOtherClient = !isOwnTemplate && !isSameClientTemplate && tmpl.isPublic === true;
 
                     return (
                       <div key={tmpl.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow space-y-3">
@@ -2687,7 +2623,6 @@ export function ProjectDetail() {
                               onError={() => markTemplatePreviewBroken(tmpl.id)}
                             />
                           ) : tmpl.thumbnail && !brokenTemplatePreviewIds[tmpl.id] ? (
-                            // Show preview image even when canvasJSON is absent (remote template with stored preview)
                             <img
                               src={tmpl.thumbnail}
                               alt={tmpl.templateName}
@@ -2708,16 +2643,6 @@ export function ProjectDetail() {
                           <div className="flex gap-1 mt-1 flex-wrap">
                             <Badge variant="secondary" className="text-[10px] capitalize">{tmpl.templateType.replace("_"," ")}</Badge>
                             <Badge variant="outline" className="text-[10px]">{tmpl.canvas.width}x{tmpl.canvas.height}mm</Badge>
-                            {isSameClientTemplate && (
-                              <Badge variant="outline" className="text-[10px] gap-0.5 text-emerald-700 border-emerald-300 bg-emerald-50">
-                                Client
-                              </Badge>
-                            )}
-                            {(isPublicOtherClient || (tmpl.isPublic && isOwnTemplate)) && (
-                              <Badge variant="outline" className="text-[10px] gap-0.5 text-primary border-primary/40 bg-primary/5">
-                                <Globe className="h-2.5 w-2.5" />Global
-                              </Badge>
-                            )}
                           </div>
                           {!previewDiagnostics?.hasDesignElements && !tmpl.thumbnail && (
                             <Badge variant="outline" className="text-[10px] mt-1 text-muted-foreground border-dashed">
@@ -2736,55 +2661,39 @@ export function ProjectDetail() {
                           <Button size="sm" variant="outline" className="flex-1 text-xs gap-1" onClick={() => setPreviewTemplate(tmpl)}>
                             <Download className="h-3 w-3" />Preview
                           </Button>
-                          {(isOwnTemplate || isSameClientTemplate) ? (
-                            <>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="flex-1 text-xs gap-1 text-primary hover:text-primary"
-                                onClick={() => {
-                                  const rawMargin = (tmpl as any).margin ?? {};
-                                  const normalizedMargin = {
-                                    top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
-                                    left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
-                                    right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
-                                    bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
-                                  };
-                                  const designerConfig = {
-                                    templateName: tmpl.templateName,
-                                    templateType: tmpl.templateType,
-                                    canvas: tmpl.canvas,
-                                    margin: normalizedMargin,
-                                  };
-                                  localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
-                                  localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-                                    projectId: project.id,
-                                    templateId: tmpl.id,
-                                    projectName: project.name,
-                                    templateName: tmpl.templateName,
-                                  }));
-                                  navigate("/designer-studio");
-                                }}
-                              >
-                                <Pencil className="h-3 w-3" />Edit
-                              </Button>
-                              {isOwnTemplate && (
-                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { void handleDeleteTemplate(tmpl); }}>
-                                  <Trash2 className="h-3 w-3" />
-                                </Button>
-                              )}
-                            </>
-                          ) : (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="flex-1 text-xs gap-1"
-                              title="Copy this global template to your project"
-                              onClick={() => {
-                                void handleCloneTemplate(tmpl);
-                              }}
-                            >
-                              <FilePlus className="h-3 w-3" />Use
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="flex-1 text-xs gap-1 text-primary hover:text-primary"
+                            onClick={() => {
+                              const rawMargin = (tmpl as any).margin ?? {};
+                              const normalizedMargin = {
+                                top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
+                                left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
+                                right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
+                                bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
+                              };
+                              const designerConfig = {
+                                templateName: tmpl.templateName,
+                                templateType: tmpl.templateType,
+                                canvas: tmpl.canvas,
+                                margin: normalizedMargin,
+                              };
+                              localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
+                              localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+                                projectId: project.id,
+                                templateId: tmpl.id,
+                                projectName: project.name,
+                                templateName: tmpl.templateName,
+                              }));
+                              navigate("/designer-studio");
+                            }}
+                          >
+                            <Pencil className="h-3 w-3" />Edit
+                          </Button>
+                          {isOwnTemplate && (
+                            <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { void handleDeleteTemplate(tmpl); }}>
+                              <Trash2 className="h-3 w-3" />
                             </Button>
                           )}
                         </div>
@@ -3628,339 +3537,357 @@ export function ProjectDetail() {
 
           {/* ── Generate Preview Dialog ── */}
           <Dialog open={isGeneratePreviewOpen} onOpenChange={(open) => {
-            if (isGeneratingPreview) return;
+            if (!open && isGeneratingPreview) {
+              // User closed dialog mid-generation — abort any in-progress work.
+              abortRef.current?.abort();
+              return;
+            }
             setIsGeneratePreviewOpen(open);
             if (!open) {
               setPreviewError("");
-              setIsPrintLayoutMounted(false);
+              setPreviewProgressText("");
+              setPreviewDialogStep(1);
             }
           }}>
             <DialogContent className="sm:max-w-[620px]">
               <DialogHeader>
                 <DialogTitle>Generate Preview</DialogTitle>
               </DialogHeader>
-              <div className="space-y-4 py-1">
-                <p className="text-sm text-muted-foreground">
-                  Generate preview for {selectedRecords.length} selected record(s).
-                </p>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label>Page size</Label>
-                    <Select
-                      value={previewForm.pageSize}
-                      onValueChange={(value) => {
-                        const size = value as PreviewPageSize;
-                        setPreviewForm((prev) => {
-                          if (size === "Custom") {
-                            return { ...prev, pageSize: size };
-                          }
-                          const dims = PAGE_SIZE_DIMENSIONS[size];
-                          return {
-                            ...prev,
-                            pageSize: size,
-                            sheetWidthMm: String(dims.width),
-                            sheetHeightMm: String(dims.height),
-                          };
-                        });
-                      }}
-                    >
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select page size" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="A4">A4</SelectItem>
-                        <SelectItem value="A3">A3</SelectItem>
-                        <SelectItem value="Letter">Letter</SelectItem>
-                        <SelectItem value="Legal">Legal</SelectItem>
-                        <SelectItem value="Custom">Custom</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-
+              {/* ── STEP 1: Select Template ── */}
+              {previewDialogStep === 1 && (
+                <div className="space-y-4 py-1">
+                  <p className="text-sm text-muted-foreground">
+                    Select a template attached to this project to use for generating the preview PDF.
+                  </p>
                   <div className="space-y-1.5">
                     <Label>Select template</Label>
-                    <Select
-                      value={previewForm.templateId || "__none__"}
-                      onValueChange={(value) => {
-                        const selectedTemplate = previewTemplates.find((template) => template.id === value);
-                        setPreviewForm((prev) => ({
-                          ...prev,
-                          templateId: value === "__none__" ? "" : value,
-                          templateType: selectedTemplate?.templateType || prev.templateType,
-                        }));
-                      }}
-                    >
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select a template" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__none__">Select a template</SelectItem>
-                        {remoteTemplatesLoading ? (
-                          <div className="px-2 py-1 text-xs text-muted-foreground">Loading templates...</div>
-                        ) : previewTemplates.length === 0 ? (
-                          <div className="px-2 py-1 text-xs text-muted-foreground">No templates available.</div>
-                        ) : (
-                          <>
-                            {previewTemplateGroups.projectTemplates.length > 0 && (
-                              <div className="px-2 py-1 text-xs text-muted-foreground">Project Templates</div>
-                            )}
-                            {previewTemplateGroups.projectTemplates.map((template) => (
-                              <SelectItem key={template.id} value={template.id}>
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="truncate">{template.templateName}</span>
-                                  <Badge variant="outline" className="text-[10px]">Project</Badge>
-                                </div>
-                              </SelectItem>
-                            ))}
-                            {previewTemplateGroups.globalTemplates.length > 0 && (
-                              <div className="px-2 py-1 text-xs text-muted-foreground">Public Templates</div>
-                            )}
-                            {previewTemplateGroups.globalTemplates.map((template) => (
-                              <SelectItem key={template.id} value={template.id}>
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="truncate">{template.templateName}</span>
-                                  <Badge variant="secondary" className="text-[10px]">Global</Badge>
-                                </div>
-                              </SelectItem>
-                            ))}
-                          </>
-                        )}
-                      </SelectContent>
-                    </Select>
-                    {remoteTemplatesError ? (
-                      <p className="text-xs text-destructive">{remoteTemplatesError}</p>
-                    ) : null}
-                  </div>
-
-                  <div className="sm:col-span-2 space-y-1.5">
-                    <Label>Rendered template preview</Label>
-                    <IdCardGrid students={selectedRecords} template={selectedGenerateTemplate} />
-                    {selectedRecords.length > 1 && (
-                      <p className="text-xs text-muted-foreground mt-1">
-                        Showing first 10 of {selectedRecords.length} student(s). PDF will include all.
-                      </p>
-                    )}
-                  </div>
-
-                  {/* Missing images warning */}
-                  {missingPhotosCount > 0 && (
-                    <div className="sm:col-span-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
-                      <p className="text-xs font-medium text-amber-800">
-                        ⚠ {missingPhotosCount} of {selectedRecords.length} student{missingPhotosCount !== 1 ? "s" : ""} {missingPhotosCount !== 1 ? "have" : "has"} no photo.
-                        Upload a ZIP to map images, or "No Image" placeholders will appear in the PDF.
-                      </p>
-                    </div>
-                  )}
-
-                  {/* Hidden off-screen print layout — only mounted when generating */}
-                  {isPrintLayoutMounted && (
-                  <div aria-hidden className="pointer-events-none fixed -left-[10000px] top-0 opacity-0">
-                    {previewPrintPages.map((pageRecords, pageIndex) => (
-                      <div
-                        key={`print-page-${pageIndex}`}
-                        ref={(el) => {
-                          previewCapturePagesRef.current[pageIndex] = el;
+                    {previewTemplateGroups.projectTemplates.length === 0 ? (
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                        No templates attached to this project yet.{" "}
+                        <button
+                          className="font-medium underline underline-offset-2"
+                          onClick={() => { setIsGeneratePreviewOpen(false); id && navigate(`/template-gallery?projectId=${id}`); }}
+                        >
+                          Open Template Gallery →
+                        </button>
+                      </div>
+                    ) : (
+                      <Select
+                        value={previewForm.templateId || "__none__"}
+                        onValueChange={(value) => {
+                          const sel = previewTemplates.find((t) => t.id === value);
+                          setPreviewForm((prev) => ({
+                            ...prev,
+                            templateId: value === "__none__" ? "" : value,
+                            templateType: sel?.templateType || prev.templateType,
+                            orientation: sel?.canvas?.width && sel?.canvas?.height
+                              ? (sel.canvas.width > sel.canvas.height ? "landscape" : "portrait")
+                              : prev.orientation,
+                          }));
                         }}
                       >
-                        <div
-                          className="id-print-page id-print-page-grid"
-                          style={{
-                            width: `${printLayout.sheetWidthPx}px`,
-                            height: `${printLayout.sheetHeightPx}px`,
-                            padding: `${printLayout.marginTopPx}px ${printLayout.marginLeftPx}px`,
-                            gridTemplateColumns: `repeat(${printLayout.columns}, ${PREVIEW_CARD_WIDTH_PX}px)`,
-                            columnGap: `${printLayout.columnGapPx}px`,
-                            rowGap: `${printLayout.rowGapPx}px`,
-                          }}
-                        >
-                          {pageRecords.map((student, studentIndex) => (
-                            <IdCard
-                              key={`print-card-${student.id}-${pageIndex}-${studentIndex}`}
-                              student={student}
-                              template={selectedGenerateTemplate}
-                            />
+                        <SelectTrigger className="h-9">
+                          <SelectValue placeholder="Choose an attached template…" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__">Choose a template…</SelectItem>
+                          {previewTemplateGroups.projectTemplates.map((template) => (
+                            <SelectItem key={template.id} value={template.id}>
+                              {template.templateName}
+                            </SelectItem>
                           ))}
-                        </div>
-                      </div>
-                    ))}
+                        </SelectContent>
+                      </Select>
+                    )}
                   </div>
-                  )} {/* end isPrintLayoutMounted */}
-
-                  {selectedGenerateTemplateDiagnostics && (
-                    <div className="sm:col-span-2 space-y-1">
-                      {!selectedGenerateTemplateDiagnostics.hasDesignElements && (
-                        <p className="text-xs text-destructive">
-                          No preview available. Please configure the template.
-                        </p>
-                      )}
-                      {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
-                        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 flex items-start gap-2.5">
-                          <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5" />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-xs font-semibold text-amber-800">
-                              {selectedGenerateTemplateDiagnostics.missingFieldKeys.length} field{selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 1 ? "s" : ""} not mapped
-                            </p>
-                            <p className="text-xs text-amber-700 mt-0.5">
-                              The preview may show placeholder text for unmapped fields. You can still generate.
-                            </p>
-                            <button
-                              className="text-xs font-medium text-amber-800 underline underline-offset-2 mt-1"
-                              onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
-                            >
-                              Fix in Rule Builder →
-                            </button>
-                          </div>
-
-                        </div>
-                      )}
+                  {previewForm.templateId && (
+                    <div className="sm:col-span-2 space-y-1.5">
+                      <Label>Template preview</Label>
+                      <IdCardGrid students={selectedRecords.slice(0, 3)} template={previewTemplates.find((t) => t.id === previewForm.templateId) ?? null} />
                     </div>
                   )}
+                  {previewError && <p className="text-sm text-destructive">{previewError}</p>}
+                  <div className="flex gap-3 pt-1">
+                    <Button variant="outline" className="flex-1" onClick={() => setIsGeneratePreviewOpen(false)}>Cancel</Button>
+                    <Button
+                      className="flex-1 gap-1.5"
+                      disabled={!previewForm.templateId}
+                      onClick={() => {
+                        if (!selectedRecords.length) {
+                          setPreviewError("No records selected. Go to Project Data tab and select records first.");
+                          return;
+                        }
+                        setPreviewError("");
+                        setPreviewDialogStep(2);
+                      }}
+                    >
+                      Configure &amp; Generate →
+                    </Button>
+                  </div>
+                </div>
+              )}
 
-                  <div className="space-y-1.5">
-                    <Label>Orientation</Label>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        type="button"
-                        variant={previewForm.orientation === "portrait" ? "default" : "outline"}
-                        className="h-9 flex-1"
-                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
+              {/* ── STEP 2: Full generation form ── */}
+              {previewDialogStep === 2 && (
+                <div className="space-y-4 py-1">
+                  <div className="flex items-center gap-3 text-sm flex-wrap">
+                    <button
+                      className="text-xs text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
+                      onClick={() => { setPreviewError(""); setPreviewDialogStep(1); }}
+                    >
+                      ← Change template
+                    </button>
+                    <span className="text-muted-foreground">·</span>
+                    <span className="text-muted-foreground">
+                      Generating for <strong className="text-foreground">{selectedRecords.length}</strong> selected record(s)
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label>Page size</Label>
+                      <Select
+                        value={previewForm.pageSize}
+                        onValueChange={(value) => {
+                          const size = value as PreviewPageSize;
+                          setPreviewForm((prev) => {
+                            if (size === "Custom") {
+                              return { ...prev, pageSize: size };
+                            }
+                            const dims = PAGE_SIZE_DIMENSIONS[size];
+                            return {
+                              ...prev,
+                              pageSize: size,
+                              sheetWidthMm: String(dims.width),
+                              sheetHeightMm: String(dims.height),
+                            };
+                          });
+                        }}
                       >
-                        Portrait
-                      </Button>
-                      <Button
-                        type="button"
-                        variant={previewForm.orientation === "landscape" ? "default" : "outline"}
-                        className="h-9 flex-1"
-                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
+                        <SelectTrigger className="h-9">
+                          <SelectValue placeholder="Select page size" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="A4">A4</SelectItem>
+                          <SelectItem value="A3">A3</SelectItem>
+                          <SelectItem value="Letter">Letter</SelectItem>
+                          <SelectItem value="Legal">Legal</SelectItem>
+                          <SelectItem value="Custom">Custom</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <Label>Selected template</Label>
+                      <div className="h-9 flex items-center px-3 rounded-md border border-input bg-muted/40 text-sm">
+                        {previewTemplates.find((t) => t.id === previewForm.templateId)?.templateName || "—"}
+                      </div>
+                    </div>
+
+                    <div className="sm:col-span-2 space-y-1.5">
+                      <Label>Rendered template preview</Label>
+                      <IdCardGrid students={selectedRecords} template={selectedGenerateTemplate} />
+                      {selectedRecords.length > 1 && (
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Showing first 10 of {selectedRecords.length} student(s). PDF will include all.
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Missing images warning */}
+                    {missingPhotosCount > 0 && (
+                      <div className="sm:col-span-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
+                        <p className="text-xs font-medium text-amber-800">
+                          ⚠ {missingPhotosCount} of {selectedRecords.length} student{missingPhotosCount !== 1 ? "s" : ""} {missingPhotosCount !== 1 ? "have" : "has"} no photo.
+                          Upload a ZIP to map images, or "No Image" placeholders will appear in the PDF.
+                        </p>
+                      </div>
+                    )}
+
+                    {selectedGenerateTemplateDiagnostics && (
+                      <div className="sm:col-span-2 space-y-1">
+                        {!selectedGenerateTemplateDiagnostics.hasDesignElements && (
+                          <p className="text-xs text-destructive">
+                            No preview available. Please configure the template.
+                          </p>
+                        )}
+                        {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
+                          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 flex items-start gap-2.5">
+                            <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-semibold text-amber-800">
+                                {selectedGenerateTemplateDiagnostics.missingFieldKeys.length} field{selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 1 ? "s" : ""} not mapped
+                              </p>
+                              <p className="text-xs text-amber-700 mt-0.5">
+                                The preview may show placeholder text for unmapped fields. You can still generate.
+                              </p>
+                              <button
+                                className="text-xs font-medium text-amber-800 underline underline-offset-2 mt-1"
+                                onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
+                              >
+                                Fix in Rule Builder →
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="space-y-1.5">
+                      <Label>Orientation</Label>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          type="button"
+                          variant={previewForm.orientation === "portrait" ? "default" : "outline"}
+                          className="h-9 flex-1"
+                          onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
+                        >
+                          Portrait
+                        </Button>
+                        <Button
+                          type="button"
+                          variant={previewForm.orientation === "landscape" ? "default" : "outline"}
+                          className="h-9 flex-1"
+                          onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
+                        >
+                          Landscape
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <Label>Template type</Label>
+                      <Select
+                        value={previewForm.templateType}
+                        onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, templateType: value as ProjectTemplate["templateType"] }))}
                       >
-                        Landscape
-                      </Button>
+                        <SelectTrigger className="h-9">
+                          <SelectValue placeholder="Select template type" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="id_card">ID Card</SelectItem>
+                          <SelectItem value="certificate">Certificate</SelectItem>
+                          <SelectItem value="poster">Poster</SelectItem>
+                          <SelectItem value="custom">Custom</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <Label>Is sample</Label>
+                      <Select value={previewForm.isSample} onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, isSample: value as "yes" | "no" }))}>
+                        <SelectTrigger className="h-9">
+                          <SelectValue placeholder="Select" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="yes">Yes</SelectItem>
+                          <SelectItem value="no">No</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1.5 sm:col-span-2">
+                      <Label>File name</Label>
+                      <Input
+                        value={previewForm.fileName}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, fileName: event.target.value }))}
+                        placeholder="Enter file name"
+                        className="h-9"
+                      />
                     </div>
                   </div>
 
-                  <div className="space-y-1.5">
-                    <Label>Template type</Label>
-                    <Select
-                      value={previewForm.templateType}
-                      onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, templateType: value as ProjectTemplate["templateType"] }))}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="space-y-1.5">
+                      <Label>Sheet width (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.sheetWidthMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Sheet height (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.sheetHeightMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Page margin top</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.pageMarginTopMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Page margin left</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.pageMarginLeftMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label>Row margin (optional)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.rowMarginMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Column margin (optional)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.columnMarginMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                  </div>
+
+                  {previewError && (
+                    <p className="text-sm text-destructive">{previewError}</p>
+                  )}
+                  {isGeneratingPreview && previewProgressText && (
+                    <p className="text-sm text-muted-foreground">{previewProgressText}</p>
+                  )}
+
+                  <div className="flex gap-3 pt-1">
+                    <Button
+                      variant="outline"
+                      className="flex-1"
+                      onClick={() => {
+                        if (isGeneratingPreview) {
+                          abortRef.current?.abort();
+                        } else {
+                          setPreviewDialogStep(1);
+                        }
+                      }}
                     >
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select template type" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="id_card">ID Card</SelectItem>
-                        <SelectItem value="certificate">Certificate</SelectItem>
-                        <SelectItem value="poster">Poster</SelectItem>
-                        <SelectItem value="custom">Custom</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <Label>Is sample</Label>
-                    <Select value={previewForm.isSample} onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, isSample: value as "yes" | "no" }))}>
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="yes">Yes</SelectItem>
-                        <SelectItem value="no">No</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-
-                  <div className="space-y-1.5 sm:col-span-2">
-                    <Label>File name</Label>
-                    <Input
-                      value={previewForm.fileName}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, fileName: event.target.value }))}
-                      placeholder="Enter file name"
-                      className="h-9"
-                    />
+                      {isGeneratingPreview ? "Stop" : "← Back"}
+                    </Button>
+                    <Button className="flex-1 gap-1.5" disabled={isGeneratingPreview} onClick={() => void handleGeneratePreviewPdf()}>
+                      {isGeneratingPreview
+                        ? <Loader2 className="h-4 w-4 animate-spin" />
+                        : <Download className="h-4 w-4" />}
+                      Generate preview
+                    </Button>
                   </div>
                 </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="space-y-1.5">
-                    <Label>Sheet width (mm)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.sheetWidthMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Sheet height (mm)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.sheetHeightMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Page margin top</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.pageMarginTopMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Page margin left</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.pageMarginLeftMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label>Row margin (optional)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.rowMarginMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Column margin (optional)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.columnMarginMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                </div>
-
-                {previewError && (
-                  <p className="text-sm text-destructive">{previewError}</p>
-                )}
-              </div>
-              <div className="flex gap-3 pt-1">
-                <Button
-                  variant="outline"
-                  className="flex-1"
-                  disabled={isGeneratingPreview}
-                  onClick={() => setIsGeneratePreviewOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button className="flex-1 gap-1.5" disabled={isGeneratingPreview} onClick={() => void handleGeneratePreviewPdf()}>
-                  {isGeneratingPreview
-                    ? <Loader2 className="h-4 w-4 animate-spin" />
-                    : <Download className="h-4 w-4" />}
-                  Generate preview
-                </Button>
-              </div>
+              )}
             </DialogContent>
           </Dialog>
 
