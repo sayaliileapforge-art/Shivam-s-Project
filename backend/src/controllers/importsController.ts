@@ -17,7 +17,7 @@ import multer                 from 'multer';
 import path                   from 'path';
 import os                     from 'os';
 import fs                     from 'fs';
-import { v4 as uuidv4 }       from 'uuid';
+import { randomUUID }         from 'crypto';
 import { bulkImportQueue }    from '../queues/bulkImportQueue';
 import type { BulkImportJobData } from '../processors/bulkImportProcessor';
 import { createLogger }       from '../utils/logger';
@@ -53,7 +53,7 @@ const acceptedZipMimes  = new Set([
 // ─── POST /api/imports ────────────────────────────────────────────────────────
 
 export async function createImportJob(req: Request, res: Response): Promise<void> {
-  const importId = uuidv4();
+  const importId = randomUUID();
   const upload   = multer({
     storage: buildTempStorage(importId),
     limits:  { fileSize: 600 * 1024 * 1024 }, // 600 MB per file
