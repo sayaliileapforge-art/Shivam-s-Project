@@ -21,19 +21,32 @@
 
 import type { RedisOptions } from 'ioredis';
 
-const REDIS_HOST     = process.env.REDIS_HOST?.trim()     ?? '127.0.0.1';
+const REDIS_HOST     = process.env.REDIS_HOST?.trim()     ?? '';
 const REDIS_PORT     = parseInt(process.env.REDIS_PORT    ?? '6379', 10);
 const REDIS_PASSWORD = process.env.REDIS_PASSWORD?.trim() || undefined;
 
+/**
+ * True only when REDIS_HOST is explicitly set in the environment.
+ * When false (e.g. Render free tier with no Redis service attached) all
+ * BullMQ queues, workers and Bull Board are skipped entirely so that the
+ * server does not flood logs with ECONNREFUSED errors.
+ */
+export const REDIS_ENABLED = Boolean(REDIS_HOST);
+
+const resolvedHost = REDIS_HOST || '127.0.0.1';
+
 export const redisConnectionOptions: RedisOptions = {
-  host:                 REDIS_HOST,
+  host:                 resolvedHost,
   port:                 REDIS_PORT,
   ...(REDIS_PASSWORD ? { password: REDIS_PASSWORD } : {}),
   // Both settings are required by BullMQ — do not remove them.
   maxRetriesPerRequest: null,
   enableReadyCheck:     false,
-  // Reconnect after brief delays rather than failing permanently.
-  retryStrategy: (times: number) => Math.min(times * 500, 10_000),
+  // When Redis is explicitly configured, reconnect with exponential backoff.
+  // When not configured, return null immediately to stop all reconnection attempts.
+  retryStrategy: REDIS_ENABLED
+    ? (times: number) => Math.min(times * 500, 10_000)
+    : () => null,
 };
 
-export const redisInfo = `${REDIS_HOST}:${REDIS_PORT}`;
+export const redisInfo = `${resolvedHost}:${REDIS_PORT}`;

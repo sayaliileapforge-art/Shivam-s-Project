@@ -139,10 +139,20 @@ export async function createImportJob(req: Request, res: Response): Promise<void
     originalZipName: zipFile.originalname,
   };
 
-  const job = await bulkImportQueue.add('bulk-import', jobData, {
+  const job = await bulkImportQueue?.add('bulk-import', jobData, {
     // Job ID is the importId so clients can predict the ID without querying.
     jobId: importId,
   });
+
+  if (!job) {
+    // Redis not configured — queue is disabled. Return a clear error so the
+    // client knows the feature is unavailable rather than silently failing.
+    res.status(503).json({
+      success: false,
+      error: 'Bulk import is unavailable: Redis is not configured on this server.',
+    });
+    return;
+  }
 
   log.info(
     `Job enqueued — id=${job.id} project=${projectId} ` +
@@ -161,6 +171,11 @@ export async function createImportJob(req: Request, res: Response): Promise<void
 
 export async function getImportStatus(req: Request, res: Response): Promise<void> {
   const { jobId } = req.params;
+
+  if (!bulkImportQueue) {
+    res.status(503).json({ success: false, error: 'Bulk import is unavailable: Redis is not configured on this server.' });
+    return;
+  }
 
   const job = await bulkImportQueue.getJob(jobId);
 

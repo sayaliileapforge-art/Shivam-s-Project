@@ -29,7 +29,7 @@ import { Worker, QueueEvents } from 'bullmq';
 import path from 'path';
 import os   from 'os';
 
-import { redisConnectionOptions } from '../redis/connection';
+import { redisConnectionOptions, REDIS_ENABLED } from '../redis/connection';
 import { BULK_IMPORT_QUEUE }      from '../queues/bulkImportQueue';
 import { bulkImportProcessor }    from '../processors/bulkImportProcessor';
 import { cleanupDir }             from '../utils/fileCleanup';
@@ -37,9 +37,12 @@ import { createLogger }           from '../utils/logger';
 
 const log = createLogger('Worker');
 
+// Skip everything when Redis is not configured — avoids ECONNREFUSED spam in logs.
+if (!REDIS_ENABLED) {
+  log.warn('Redis not configured (REDIS_HOST not set) — BullMQ worker disabled. Bulk import background processing is unavailable.');
+} else {
+
 // ─── Concurrency ─────────────────────────────────────────────────────────────
-// How many jobs to process simultaneously in this worker instance.
-// Override with BULK_IMPORT_CONCURRENCY env var for easy tuning.
 const CONCURRENCY = parseInt(process.env.BULK_IMPORT_CONCURRENCY ?? '3', 10);
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
@@ -49,11 +52,8 @@ export const bulkImportWorker = new Worker(
   {
     connection:  redisConnectionOptions,
     concurrency: CONCURRENCY,
-    // Lock duration: how long a job can be "active" before BullMQ considers
-    // the worker stalled.  Import jobs can take several minutes for large ZIPs.
-    lockDuration: 5 * 60 * 1_000, // 5 minutes
-    // Extend the lock automatically so long-running jobs don't get re-queued.
-    lockRenewTime: 2 * 60 * 1_000, // renew every 2 minutes
+    lockDuration: 5 * 60 * 1_000,
+    lockRenewTime: 2 * 60 * 1_000,
   },
 );
 
@@ -74,9 +74,6 @@ bulkImportWorker.on('failed', async (job, err) => {
   log.error(
     `Job failed — id=${job.id}  attempt=${job.attemptsMade}  final=${isFinalAttempt}  error=${err.message}`,
   );
-
-  // Clean up temp files only after the final failed attempt so that temp
-  // files are available for retry attempts (avoids re-upload on transient SFTP errors).
   if (isFinalAttempt && job.data.importId) {
     const importDir = path.join(os.tmpdir(), 'bulk-imports', job.data.importId);
     log.info(`Cleaning up temp files after final failure: ${importDir}`);
@@ -92,7 +89,7 @@ bulkImportWorker.on('stalled', (jobId) => {
   log.warn(`Job stalled — id=${jobId} (will be retried)`);
 });
 
-// ─── Queue Events (lightweight monitoring / logging) ─────────────────────────
+// ─── Queue Events ─────────────────────────────────────────────────────────────
 export const bulkImportQueueEvents = new QueueEvents(BULK_IMPORT_QUEUE, {
   connection: redisConnectionOptions,
 });
@@ -123,3 +120,6 @@ process.once('SIGINT',  () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
 log.info(`BulkImport worker started — concurrency=${CONCURRENCY} queue=${BULK_IMPORT_QUEUE}`);
+
+} // end REDIS_ENABLED guard
+

@@ -17,25 +17,35 @@
  *   - @bull-board/express    Express middleware generator
  */
 
-import { createBullBoard }       from '@bull-board/api';
-import { BullMQAdapter }         from '@bull-board/api/bullMQAdapter';
-import { ExpressAdapter }        from '@bull-board/express';
-import { bulkImportQueue }       from '../queues/bulkImportQueue';
+import { Router }              from 'express';
+import { REDIS_ENABLED }       from '../redis/connection';
+import { bulkImportQueue }     from '../queues/bulkImportQueue';
 
-const serverAdapter = new ExpressAdapter();
-serverAdapter.setBasePath('/admin/queues');
+let bullBoardRouter: Router;
 
-createBullBoard({
-  queues: [
-    new BullMQAdapter(bulkImportQueue),
-  ],
-  serverAdapter,
-});
+if (REDIS_ENABLED && bulkImportQueue) {
+  // Redis is available — set up the full Bull Board UI.
+  const { createBullBoard }  = require('@bull-board/api');
+  const { BullMQAdapter }    = require('@bull-board/api/bullMQAdapter');
+  const { ExpressAdapter }   = require('@bull-board/express');
 
-/**
- * Express Router for the Bull Board UI.
- *
- * Mount BEFORE the API 404 handler in server.ts:
- *   app.use('/admin/queues', bullBoardRouter);
- */
-export const bullBoardRouter = serverAdapter.getRouter();
+  const serverAdapter = new ExpressAdapter();
+  serverAdapter.setBasePath('/admin/queues');
+
+  createBullBoard({
+    queues: [new BullMQAdapter(bulkImportQueue)],
+    serverAdapter,
+  });
+
+  bullBoardRouter = serverAdapter.getRouter() as Router;
+} else {
+  // Redis not configured — return a minimal router that explains why the
+  // dashboard is unavailable instead of crashing or spamming error logs.
+  const r = Router();
+  r.use((_req, res) => {
+    res.status(503).json({ error: 'Queue dashboard unavailable: Redis is not configured.' });
+  });
+  bullBoardRouter = r;
+}
+
+export { bullBoardRouter };

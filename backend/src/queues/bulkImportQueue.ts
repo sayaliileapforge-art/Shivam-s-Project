@@ -30,30 +30,42 @@
  */
 
 import { Queue } from 'bullmq';
-import { redisConnectionOptions } from '../redis/connection';
+import { redisConnectionOptions, REDIS_ENABLED } from '../redis/connection';
 import type { BulkImportJobData } from '../processors/bulkImportProcessor';
 
 /** The canonical queue name.  Import this constant wherever you reference the
  *  queue to avoid silent misspellings. */
 export const BULK_IMPORT_QUEUE = 'bulk-import-queue';
 
-export const bulkImportQueue = new Queue<BulkImportJobData>(BULK_IMPORT_QUEUE, {
-  connection: redisConnectionOptions,
-  defaultJobOptions: {
-    // ── Retry with exponential backoff ──────────────────────────────────
-    attempts: 3,
-    backoff: {
-      type:  'exponential',
-      delay: 2_000, // 2 s, 4 s, 8 s
-    },
-    // ── Job retention (avoid unbounded Redis growth) ─────────────────────
-    removeOnComplete: { count: 100, age: 7 * 24 * 3_600 },
-    removeOnFail:     { count:  50, age: 30 * 24 * 3_600 },
-  },
-});
+/**
+ * The BullMQ Queue instance, or null when Redis is not configured.
+ * Always check for null before calling .add() in API routes.
+ */
+export const bulkImportQueue: Queue<BulkImportJobData> | null = REDIS_ENABLED
+  ? (() => {
+      const q = new Queue<BulkImportJobData>(BULK_IMPORT_QUEUE, {
+        connection: redisConnectionOptions,
+        defaultJobOptions: {
+          // ── Retry with exponential backoff ──────────────────────────────────
+          attempts: 3,
+          backoff: {
+            type:  'exponential',
+            delay: 2_000, // 2 s, 4 s, 8 s
+          },
+          // ── Job retention (avoid unbounded Redis growth) ─────────────────────
+          removeOnComplete: { count: 100, age: 7 * 24 * 3_600 },
+          removeOnFail:     { count:  50, age: 30 * 24 * 3_600 },
+        },
+      });
+      // Log queue-level errors (e.g. Redis disconnects) so they are visible in
+      // server logs without crashing the process.
+      q.on('error', (err) => {
+        console.error(`[Queue:${BULK_IMPORT_QUEUE}] Error: ${err.message}`);
+      });
+      return q;
+    })()
+  : null;
 
-// Log queue-level errors (e.g. Redis disconnects) so they are visible in
-// server logs without crashing the process.
-bulkImportQueue.on('error', (err) => {
-  console.error(`[Queue:${BULK_IMPORT_QUEUE}] Error: ${err.message}`);
-});
+if (!REDIS_ENABLED) {
+  console.warn('[Queue] Redis not configured (REDIS_HOST not set) — BullMQ queue disabled. Bulk import jobs will not be processed.');
+}
