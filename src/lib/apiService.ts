@@ -384,54 +384,53 @@ export async function uploadImages(files: File[]): Promise<string[]> {
 //  ZIP Bulk Image Upload API
 // ─────────────────────────────────────────────────────────────
 
-export interface ZipUploadImageResult {
+/** One uploaded file returned by the backend ZIP extract-and-upload route. */
+export interface ZipUploadFileEntry {
   filename: string;
   url: string;
-  matchedName?: string;
-  matchedId?: string;
-  status: 'matched' | 'unmatched' | 'error';
 }
 
+/**
+ * Response from POST /api/upload-images/zip.
+ * The backend now only extracts + uploads; matching is done on the frontend
+ * using the same matchImages() engine as folder upload.
+ */
 export interface ZipUploadSummary {
   success: boolean;
   total: number;
   uploaded: number;
-  matched: number;
-  unmatched: number;
+  files: ZipUploadFileEntry[];
   errors: string[];
-  results: ZipUploadImageResult[];
 }
 
 /**
  * Upload a ZIP file to the backend.
- * The server extracts images, uploads each to Hostinger via SFTP, and then
- * auto-maps filenames to student records in MongoDB using name normalization.
+ * The server extracts images and uploads each to Hostinger / local disk.
+ * Returns the list of {filename, url} pairs — matching is done on the
+ * frontend by the caller using matchImages().
  *
- * Filename convention:  "145__Vanshika_Katiyar.jpg" → "vanshika katiyar"
- *
- * @param zipFile   ZIP File object from an <input type="file"> element
- * @param projectId MongoDB project ID (required for auto-matching)
- * @param category  Data category, e.g. "student" (default "student")
+ * @param zipFile ZIP File object from an <input type="file"> element
  */
 export async function uploadZipImages(
   zipFile: File,
-  projectId: string,
-  category = 'student',
+  _projectId?: string,
+  _category?: string,
 ): Promise<ZipUploadSummary> {
   const form = new FormData();
   form.append('zip', zipFile);
-  form.append('projectId', projectId);
-  form.append('category', category);
 
   const response = await fetch(`${API_BASE}/upload-images/zip`, {
     method: 'POST',
     body: form,
   });
 
-  // Backend returns the summary fields directly — no `data` wrapper
   const json = await response.json() as ZipUploadSummary & { error?: string };
   if (!json.success) {
-    throw new Error((json as unknown as { error?: string }).error || 'ZIP upload failed');
+    throw new Error(json.error || 'ZIP upload failed');
+  }
+  // Defensive: ensure files array exists even if backend returned old format
+  if (!Array.isArray(json.files)) {
+    json.files = [];
   }
   return json;
 }

@@ -166,7 +166,7 @@ export async function getTemplateById(templateId: string): Promise<TemplateRecor
   return handleResponse<TemplateRecord>(response);
 }
 
-export async function createTemplate(input: TemplateSaveInput): Promise<TemplateRecord> {
+export async function createTemplate(input: TemplateSaveInput): Promise<TemplateRecord & { alreadyExists?: boolean }> {
   const preview = resolvePreviewForSave(input);
   const response = await fetch(TEMPLATE_API_BASE, {
     method: 'POST',
@@ -178,7 +178,15 @@ export async function createTemplate(input: TemplateSaveInput): Promise<Template
     }),
   });
 
-  return handleResponse<TemplateRecord>(response);
+  const raw = await response.text();
+  let json: { success?: boolean; data?: TemplateRecord; error?: string; message?: string; alreadyExists?: boolean } = {};
+  if (raw) {
+    try { json = JSON.parse(raw); } catch { throw new Error(raw || `Request failed with status ${response.status}`); }
+  }
+  if (!response.ok || json.success === false) {
+    throw new Error(json.error || json.message || `Request failed with status ${response.status}`);
+  }
+  return { ...(json.data as TemplateRecord), alreadyExists: json.alreadyExists };
 }
 
 export async function createTemplateWithImage(input: TemplateUploadInput): Promise<TemplateRecord> {
@@ -218,6 +226,20 @@ export async function updateTemplate(templateId: string, input: Partial<Template
 export async function deleteTemplate(templateId: string): Promise<void> {
   const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}`, {
     method: 'DELETE',
+  });
+  await handleResponse<unknown>(response);
+}
+
+/**
+ * Removes a template from a project without deleting the template document.
+ * The template remains in the Template Gallery if it is globally shared (isGlobal).
+ * Only the project-template association is severed.
+ */
+export async function unlinkTemplateFromProject(templateId: string, projectId: string): Promise<void> {
+  const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}/unlink`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId }),
   });
   await handleResponse<unknown>(response);
 }

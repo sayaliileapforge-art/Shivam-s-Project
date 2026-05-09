@@ -182,8 +182,26 @@ router.get('/', async (req: Request, res: Response) => {
       // Include global templates so all users see shared designs.
       projectConditions.push({ isGlobal: true });
       filter = { $or: projectConditions };
+    } else {
+      // Gallery mode (no productId / projectId): only return public global templates.
+      // This prevents project-specific copies and clones from polluting the gallery.
+      filter = { isGlobal: true };
     }
-    const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
+    const rawTemplates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
+
+    // Deduplicate by name only in gallery mode (no productId / projectId filter).
+    // When fetching project-specific templates, all records must be returned regardless of name
+    // so that a project copy with the same name as the global template is not silently dropped.
+    const isGalleryMode = !requestedProductId && !requestedProjectId;
+    const seenNames = new Set<string>();
+    const templates = isGalleryMode
+      ? rawTemplates.filter((t) => {
+          const key = t.templateName.trim().toLowerCase();
+          if (seenNames.has(key)) return false;
+          seenNames.add(key);
+          return true;
+        })
+      : rawTemplates;
     console.log('[templates] Templates found', {
       count: templates.length,
       ids: templates.map((template) => String(template._id)),
@@ -328,6 +346,26 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
     // Resolve final projectId: explicit bodyProjectId wins, otherwise derive from productId when it's a project
     const resolvedProjectId = String(bodyProjectId || (isActualProject ? productId : '') || '').trim();
 
+    // ── Idempotency check: if a non-global template with the same projectId + name already exists, return it ──
+    // NOTE: isGlobal: true templates are gallery templates — they must NOT be counted as project attachments
+    // even if they share the same projectId (templates created for a project are stored with projectId set).
+    if (resolvedProjectId) {
+      const existing = await ProductTemplate.findOne({
+        projectId: resolvedProjectId,
+        templateName: resolvedTemplateName,
+        isGlobal: { $ne: true },
+      });
+      if (existing) {
+        console.log('[templates] Template already exists for project — returning existing', {
+          _id: String(existing._id),
+          templateName: existing.templateName,
+          projectId: resolvedProjectId,
+        });
+        res.status(200).json({ success: true, data: existing, alreadyExists: true });
+        return;
+      }
+    }
+
     const template = new ProductTemplate({
       ...(isActualProduct ? { productId: new mongoose.Types.ObjectId(String(productId)) } : {}),
       ...(resolvedProjectId ? { projectId: resolvedProjectId } : {}),
@@ -354,7 +392,27 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       database: mongoose.connection.name,
     });
 
-    const savedTemplate = await template.save();
+    let savedTemplate: typeof template;
+    try {
+      savedTemplate = await template.save();
+    } catch (saveError: any) {
+      // Handle MongoDB duplicate key error (E11000) — return the existing document instead
+      if (saveError?.code === 11000) {
+        const dupFilter: Record<string, any> = { templateName: resolvedTemplateName, isGlobal: { $ne: true } };
+        if (resolvedProjectId) dupFilter.projectId = resolvedProjectId;
+        else if (isActualProduct) dupFilter.productId = new mongoose.Types.ObjectId(String(productId));
+        const existingDup = await ProductTemplate.findOne(dupFilter);
+        if (existingDup) {
+          console.log('[templates] Duplicate key — returning existing template', {
+            _id: String(existingDup._id),
+            templateName: existingDup.templateName,
+          });
+          res.status(200).json({ success: true, data: existingDup, alreadyExists: true });
+          return;
+        }
+      }
+      throw saveError;
+    }
 
     // Push template ref into Project.templates array
     if (resolvedProjectId && isValidObjectId(resolvedProjectId)) {
@@ -444,6 +502,68 @@ router.put('/:id', async (req: Request, res: Response) => {
   } catch (error) {
     const err = error as Error;
     console.error('[templates] Template update failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Unlink a template from a project without deleting the template document itself.
+// Used by "Remove from project" in ProjectDetail — the template remains in the
+// Template Gallery (if isGlobal) or as an orphaned record (if private).
+router.patch('/:id/unlink', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const projectId = String((req.body as Record<string, unknown>).projectId || '').trim();
+
+    if (!isValidObjectId(id)) {
+      res.status(400).json({ success: false, error: 'Invalid template id' });
+      return;
+    }
+    if (!projectId || !isValidObjectId(projectId)) {
+      res.status(400).json({ success: false, error: 'Valid projectId is required' });
+      return;
+    }
+
+    const template = await ProductTemplate.findById(id);
+    if (!template) {
+      res.status(404).json({ success: false, error: 'Template not found' });
+      return;
+    }
+
+    // Remove association fields so the template no longer appears in project queries.
+    // isGlobal templates remain visible in the gallery via {isGlobal:true} filter.
+    await ProductTemplate.findByIdAndUpdate(id, {
+      $unset: { projectId: '', productId: '' },
+    });
+
+    // Remove from the project's template array.
+    await Project.findByIdAndUpdate(
+      projectId,
+      { $pull: { templates: template._id } },
+      { new: false }
+    ).catch((err: Error) => {
+      console.warn('[templates] Failed to pull from Project.templates on unlink', err.message);
+    });
+
+    console.log('[templates] Template unlinked from project', {
+      templateId: id,
+      projectId,
+    });
+
+    emitRealtimeEvent({
+      type: 'template:updated',
+      templateId: id,
+      projectId,
+      productId: template.productId?.toString(),
+      isGlobal: template.isGlobal === true,
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    const err = error as Error;
+    console.error('[templates] Template unlink failed', {
       error: err.message,
       stack: err.stack,
     });

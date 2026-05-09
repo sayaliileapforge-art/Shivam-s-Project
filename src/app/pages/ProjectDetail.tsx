@@ -1,4 +1,4 @@
-﻿import { useParams, Link, useNavigate } from "react-router";
+﻿import { useParams, Link, useNavigate, useLocation, useSearchParams } from "react-router";
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import * as fabric from "fabric";
 import html2canvas from "html2canvas";
@@ -37,7 +37,7 @@ import {
   loadProjectProducts, addProjectProduct, deleteProjectProduct,
   loadProjectTasks, addProjectTask, updateProjectTask, deleteProjectTask,
   loadProjectFiles, addProjectFile, deleteProjectFile,
-  loadProjectTemplates, updateProjectTemplate, syncProjectTemplatesFromRemote,
+  loadProjectTemplates, updateProjectTemplate, deleteProjectTemplate, syncProjectTemplatesFromRemote,
   loadDataFields, saveDataFields, loadDataGroups, addDataGroup, deleteDataGroup, updateDataGroup,
   loadDataRecords, saveDataRecords, deleteDataRecord, updateDataRecord,
   type ProjectProduct, type ProjectTask, type ProjectFile, type ProjectTemplate,
@@ -59,7 +59,7 @@ import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { toast } from "sonner";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender, studentHasPhoto, getTemplateCached, resolveStudentPhotoUrl, resolveTemplateConfig, mapData, getRecordField, type DynamicTextObject } from "../components/preview/TemplateRenderer";
-import { createTemplate, deleteTemplate, mapTemplateRecordToProjectTemplate, migrateProjectTemplatesToDatabase, type TemplateRecord } from "../../lib/templateApi";
+import { createTemplate, deleteTemplate, unlinkTemplateFromProject, mapTemplateRecordToProjectTemplate, migrateProjectTemplatesToDatabase, type TemplateRecord } from "../../lib/templateApi";
 import { matchImages, type BulkMatchResult } from "../../lib/imageMatchEngine";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
 
@@ -491,7 +491,19 @@ function isPhotoFieldKey(key: string): boolean {
 
 function getRecordPhotoUrl(rec: ProjectDataRecord): string {
   const value = getRecordPhoto(rec);
-  return resolveProfileImageUrl(value);
+  if (!value) return '';
+  const trimmed = value.trim();
+  // Only display values that are confirmed uploaded URLs or embedded data.
+  // A bare filename like "101_syali.jpg" (from a CSV Photo column) is just
+  // matching metadata — it has NOT been uploaded yet and must not be resolved
+  // to an upload URL. After a real ZIP/folder upload the backend overwrites
+  // this field with the full http:// URL.
+  const isConfirmedUrl =
+    /^(data:image\/|blob:|https?:\/\/)/i.test(trimmed) ||
+    trimmed.startsWith('/uploads/') ||
+    trimmed.startsWith('uploads/');
+  if (!isConfirmedUrl) return '';
+  return resolveProfileImageUrl(trimmed);
 }
 const DEFAULT_AVATAR =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Ccircle cx='18' cy='18' r='18' fill='%23e2e8f0'/%3E%3Ccircle cx='18' cy='14' r='6' fill='%2394a3b8'/%3E%3Cellipse cx='18' cy='30' rx='10' ry='7' fill='%2394a3b8'/%3E%3C/svg%3E";
@@ -519,6 +531,8 @@ function toDbSafeRecords(records: ProjectDataRecord[]): ProjectDataRecord[] {
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
   const [version, setVersion] = useState(0);
   const [project, setProject] = useState<ReturnType<typeof mapApiProjectToUi> | null>(null);
   const [projectLoading, setProjectLoading] = useState(true);
@@ -623,6 +637,8 @@ export function ProjectDetail() {
   const [manualAssign, setManualAssign] = useState<Record<string, string>>({}); // filename → userId override
   const bulkImageDataUrlsRef = useRef<Map<string, string>>(new Map()); // filename → dataUrl
   const bulkImageFilesRef = useRef<Map<string, File>>(new Map()); // filename → File (for server upload)
+  // Pre-uploaded server URLs for ZIP upload (files already on server — no re-upload needed)
+  const zipServerUrlsRef = useRef<Map<string, string>>(new Map()); // filename → serverUrl
   const [isAddDataOpen, setIsAddDataOpen] = useState(false);
   const [addDataDraft, setAddDataDraft] = useState<Record<string, string>>({});
   const [isBulkEditOpen, setIsBulkEditOpen] = useState(false);
@@ -648,12 +664,20 @@ export function ProjectDetail() {
   const [templateErrors, setTemplateErrors] = useState<{ templateName?: string; applicableFor?: string }>({});
   const [previewTemplate, setPreviewTemplate] = useState<ProjectTemplate | null>(null);
   const [brokenTemplatePreviewIds, setBrokenTemplatePreviewIds] = useState<Record<string, true>>({});
-  const [activeTab, setActiveTab] = useState("details");
+  const [activeTab, setActiveTab] = useState(() => searchParams.get("tab") || "details");
   const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>([]);
   const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(false);
   const [remoteTemplatesError, setRemoteTemplatesError] = useState("");
+  const [deleteConfirmTemplate, setDeleteConfirmTemplate] = useState<ProjectTemplate | null>(null);
+  const [isDeletingTemplate, setIsDeletingTemplate] = useState(false);
   const templateMigrationRef = useRef(false);
   const realtimeRefreshRef = useRef<number | null>(null);
+
+  // Sync activeTab when the URL ?tab= param changes (e.g., after returning from Template Gallery)
+  useEffect(() => {
+    const tabFromUrl = searchParams.get("tab");
+    if (tabFromUrl) setActiveTab(tabFromUrl);
+  }, [searchParams]);
 
   useEffect(() => {
     templateMigrationRef.current = false;
@@ -762,7 +786,9 @@ export function ProjectDetail() {
     return () => {
       mounted = false;
     };
-  }, [id, version]);
+  // location.key changes on every navigation — ensures a fresh fetch when the user
+  // returns from Template Gallery to this same project URL.
+  }, [id, version, location.key]);
 
   // Load data
   const products = id ? loadProjectProducts(id) : [];
@@ -795,8 +821,14 @@ export function ProjectDetail() {
   }, [remoteTemplates, templates]);
 
   const previewTemplateGroups = useMemo(() => {
-    const projectTemplates = previewTemplates.filter((template) => !template.isGlobal);
-    const globalTemplates = previewTemplates.filter((template) => template.isGlobal);
+    // A template belongs to this project if it was created here (projectId === id),
+    // even when it is also publicly shared (isGlobal: true).
+    const projectTemplates = previewTemplates.filter(
+      (template) => !template.isGlobal || template.projectId === id
+    );
+    const globalTemplates = previewTemplates.filter(
+      (template) => template.isGlobal && template.projectId !== id
+    );
     return {
       projectTemplates: projectTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
       globalTemplates: globalTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
@@ -977,6 +1009,28 @@ export function ProjectDetail() {
         syncProjectTemplatesFromRemote(id, next);
         return next;
       });
+
+      // Open the Designer Studio for the newly created template
+      const normalizedMargin = {
+        top:    Number(templateForm.margin?.top    ?? 0) || 0,
+        left:   Number(templateForm.margin?.left   ?? 0) || 0,
+        right:  Number(templateForm.margin?.right  ?? 0) || 0,
+        bottom: Number(templateForm.margin?.bottom ?? 0) || 0,
+      };
+      const designerConfig = {
+        templateName: mapped.templateName,
+        templateType: mapped.templateType,
+        canvas: mapped.canvas,
+        margin: normalizedMargin,
+      };
+      localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
+      localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+        projectId: id,
+        templateId: mapped.id,
+        projectName: project?.name ?? "",
+        templateName: mapped.templateName,
+      }));
+      navigate(`/designer-studio?templateId=${mapped.id}`);
     } catch (error) {
       console.warn("[templates] Failed to persist project template to MongoDB", error);
       toast.error("Template could not be saved to the server.");
@@ -995,20 +1049,29 @@ export function ProjectDetail() {
   const handleDeleteTemplate = async (template: ProjectTemplate) => {
     if (!id) return;
     const remoteId = resolveRemoteTemplateId(template);
-    if (!remoteId) {
-      toast.error("Template is not synced to the server.");
-      return;
-    }
+    setIsDeletingTemplate(true);
     try {
-      await deleteTemplate(remoteId);
-      setRemoteTemplates((prev) => {
-        const next = prev.filter((t) => t.id !== remoteId);
-        syncProjectTemplatesFromRemote(id, next);
-        return next;
-      });
+      if (remoteId) {
+        // Detach from this project only — does NOT delete the template document.
+        // The template remains in the Template Gallery if it is globally shared.
+        await unlinkTemplateFromProject(remoteId, id);
+        setRemoteTemplates((prev) => {
+          const next = prev.filter((t) => t.id !== remoteId);
+          syncProjectTemplatesFromRemote(id, next);
+          return next;
+        });
+      } else {
+        // Local-only template (never synced) — remove from localStorage only.
+        deleteProjectTemplate(template.id);
+        refresh();
+      }
+      toast.success(`"${template.templateName}" removed from project.`);
+      setDeleteConfirmTemplate(null);
     } catch (error) {
-      console.warn("[templates] Failed to delete template", error);
-      toast.error("Failed to delete template.");
+      console.warn("[templates] Failed to remove template from project", error);
+      toast.error("Failed to remove template.");
+    } finally {
+      setIsDeletingTemplate(false);
     }
   };
 
@@ -1536,45 +1599,80 @@ export function ProjectDetail() {
         const i = updated.findIndex((r) => r.id === targets[0].id);
         if (i >= 0) updated[i] = { ...updated[i], photo: uploadedUrls[0] };
       } else {
+        // Check if any record has an explicit photo-filename column (e.g. "Photo", "Filename")
+        // If so, use EXACT filename matching only — no fuzzy/prefix fallback.
+        const photoColumnKeys = [
+          "Profile Picture", "profile_picture", "ProfilePicture", "profilePicture",
+          "Profile Pic", "profile_pic", "ProfilePic",
+          "Photo", "photo", "Photo File", "photo_file", "PhotoFile", "photoFile",
+          "Filename", "filename", "File Name", "file_name", "FileName",
+          "Photo Filename", "photo_filename", "Image", "image", "Image File", "image_file",
+        ] as const;
+        // Normalise a photo column value the same way as imageMatchEngine:
+        // strip \r\n, BOM (\ufeff), non-breaking space (\u00a0), Unicode NFC, lowercase.
+        const normalizePhotoKey = (s: string): string => {
+          let v = s.trim().replace(/[\r\n\t\u00a0\ufeff]/g, '');
+          try { v = v.normalize('NFC'); } catch { /* ignore */ }
+          return v.toLowerCase();
+        };
+        const getPhotoColumnValue = (r: ProjectDataRecord): string => {
+          for (const k of photoColumnKeys) {
+            const v = (r as Record<string, unknown>)[k];
+            if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+          }
+          return "";
+        };
+        const hasPhotoColumn = targets.some((r) => getPhotoColumnValue(r) !== "");
+
         files.forEach((f, idx) => {
           const photoUrl = uploadedUrls[idx];
           if (!photoUrl) return;
+          const filenameLower = f.name.toLowerCase();
           const baseName = f.name.replace(/\.[^.]+$/, "").toLowerCase().trim();
-          const match = targets.find((r) => {
-            // 1. Match by SchoolCode_AdmissionNumber prefix (e.g. "44837_10_Nitin_.jpg")
-            const schoolCode = String(
-              r["School Code"] ?? r["schoolCode"] ?? r["school_code"] ?? ""
-            ).trim();
-            const admNo = String(
-              r["Admission Number"] ?? r["admissionNumber"] ?? r["admission_number"] ?? ""
-            ).trim();
-            if (schoolCode && admNo) {
-              const prefix = `${schoolCode}_${admNo}_`.toLowerCase();
-              if (baseName.startsWith(prefix)) return true;
-            }
-            // 2. Match by student name
-            const name = String(r["Name"] ?? r["name"] ?? "").toLowerCase().trim();
-            if (name === baseName || baseName.startsWith(name) || name.startsWith(baseName)) return true;
-            // 3. Match by name tokens appearing in filename segments
-            if (name) {
-              const segments = baseName.split("_").filter(Boolean);
-              const nameTokens = name.split(/\s+/);
-              if (nameTokens.every((token) => segments.includes(token))) return true;
-            }
-            // 4. Match by the record's existing photo field filename
-            const existingPhoto = String(getRecordPhoto(r) || "");
-            const existingFilename = existingPhoto
-              .split("/").pop()!
-              .replace(/\.[^.]+$/, "")
-              .toLowerCase().trim();
-            return existingFilename.length > 0 && (
-              existingFilename === baseName ||
-              baseName.startsWith(existingFilename) ||
-              existingFilename.startsWith(baseName)
-            );
-          });
+          let match: ProjectDataRecord | undefined;
+
+          if (hasPhotoColumn) {
+            // Exact filename match against photo column — both sides normalised
+            // (strips invisible chars, BOM, NBSP, lowercases)
+            match = targets.find((r) => normalizePhotoKey(getPhotoColumnValue(r)) === normalizePhotoKey(f.name));
+          } else {
+            match = targets.find((r) => {
+              // 1. Match by SchoolCode_AdmissionNumber prefix (e.g. "44837_10_Nitin_.jpg")
+              const schoolCode = String(
+                r["School Code"] ?? r["schoolCode"] ?? r["school_code"] ?? ""
+              ).trim();
+              const admNo = String(
+                r["Admission Number"] ?? r["admissionNumber"] ?? r["admission_number"] ?? ""
+              ).trim();
+              if (schoolCode && admNo) {
+                const prefix = `${schoolCode}_${admNo}_`.toLowerCase();
+                if (baseName.startsWith(prefix)) return true;
+              }
+              // 2. Match by student name
+              const name = String(r["Name"] ?? r["name"] ?? "").toLowerCase().trim();
+              if (name === baseName || baseName.startsWith(name) || name.startsWith(baseName)) return true;
+              // 3. Match by name tokens appearing in filename segments
+              if (name) {
+                const segments = baseName.split("_").filter(Boolean);
+                const nameTokens = name.split(/\s+/);
+                if (nameTokens.every((token) => segments.includes(token))) return true;
+              }
+              // 4. Match by the record's existing photo field filename
+              const existingPhoto = String(getRecordPhoto(r) || "");
+              const existingFilename = existingPhoto
+                .split("/").pop()!
+                .replace(/\.[^.]+$/, "")
+                .toLowerCase().trim();
+              return existingFilename.length > 0 && (
+                existingFilename === baseName ||
+                baseName.startsWith(existingFilename) ||
+                existingFilename.startsWith(baseName)
+              );
+            });
+          }
+
           if (match) {
-            const i = updated.findIndex((r) => r.id === match.id);
+            const i = updated.findIndex((r) => r.id === match!.id);
             if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
           }
         });
@@ -1605,6 +1703,8 @@ export function ProjectDetail() {
     const fileMap = new Map<string, File>();
     imageFiles.forEach((f) => fileMap.set(f.name, f));
     bulkImageFilesRef.current = fileMap;
+    // Ensure ZIP server-URL map is clear (this is a folder upload)
+    zipServerUrlsRef.current = new Map();
 
     // Read all images as data URLs for the preview / matching UI
     const loaded = await Promise.all(
@@ -1641,67 +1741,67 @@ export function ProjectDetail() {
 
     setBulkImageProcessing(true);
     setBulkImageResults(null);
-    // Clear any stale refs from a previous folder-upload session
+    setManualAssign({});
+    // Clear all stale refs from previous sessions
     bulkImageFilesRef.current    = new Map();
     bulkImageDataUrlsRef.current = new Map();
+    zipServerUrlsRef.current     = new Map();
 
     try {
-      // Send ZIP to backend: it extracts images, uploads to Hostinger via SFTP,
-      // matches filenames → student names, and updates MongoDB directly.
-      const result = await uploadZipImages(zipFile, id, dataCategory);
+      // ── Step 1: Send ZIP to backend for extraction + upload only ──────────
+      // The backend extracts images and uploads each to the server, then
+      // returns [{filename, url}]. NO matching is done on the backend.
+      const result = await uploadZipImages(zipFile);
 
-      // Refresh records from backend so the updated photo URLs are shown immediately
-      const backendRecords = await fetchProjectRecords(id, dataCategory);
-      if (backendRecords && backendRecords.length > 0) {
-        const typed = backendRecords as ProjectDataRecord[];
-        saveDataRecords(id, dataCategory, toDbSafeRecords(typed));
-        setDataRecords(typed);
-      }
-
-      // Report to user
-      if (result.matched > 0) {
-        toast.success(
-          `${result.matched} photo(s) matched and saved on server — will persist after refresh.`
-        );
-      }
-      if (result.unmatched > 0) {
-        toast.error(
-          `${result.unmatched} image(s) had no matching student. ` +
-          `Rename files as "<number>__<First>_<Last>.jpg" to improve matching.`
-        );
-      }
       if (result.errors.length > 0) {
-        console.error("[zip-upload] errors:", result.errors);
-        toast.error(`${result.errors.length} upload error(s). Check browser console for details.`);
+        console.error("[zip-upload] upload errors:", result.errors);
+        toast.error(`${result.errors.length} file(s) failed to upload. Check console for details.`);
       }
 
-      // Expose results in the review panel (unmatched images shown for manual review)
-      if (result.unmatched > 0 || result.matched > 0) {
-        setBulkImageResults({
-          matched: result.results
-            .filter((r) => r.status === "matched" && r.matchedId)
-            .map((r) => ({
-              userId:          r.matchedId!,
-              name:            r.matchedName ?? r.filename,
-              filename:        r.filename,
-              dataUrl:         r.url, // server-hosted URL (not base64)
-              confidenceScore: 100,
-              matchType:       "exact_name" as const,
-            })),
-          duplicates: [],
-          unmatched: result.results
-            .filter((r) => r.status === "unmatched")
-            .map((r) => ({
-              filename:           r.filename,
-              reason:             "No matching student found",
-              normalizedFilename: r.filename,
-            })),
-        });
+      if (!result.files.length) {
+        toast.error("No images were extracted from the ZIP.");
+        return;
       }
+
+      // ── Step 2: Store server URLs for use in Apply (no re-upload needed) ──
+      const serverUrlMap = new Map<string, string>();
+      result.files.forEach(({ filename, url }) => serverUrlMap.set(filename, url));
+      zipServerUrlsRef.current = serverUrlMap;
+      // Also populate dataUrlsRef with server URLs so preview images work
+      bulkImageDataUrlsRef.current = new Map(serverUrlMap);
+
+      // ── Step 3: Run the SAME matchImages() engine as folder upload ─────────
+      // Build ImageFile objects: use the server URL as the dataUrl so thumbnails
+      // can still render in the review panel via <img src="…">.
+      const imageFiles = result.files.map(({ filename, url }) => ({
+        name:    filename,
+        dataUrl: url,
+      }));
+
+      const matchResult = matchImages(imageFiles, dataRecords as Record<string, unknown>[]);
+      setBulkImageResults(matchResult);
+
+      // ── Step 4: Report summary toasts ─────────────────────────────────────
+      const matchedCount   = matchResult.matched.length;
+      const unmatchedCount = matchResult.unmatched.length;
+
+      if (matchedCount > 0) {
+        toast.success(
+          `${matchedCount} photo(s) matched. Click "Apply" to save them.`
+        );
+      }
+      if (unmatchedCount > 0) {
+        toast.error(
+          `${unmatchedCount} image(s) had no matching student. ` +
+          `Check that the "Profile Picture" column in your CSV matches the ZIP filenames exactly.`
+        );
+      }
+
+      // Keep dialog open so the user can review results and click Apply.
+      setBulkImageProcessing(false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(`ZIP upload failed: ${msg}. Check your connection and try again.`);
-    } finally {
       setBulkImageProcessing(false);
       setIsBulkImageUploadOpen(false);
     }
@@ -1710,46 +1810,54 @@ export function ProjectDetail() {
   const handleApplyBulkImages = async () => {
     if (!id || !bulkImageResults) return;
 
-    const fileMap = bulkImageFilesRef.current;
-    const dataUrlMap = bulkImageDataUrlsRef.current;
-
-    // Collect the filenames that will actually be applied (matched + manually assigned unmatched)
-    const filesToUpload: { filename: string; file: File }[] = [];
-    const collect = (filename: string) => {
-      const file = fileMap.get(filename);
-      if (file) filesToUpload.push({ filename, file });
-    };
-    bulkImageResults.matched.forEach(({ filename }) => collect(filename));
-    bulkImageResults.unmatched.forEach(({ filename }) => {
-      if (manualAssign[filename]) collect(filename);
-    });
-
-    // Show loading state while uploading
     setBulkImageProcessing(true);
 
-    // Upload all required files to the server in chunks of 50
-    // (splitting avoids a single enormous multipart request and gives progress feedback)
+    // ── Determine server URLs ──────────────────────────────────────────────
+    // ZIP upload: files already on server → use zipServerUrlsRef (no re-upload)
+    // Folder upload: files are local File objects → upload them now
+    const isZipMode = zipServerUrlsRef.current.size > 0;
     const serverUrlByFilename = new Map<string, string>();
-    if (filesToUpload.length > 0) {
-      const CHUNK = 50;
-      try {
-        for (let i = 0; i < filesToUpload.length; i += CHUNK) {
-          const slice = filesToUpload.slice(i, i + CHUNK);
-          const urls = await uploadImages(slice.map((x) => x.file));
-          slice.forEach(({ filename }, idx) => {
-            if (urls[idx]) serverUrlByFilename.set(filename, urls[idx]);
-          });
+
+    if (isZipMode) {
+      // Copy pre-uploaded ZIP server URLs
+      zipServerUrlsRef.current.forEach((url, filename) => {
+        serverUrlByFilename.set(filename, url);
+      });
+    } else {
+      // Folder upload: collect File objects and upload in chunks of 50
+      const fileMap = bulkImageFilesRef.current;
+      const filesToUpload: { filename: string; file: File }[] = [];
+      const collect = (filename: string) => {
+        const file = fileMap.get(filename);
+        if (file) filesToUpload.push({ filename, file });
+      };
+      bulkImageResults.matched.forEach(({ filename }) => collect(filename));
+      bulkImageResults.unmatched.forEach(({ filename }) => {
+        if (manualAssign[filename]) collect(filename);
+      });
+
+      if (filesToUpload.length > 0) {
+        const CHUNK = 50;
+        try {
+          for (let i = 0; i < filesToUpload.length; i += CHUNK) {
+            const slice = filesToUpload.slice(i, i + CHUNK);
+            const urls = await uploadImages(slice.map((x) => x.file));
+            slice.forEach(({ filename }, idx) => {
+              if (urls[idx]) serverUrlByFilename.set(filename, urls[idx]);
+            });
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          toast.error(`Photo upload failed: ${msg}. Please check your connection and try again.`);
+          setBulkImageProcessing(false);
+          setIsBulkImageUploadOpen(false);
+          setBulkImageResults(null);
+          setManualAssign({});
+          bulkImageDataUrlsRef.current = new Map();
+          bulkImageFilesRef.current    = new Map();
+          zipServerUrlsRef.current     = new Map();
+          return;
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        toast.error(`Photo upload failed: ${msg}. Please check your connection and try again.`);
-        setBulkImageProcessing(false);
-        setIsBulkImageUploadOpen(false);
-        setBulkImageResults(null);
-        setManualAssign({});
-        bulkImageDataUrlsRef.current = new Map();
-        bulkImageFilesRef.current = new Map();
-        return;
       }
     }
 
@@ -1758,7 +1866,7 @@ export function ProjectDetail() {
     // Apply auto-matched images — only use server-hosted URLs (never base64)
     bulkImageResults.matched.forEach(({ userId, filename }) => {
       const targetId = manualAssign[filename] ?? userId;
-      const photoUrl = serverUrlByFilename.get(filename); // server URL only; no base64 fallback
+      const photoUrl = serverUrlByFilename.get(filename);
       if (!photoUrl) return;
       const i = updated.findIndex((r) => r.id === targetId);
       if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
@@ -1768,7 +1876,7 @@ export function ProjectDetail() {
     bulkImageResults.unmatched.forEach(({ filename }) => {
       const targetId = manualAssign[filename];
       if (!targetId) return;
-      const photoUrl = serverUrlByFilename.get(filename); // server URL only; no base64 fallback
+      const photoUrl = serverUrlByFilename.get(filename);
       if (!photoUrl) return;
       const i = updated.findIndex((r) => r.id === targetId);
       if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
@@ -1781,7 +1889,8 @@ export function ProjectDetail() {
     setBulkImageResults(null);
     setManualAssign({});
     bulkImageDataUrlsRef.current = new Map();
-    bulkImageFilesRef.current = new Map();
+    bulkImageFilesRef.current    = new Map();
+    zipServerUrlsRef.current     = new Map();
     // Count records that now have a server-hosted photo (any URL that isn't base64)
     const savedCount = updated.filter((r) => {
       const p = String((r as Record<string, unknown>).photo ?? "");
@@ -2554,6 +2663,35 @@ export function ProjectDetail() {
             </DialogContent>
           </Dialog>
 
+          {/* ── Remove-from-project confirmation dialog ── */}
+          <Dialog open={!!deleteConfirmTemplate} onOpenChange={(open) => { if (!open && !isDeletingTemplate) setDeleteConfirmTemplate(null); }}>
+            <DialogContent className="max-w-sm">
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2 text-destructive">
+                  <Trash2 className="h-4 w-4" /> Remove Template
+                </DialogTitle>
+              </DialogHeader>
+              <p className="text-sm text-muted-foreground">
+                Remove{" "}
+                <strong className="font-medium text-foreground">"{deleteConfirmTemplate?.templateName}"</strong>{" "}
+                from this project? This only removes it from the project — it won't affect the Template Gallery.
+              </p>
+              <div className="flex justify-end gap-2 mt-2">
+                <Button variant="outline" size="sm" disabled={isDeletingTemplate} onClick={() => setDeleteConfirmTemplate(null)}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={isDeletingTemplate}
+                  onClick={() => deleteConfirmTemplate && void handleDeleteTemplate(deleteConfirmTemplate)}
+                >
+                  {isDeletingTemplate ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />Removing…</> : "Remove"}
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+
           <Card className="shadow-md">
             <CardHeader>
               <div className="flex items-center justify-between flex-wrap gap-2">
@@ -2691,11 +2829,55 @@ export function ProjectDetail() {
                           >
                             <Pencil className="h-3 w-3" />Edit
                           </Button>
-                          {isOwnTemplate && (
-                            <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { void handleDeleteTemplate(tmpl); }}>
-                              <Trash2 className="h-3 w-3" />
-                            </Button>
-                          )}
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button size="sm" variant="ghost" className="px-2">
+                                <MoreVertical className="h-3.5 w-3.5" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="min-w-[170px]">
+                              <DropdownMenuItem
+                                className="gap-2 text-xs cursor-pointer"
+                                onClick={() => {
+                                  const rawMargin = (tmpl as any).margin ?? {};
+                                  const normalizedMargin = {
+                                    top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
+                                    left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
+                                    right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
+                                    bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
+                                  };
+                                  localStorage.setItem("vendor_designer_template_config", JSON.stringify({
+                                    templateName: tmpl.templateName,
+                                    templateType: tmpl.templateType,
+                                    canvas: tmpl.canvas,
+                                    margin: normalizedMargin,
+                                  }));
+                                  localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+                                    projectId: project.id,
+                                    templateId: tmpl.id,
+                                    projectName: project.name,
+                                    templateName: tmpl.templateName,
+                                  }));
+                                  navigate("/designer-studio");
+                                }}
+                              >
+                                <Pencil className="h-3.5 w-3.5" /> Edit in Designer
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                className="gap-2 text-xs cursor-pointer"
+                                onClick={() => setPreviewTemplate(tmpl)}
+                              >
+                                <Download className="h-3.5 w-3.5" /> Preview
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                className="gap-2 text-xs text-destructive focus:text-destructive focus:bg-destructive/10 cursor-pointer"
+                                onClick={() => setDeleteConfirmTemplate(tmpl)}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" /> Remove from Project
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         </div>
                       </div>
                     );
@@ -3979,91 +4161,18 @@ export function ProjectDetail() {
                       </summary>
                       {bulkImageResults.matched.length > 0 && (
                         <ul className="text-xs text-green-700 space-y-1 max-h-48 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
-                          {bulkImageResults.matched.map((m) => {
-                            const weak = m.confidenceScore < 80;
-                            return (
-                              <li key={m.userId + m.filename} className={`flex gap-1.5 items-center rounded px-1 py-0.5 ${weak ? 'bg-amber-50 border border-amber-200' : ''}`}>
-                                <img src={m.dataUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
-                                <span className="truncate flex-1">{m.filename} → <strong>{m.name}</strong></span>
-                                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
-                                  m.confidenceScore >= 95 ? 'bg-green-200 text-green-800' :
-                                  m.confidenceScore >= 80 ? 'bg-blue-100 text-blue-700' :
-                                  'bg-amber-200 text-amber-800'
-                                }`}>
-                                  {m.confidenceScore}%
-                                </span>
-                                {weak && (
-                                  <Select
-                                    value={manualAssign[m.filename] ?? m.userId}
-                                    onValueChange={(v) => setManualAssign((prev) => ({ ...prev, [m.filename]: v }))}
-                                  >
-                                    <SelectTrigger className="h-5 text-[10px] w-32 shrink-0 border-amber-300 bg-white">
-                                      <SelectValue placeholder="Reassign…" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      {dataRecords.map((rec) => (
-                                        <SelectItem key={rec.id} value={rec.id} className="text-xs">
-                                          {String(rec['Name'] ?? rec['name'] ?? rec['full_name'] ?? rec['Full Name'] ?? rec.id)}
-                                        </SelectItem>
-                                      ))}
-                                    </SelectContent>
-                                  </Select>
-                                )}
-                              </li>
-                            );
-                          })}
-                        </ul>
-                      )}
-                    </details>
-
-                    {/* ── DUPLICATES ── */}
-                    {bulkImageResults.duplicates.length > 0 && (
-                      <details className="rounded-lg border border-amber-200 bg-amber-50 overflow-hidden">
-                        <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-amber-800 [list-style:none] [&::-webkit-details-marker]:hidden">
-                          <AlertTriangle className="h-4 w-4 shrink-0" />
-                          <span>{bulkImageResults.duplicates.length} ambiguous match{bulkImageResults.duplicates.length !== 1 ? 'es' : ''}</span>
-                          <span className="text-xs font-normal ml-1 opacity-60">(best applied — please verify)</span>
-                          <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
-                        </summary>
-                        <ul className="text-xs space-y-3 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-amber-200">
-                          {bulkImageResults.duplicates.map((d, i) => (
-                            <li key={i}>
-                              <p className="font-semibold text-amber-900 truncate mb-0.5">📄 {d.filename}</p>
-                              <p className="text-[10px] text-amber-700 mb-1.5 opacity-80">{d.reason}</p>
-                              <ul className="pl-3 space-y-0.5 mb-1.5">
-                                {d.allMatches.map((m, ni) => (
-                                  <li key={ni} className="flex items-center gap-1.5 text-amber-800">
-                                    <span className={ni === 0 ? 'font-semibold' : 'opacity-60'}>{ni + 1}. {m.name}</span>
-                                    <span className="text-[10px] px-1 rounded bg-amber-100">{m.score}%</span>
-                                    {ni === 0 && (
-                                      <span className="text-[10px] font-bold bg-amber-300 text-amber-900 px-1.5 py-0.5 rounded">APPLIED</span>
-                                    )}
-                                  </li>
-                                ))}
-                              </ul>
-                              {/* Reassign dropdown */}
-                              <div className="pl-3">
-                                <Select
-                                  value={manualAssign[d.filename] ?? d.appliedUserId}
-                                  onValueChange={(v) => setManualAssign((prev) => ({ ...prev, [d.filename]: v }))}
-                                >
-                                  <SelectTrigger className="h-6 text-[11px] w-full border-amber-300 bg-white">
-                                    <SelectValue placeholder="Reassign to different student…" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    {d.allMatches.map((m) => (
-                                      <SelectItem key={m.userId} value={m.userId} className="text-xs">
-                                        {m.name} ({m.score}%)
-                                      </SelectItem>
-                                    ))}
-                                  </SelectContent>
-                                </Select>
-                              </div>
+                          {bulkImageResults.matched.map((m) => (
+                            <li key={m.userId + m.filename} className="flex gap-1.5 items-center rounded px-1 py-0.5">
+                              <img src={m.dataUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
+                              <span className="truncate flex-1">{m.filename} → <strong>{m.name}</strong></span>
+                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 bg-green-200 text-green-800">
+                                Matched
+                              </span>
                             </li>
                           ))}
                         </ul>
-                      </details>
-                    )}
+                      )}
+                    </details>
 
                     {/* ── UNMATCHED ── */}
                     {bulkImageResults.unmatched.length > 0 && (

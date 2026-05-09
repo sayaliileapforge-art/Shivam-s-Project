@@ -3,10 +3,12 @@ import { useNavigate, useSearchParams } from "react-router";
 import {
   Search, Globe, Star, Clock, Heart, ChevronLeft,
   ChevronRight, RotateCcw, Eye, Plus, X, ChevronDown, ImageOff, Loader2,
+  MoreVertical, Pencil, Copy, Trash2, Info,
 } from "lucide-react";
 import { cn } from "../components/ui/utils";
 import { getTemplates, createTemplate, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
+import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { toast } from "sonner";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -96,20 +98,39 @@ interface TemplateCardProps {
   onPreview: (t: TemplateRecord) => void;
   isFavorite: boolean;
   onToggleFavorite: (id: string) => void;
-  isAttaching?: boolean;
   projectId?: string | null;
+  isAttaching?: boolean;
+  onDuplicate: (t: TemplateRecord) => void;
+  onDelete: (t: TemplateRecord) => void;
+  isDuplicating?: boolean;
 }
 
-function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavorite, isAttaching, projectId }: TemplateCardProps) {
+function TemplateCard({
+  template: t, onUse, onPreview, isFavorite, onToggleFavorite,
+  projectId, isAttaching, onDuplicate, onDelete, isDuplicating,
+}: TemplateCardProps) {
+  const navigate = useNavigate();
   const [imgError, setImgError] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
   const previewSrc = resolveTemplatePreview(t);
   const displayCategory = deriveDisplayCategory(t);
   const size = deriveSize(t);
 
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [menuOpen]);
+
   return (
-    <div className="group relative flex flex-col rounded-xl border border-gray-200 bg-white shadow-sm hover:shadow-md transition-all duration-200 hover:-translate-y-0.5 overflow-hidden">
-      {/* Thumbnail */}
-      <div className="relative h-40 bg-gray-100 overflow-hidden">
+    <div ref={menuRef} className="group relative flex flex-col rounded-xl border border-gray-200 bg-white shadow-sm hover:shadow-md transition-all duration-200 hover:-translate-y-0.5">
+      {/* Thumbnail — overflow-hidden only clips image, NOT the dropdown */}
+      <div className="relative h-40 bg-gray-100 overflow-hidden rounded-t-xl">
         {previewSrc && !imgError ? (
           <img
             src={previewSrc}
@@ -123,6 +144,7 @@ function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavor
             <span className="text-xs">No Preview Available</span>
           </div>
         )}
+
         {/* Public badge */}
         <div className="absolute left-2 top-2">
           <span className="inline-flex items-center gap-1 rounded-full bg-white/90 px-2 py-0.5 text-xs font-medium text-gray-700 shadow-sm">
@@ -130,21 +152,86 @@ function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavor
             Public
           </span>
         </div>
-        {/* Favorite */}
-        <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+
+        {/* Favorite + three-dot trigger — buttons only, NO dropdown panel here */}
+        <div className="absolute right-2 top-2 flex items-center gap-1">
           <button
             onClick={() => onToggleFavorite(t._id)}
-            className="rounded-full bg-white/90 p-1 shadow-sm hover:bg-white transition-colors"
+            title={isFavorite ? "Remove from Favorites" : "Add to Favorites"}
+            className={cn(
+              "rounded-full bg-white/90 p-1 shadow-sm hover:bg-white transition-colors",
+              isFavorite ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+            )}
           >
             <Star className={cn("h-3.5 w-3.5", isFavorite ? "fill-yellow-400 text-yellow-400" : "text-gray-400")} />
           </button>
-          <button className="rounded-full bg-white/90 p-1 shadow-sm hover:bg-white transition-colors text-gray-500">
-            <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 16 16">
-              <circle cx="8" cy="3" r="1.2"/><circle cx="8" cy="8" r="1.2"/><circle cx="8" cy="13" r="1.2"/>
-            </svg>
+
+          <button
+            onClick={(e) => { e.stopPropagation(); setMenuOpen((o) => !o); }}
+            title="More options"
+            className={cn(
+              "rounded-full bg-white/90 p-1 shadow-sm hover:bg-white transition-colors text-gray-500",
+              menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+            )}
+          >
+            <MoreVertical className="h-3.5 w-3.5" />
           </button>
         </div>
       </div>
+
+      {/*
+        ── Dropdown panel is a direct child of the card's outer `relative` div,
+           completely outside the thumbnail's `overflow-hidden` scope.
+           Positioned from the card top-right corner.
+      */}
+      {menuOpen && (
+        <div className="absolute right-2 top-9 z-[100] min-w-[185px] rounded-xl border border-gray-200 bg-white py-1 shadow-2xl">
+          <button
+            onClick={() => {
+              setMenuOpen(false);
+              localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+                projectId: t.productId || "",
+                templateId: t._id,
+                templateName: t.templateName,
+              }));
+              navigate(`/designer-studio?templateId=${t._id}`);
+            }}
+            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+          >
+            <Pencil className="h-3.5 w-3.5 text-gray-400" /> Edit Template
+          </button>
+          <button
+            onClick={() => { setMenuOpen(false); onDuplicate(t); }}
+            disabled={isDuplicating}
+            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors disabled:opacity-50"
+          >
+            {isDuplicating
+              ? <Loader2 className="h-3.5 w-3.5 animate-spin text-gray-400" />
+              : <Copy className="h-3.5 w-3.5 text-gray-400" />}
+            {isDuplicating ? "Duplicating…" : "Duplicate Template"}
+          </button>
+          <button
+            onClick={() => { setMenuOpen(false); onToggleFavorite(t._id); }}
+            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+          >
+            <Star className={cn("h-3.5 w-3.5", isFavorite ? "fill-yellow-400 text-yellow-400" : "text-gray-400")} />
+            {isFavorite ? "Remove from Favorites" : "Add to Favorites"}
+          </button>
+          <button
+            onClick={() => { setMenuOpen(false); onPreview(t); }}
+            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+          >
+            <Info className="h-3.5 w-3.5 text-gray-400" /> View Details
+          </button>
+          <div className="my-1 border-t border-gray-100" />
+          <button
+            onClick={() => { setMenuOpen(false); onDelete(t); }}
+            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50 transition-colors"
+          >
+            <Trash2 className="h-3.5 w-3.5" /> Delete Template
+          </button>
+        </div>
+      )}
 
       {/* Card body */}
       <div className="flex flex-col gap-3 p-3">
@@ -154,20 +241,74 @@ function TemplateCard({ template: t, onUse, onPreview, isFavorite, onToggleFavor
         </div>
         <div className="flex gap-2">
           <button
-            onClick={() => !isAttaching && onUse(t)}
+            onClick={() => onUse(t)}
             disabled={isAttaching}
             className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-blue-600 bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 active:bg-blue-800 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
           >
             {isAttaching
               ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Attaching…</>
-              : <><Plus className="h-3.5 w-3.5" /> {projectId ? "Attach to Project" : "Use Template"}</>
+              : projectId
+                ? <><Plus className="h-3.5 w-3.5" /> Attach to Project</>
+                : <><Plus className="h-3.5 w-3.5" /> Use Template</>
             }
           </button>
           <button
             onClick={() => onPreview(t)}
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+            className="flex items-center justify-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 transition-colors"
           >
             <Eye className="h-3.5 w-3.5" /> Preview
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Delete Confirm Modal ─────────────────────────────────────────────────────
+
+function DeleteConfirmModal({
+  template, onConfirm, onCancel, isDeleting,
+}: {
+  template: TemplateRecord;
+  onConfirm: () => void;
+  onCancel: () => void;
+  isDeleting: boolean;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onCancel}>
+      <div
+        className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-100">
+            <Trash2 className="h-5 w-5 text-red-600" />
+          </div>
+          <div>
+            <h3 className="font-semibold text-gray-900">Delete Template</h3>
+            <p className="mt-1 text-sm text-gray-500">
+              Are you sure you want to delete{" "}
+              <strong className="font-medium text-gray-700">"{template.templateName}"</strong>?{" "}
+              This action cannot be undone.
+            </p>
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            disabled={isDeleting}
+            className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={isDeleting}
+            className="flex items-center gap-1.5 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            {isDeleting
+              ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Deleting…</>
+              : <><Trash2 className="h-3.5 w-3.5" /> Delete</>}
           </button>
         </div>
       </div>
@@ -263,13 +404,32 @@ export function TemplateGallery() {
   const [recentlyUsed, setRecentlyUsed] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem("tg_recent") ?? "[]") as string[]; } catch { return []; }
   });
-  const [attachingTemplateId, setAttachingTemplateId] = useState<string | null>(null);
+  const [attachingTemplateId, setAttachingTemplateId]     = useState<string | null>(null);
+  const [duplicatingTemplateId, setDuplicatingTemplateId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget]                   = useState<TemplateRecord | null>(null);
+  const [isDeleting, setIsDeleting]                       = useState(false);
 
   const fetchTemplates = useCallback(() => {
     setLoading(true);
     setError("");
     getTemplates()
-      .then((data) => setTemplates(data))
+      .then((data) => {
+        // Deduplicate: skip any template whose name (case-insensitive) or _id was already seen.
+        // Also exclude "(Copy)" templates — those are project-local clones, not gallery items.
+        const seenIds   = new Set<string>();
+        const seenNames = new Set<string>();
+        const unique = data.filter((t) => {
+          if (seenIds.has(t._id)) return false;
+          seenIds.add(t._id);
+          const nameKey = t.templateName.trim().toLowerCase();
+          if (seenNames.has(nameKey)) return false;
+          seenNames.add(nameKey);
+          // Hide project-local copy templates from the global gallery
+          if (/\(copy\)/i.test(t.templateName)) return false;
+          return true;
+        });
+        setTemplates(unique);
+      })
       .catch((err) => setError((err as Error).message ?? "Failed to load templates"))
       .finally(() => setLoading(false));
   }, []);
@@ -341,10 +501,10 @@ export function TemplateGallery() {
 
   const handleUseTemplate = async (t: TemplateRecord) => {
     if (projectId) {
-      // Attach (clone) the template into the current project
+      // Attach mode: clone the global template into the project
       setAttachingTemplateId(t._id);
       try {
-        await createTemplate({
+        const result = await createTemplate({
           productId: projectId,
           projectId: projectId,
           templateName: t.templateName,
@@ -353,10 +513,14 @@ export function TemplateGallery() {
           designData: t.designData ?? {},
           isGlobal: false,
           isPublic: false,
-        });
+        }) as any;
         setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
-        toast.success(`"${t.templateName}" attached to project.`);
-        navigate(`/projects/${projectId}`);
+        if (result?.alreadyExists) {
+          toast.info(`"${t.templateName}" is already attached to this project.`);
+        } else {
+          toast.success(`"${t.templateName}" attached to project.`);
+        }
+        navigate(`/projects/${projectId}?tab=templates`);
       } catch (err) {
         toast.error((err as Error).message || "Failed to attach template to project.");
       } finally {
@@ -364,13 +528,52 @@ export function TemplateGallery() {
       }
       return;
     }
-    // Default: open in Designer Studio
+    // Gallery mode: open in Designer Studio
     setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
     navigate(`/designer-studio?templateId=${t._id}`);
   };
 
   const toggleFavorite = (id: string) =>
     setFavorites((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+
+  const handleDuplicate = async (t: TemplateRecord) => {
+    setDuplicatingTemplateId(t._id);
+    try {
+      const copy = await createTemplate({
+        productId: t.productId ?? "",
+        templateName: `${t.templateName} (Copy)`,
+        preview_image: resolveTemplatePreview(t),
+        category: (t.category as any) || "Other",
+        designData: t.designData ?? {},
+        isGlobal: t.isGlobal ?? false,
+        isPublic: t.isGlobal ?? false,
+      });
+      setTemplates((prev) => [copy, ...prev]);
+      toast.success(`"${copy.templateName}" created.`);
+    } catch (err) {
+      toast.error((err as Error).message || "Failed to duplicate template.");
+    } finally {
+      setDuplicatingTemplateId(null);
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget) return;
+    setIsDeleting(true);
+    try {
+      const { deleteTemplate } = await import("../../lib/templateApi");
+      await deleteTemplate(deleteTarget._id);
+      setTemplates((prev) => prev.filter((t) => t._id !== deleteTarget._id));
+      setFavorites((prev) => prev.filter((id) => id !== deleteTarget._id));
+      setRecentlyUsed((prev) => prev.filter((id) => id !== deleteTarget._id));
+      toast.success(`"${deleteTarget.templateName}" deleted.`);
+      setDeleteTarget(null);
+    } catch (err) {
+      toast.error((err as Error).message || "Failed to delete template.");
+    } finally {
+      setIsDeleting(false);
+    }
+  };
 
   const handleClearFilters = () => {
     setQuery(""); setSelectedCategories(["all"]); setSelectedSizes(["all"]);
@@ -400,34 +603,31 @@ export function TemplateGallery() {
 
   return (
     <div className="flex min-h-screen flex-col bg-gray-50">
+      {/* ── Delete Confirmation Modal ── */}
+      {deleteTarget && (
+        <DeleteConfirmModal
+          template={deleteTarget}
+          onConfirm={handleDeleteConfirm}
+          onCancel={() => setDeleteTarget(null)}
+          isDeleting={isDeleting}
+        />
+      )}
+
       {/* ── Header ── */}
       <div className="flex items-start justify-between border-b bg-white px-6 py-5">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Template Gallery</h1>
           <p className="mt-0.5 text-sm text-gray-500">
-            {projectId
-              ? "Browse public templates and click \"Attach to Project\" to add one to your project."
-              : "Browse public templates, open any design, customize it in Designer Studio, and save as a new template."}
+            Browse public templates, open any design, customize it in Designer Studio, and save as a new template.
           </p>
         </div>
         <button
           onClick={() => navigate(projectId ? `/projects/${projectId}` : "/projects")}
           className="ml-4 flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors shadow-sm"
         >
-          <ChevronLeft className="h-4 w-4" /> {projectId ? "Back to Project" : "Back"}
+          <ChevronLeft className="h-4 w-4" /> Back to Project
         </button>
       </div>
-
-      {/* ── Context banner when attaching to a project ── */}
-      {projectId && (
-        <div className="border-b bg-blue-50 px-6 py-3 flex items-center gap-3">
-          <Globe className="h-4 w-4 text-blue-600 shrink-0" />
-          <p className="text-sm text-blue-800">
-            You are selecting a template for project <strong className="font-semibold">{projectId}</strong>.
-            Click <strong className="font-semibold">"Attach to Project"</strong> on any template to add it to your project.
-          </p>
-        </div>
-      )}
 
       {/* ── Top filter bar ── */}
       <div className="flex flex-wrap items-center gap-3 border-b bg-white px-6 py-3">
@@ -643,12 +843,15 @@ export function TemplateGallery() {
                   <div key={t._id} className="w-52 shrink-0">
                     <TemplateCard
                       template={t}
-                      onUse={(tmpl) => void handleUseTemplate(tmpl)}
+                      onUse={handleUseTemplate}
                       onPreview={setPreviewTemplate}
                       isFavorite={favorites.includes(t._id)}
                       onToggleFavorite={toggleFavorite}
-                      isAttaching={attachingTemplateId === t._id}
                       projectId={projectId}
+                      isAttaching={attachingTemplateId === t._id}
+                      onDuplicate={handleDuplicate}
+                      onDelete={setDeleteTarget}
+                      isDuplicating={duplicatingTemplateId === t._id}
                     />
                   </div>
                 ))}
@@ -688,12 +891,15 @@ export function TemplateGallery() {
                   <TemplateCard
                     key={t._id}
                     template={t}
-                    onUse={(tmpl) => void handleUseTemplate(tmpl)}
+                    onUse={handleUseTemplate}
                     onPreview={setPreviewTemplate}
                     isFavorite={favorites.includes(t._id)}
                     onToggleFavorite={toggleFavorite}
-                    isAttaching={attachingTemplateId === t._id}
                     projectId={projectId}
+                    isAttaching={attachingTemplateId === t._id}
+                    onDuplicate={handleDuplicate}
+                    onDelete={setDeleteTarget}
+                    isDuplicating={duplicatingTemplateId === t._id}
                   />
                 ))}
               </div>

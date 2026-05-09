@@ -16,8 +16,10 @@
     /* JSX */
     "jsx": "react-jsx",
 
+    /* Silence TS6.x deprecation notices in third-party packages */
+    "ignoreDeprecations": "6.0",
+
     /* Paths */
-    "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"]
     },

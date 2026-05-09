@@ -2,8 +2,6 @@ import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import mongoose from 'mongoose';
-import DataRecord from '../models/DataRecord';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const SftpClient = require('ssh2-sftp-client');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -196,8 +194,11 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
 //   "145__Vanshika_Katiyar.jpg"  →  "vanshika katiyar"
 //   "12_Ravi_Kumar.jpeg"         →  "ravi kumar"
 //
+// Matching is done on the FRONTEND (same matchImages() engine as folder upload)
+// so both paths are always in sync.
+//
 // Response:
-//   { success, total, uploaded, matched, unmatched, errors[], results[] }
+//   { success, total, uploaded, files[{filename, url}], errors[] }
 
 const zipUpload = multer({
   storage: multer.memoryStorage(),
@@ -212,79 +213,6 @@ const zipUpload = multer({
     else cb(new Error('Only ZIP files are allowed'));
   },
 });
-
-/**
- * Core normaliser: lowercase, keep only a-z and 0-9, drop everything else
- * (spaces, underscores, hyphens, dots, apostrophes, …).
- * "Vanshika Katiyar" → "vanshikakatiyar"
- * "O'Brien"          → "obrien"
- */
-function normalize(str: string): string {
-  return str.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-/**
- * Extract a normalised key from an image filename for matching.
- * 1. Decode URL encoding (%20 → space, etc.)
- * 2. Strip file extension
- * 3. Strip ALL leading roll/serial number prefixes (handles "145_36_" etc.)
- * 4. Run normalize()
- *
- * Examples:
- *   "145_36_Avni%20Pal_.jpg"   → "avnipal"
- *   "145_36_avni_pal.jpg"      → "avnipal"
- *   "145_Vanshika_Katiyar.jpg" → "vanshikakatiyar"
- *   "vanshika_katiyar.jpg"     → "vanshikakatiyar"
- */
-function normalizeFilename(filename: string): string {
-  // Decode URL-encoded characters first (%20 → space, etc.)
-  let decoded = filename;
-  try { decoded = decodeURIComponent(filename); } catch { /* keep original */ }
-  const noExt    = path.basename(decoded, path.extname(decoded));
-  // Strip ALL leading digit+separator segments (e.g. "145_36_" not just "145_")
-  const noPrefix = noExt.replace(/^(\d+[_\s.\-]*)+/, '');
-  return normalize(noPrefix);
-}
-
-/** Extract the student name from a DataRecord variables object.
- *  Checks common column name variations (CSV headers vary by school).
- *  Falls back to case-insensitive key scan for headers like "STUDENT NAME". */
-function getRecordName(vars: Record<string, unknown>): string {
-  // Fast path: exact key match
-  const direct = String(
-    vars['Name']         ??
-    vars['name']         ??
-    vars['StudentName']  ??
-    vars['studentName']  ??
-    vars['student_name'] ??
-    vars['FullName']     ??
-    vars['fullName']     ??
-    vars['full_name']    ??
-    vars['Student Name'] ??
-    vars['student name'] ??
-    vars['STUDENT NAME'] ??
-    vars['Full Name']    ??
-    ''
-  ).trim();
-  if (direct) return direct.toLowerCase();
-
-  // Fallback: case-insensitive scan for any name-like key
-  const namePattern = /^(student\s*name|full\s*name|name)$/i;
-  for (const [key, val] of Object.entries(vars)) {
-    if (namePattern.test(key.trim()) && val) return String(val).trim().toLowerCase();
-  }
-  return '';
-}
-
-type ZipResultStatus = 'matched' | 'unmatched' | 'error';
-
-interface ZipResult {
-  filename: string;
-  url: string;
-  matchedName?: string;
-  matchedId?: string;
-  status: ZipResultStatus;
-}
 
 router.post('/zip', async (req: Request, res: Response): Promise<void> => {
   // ── 1. Parse ZIP upload ──────────────────────────────────────────────────
@@ -305,9 +233,6 @@ router.post('/zip', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const projectId = String(req.body.projectId ?? req.query.projectId ?? '').trim();
-  const category  = String(req.body.category  ?? req.query.category  ?? 'student').trim();
-
   // ── 2. Extract images from ZIP ───────────────────────────────────────────
   type ImageEntry = { filename: string; buffer: Buffer };
   let imageEntries: ImageEntry[];
@@ -316,9 +241,17 @@ router.post('/zip', async (req: Request, res: Response): Promise<void> => {
       getEntries(): Array<{ isDirectory: boolean; entryName: string; name: string; getData(): Buffer }>;
     };
     imageEntries = zip.getEntries()
-      .filter((e) => !e.isDirectory && /\.(jpe?g|png|webp|gif|bmp)$/i.test(e.name))
+      .filter((e) =>
+        !e.isDirectory &&
+        // Only real image files — skip Mac resource-fork entries (._*) and __MACOSX/
+        !e.entryName.startsWith('__MACOSX/') &&
+        !e.name.startsWith('.') &&
+        /\.(jpe?g|png|webp|gif|bmp)$/i.test(e.name)
+      )
       .map((e) => ({
-        filename: path.basename(e.entryName), // strip any folder prefix from ZIP path
+        // e.name is already the bare filename (no path), unlike e.entryName.
+        // Using it directly avoids path.sep differences between Windows/Linux.
+        filename: e.name,
         buffer:   e.getData(),
       }));
   } catch (err) {
@@ -331,7 +264,7 @@ router.post('/zip', async (req: Request, res: Response): Promise<void> => {
     res.status(400).json({ success: false, error: 'No image files found inside the ZIP' });
     return;
   }
-  console.log(`[upload-images/zip] Extracted ${imageEntries.length} image(s)  projectId=${projectId || '(none)'}  category=${category}`);
+  console.log(`[upload-images/zip] Extracted ${imageEntries.length} image(s)`);
 
   // ── 3. Upload all images to SFTP (or local disk) ─────────────────────────
   // Reuse the same pool uploader, wrapping raw buffers as minimal Multer File objects.
@@ -383,124 +316,28 @@ router.post('/zip', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  // ── 4. Match filenames → student records & update DB ────────────────────
-  const results: ZipResult[] = [];
-  let matched   = 0;
-  let unmatched = 0;
-
-  if (projectId) {
-    try {
-      // Validate / coerce projectId to ObjectId
-      const projectOid = mongoose.Types.ObjectId.isValid(projectId)
-        ? new mongoose.Types.ObjectId(projectId)
-        : null;
-
-      if (!projectOid) {
-        res.status(400).json({ success: false, error: `Invalid projectId: ${projectId}` });
-        return;
-      }
-
-      const records = await DataRecord.find({ projectId: projectOid, category }).lean();
-      console.log(`[upload-images/zip] Loaded ${records.length} DB record(s) for projectId=${projectId} category=${category}`);
-      if (records.length === 0) {
-        console.warn('[upload-images/zip] ⚠ No records found in DB — upload CSV first, then upload ZIP');
-      }
-
-      // Build name index: normalised name → record
-      // normalize() produces "vanshikakatiyar" from "Vanshika Katiyar",
-      // "obrien" from "O'Brien", etc. — spaces and punctuation all removed.
-      const nameIndex = new Map<string, (typeof records)[number]>();
-      for (const rec of records) {
-        const rawName = getRecordName((rec.variables || {}) as Record<string, unknown>);
-        const name    = normalize(rawName);
-        if (name) {
-          nameIndex.set(name, rec);
-        }
-      }
-      console.log(`[upload-images/zip] Name index (${nameIndex.size} entries):`, Array.from(nameIndex.keys()).slice(0, 10));
-
-      for (let i = 0; i < imageEntries.length; i++) {
-        const filename = imageEntries[i].filename;
-        const url      = uploadedUrls[i];
-        if (!url) {
-          errors.push(`${filename}: upload produced no URL`);
-          results.push({ filename, url: '', status: 'error' });
-          continue;
-        }
-
-        // normalizeFilename strips extension + leading roll number, then normalises
-        // "145_Vanshika_Katiyar.jpg" → "vanshikakatiyar"
-        const cleanName = normalizeFilename(filename);
-        console.log(`[upload-images/zip] Matching "${filename}" → "${cleanName}"`);
-
-        // 1. Exact match (covers "vanshikakatiyar" === "vanshikakatiyar")
-        let matchRec = nameIndex.get(cleanName) ?? null;
-
-        // 2. Substring match — handles extra tokens (e.g. middle names, initials)
-        //    "vanshikasinghkatiyar" contains "vanshikakatiyar" is false, but
-        //    "vanshika" (stored short name) is contained in "vanshikakatiyar" (filename)
-        if (!matchRec) {
-          for (const [storedName, rec] of nameIndex) {
-            if (!storedName || !cleanName) continue;
-            if (cleanName.includes(storedName) || storedName.includes(cleanName)) {
-              matchRec = rec;
-              break;
-            }
-          }
-        }
-
-        if (matchRec) {
-          const vars       = (matchRec.variables || {}) as Record<string, unknown>;
-          const updatedVars = { ...vars, photo: url };
-          await DataRecord.updateOne({ _id: matchRec._id }, { $set: { variables: updatedVars } });
-
-          const matchedName = getRecordName(vars) || filename;
-          console.log(`[upload-images/zip] ✓ MATCHED  "${filename}" (key="${cleanName}") → "${matchedName}"  URL: ${url}`);
-          results.push({ filename, url, matchedName, matchedId: String(matchRec._id), status: 'matched' });
-          matched++;
-        } else {
-          console.warn(`[upload-images/zip] ✗ UNMATCHED "${filename}" (key="${cleanName}") — no record found`);
-          results.push({ filename, url, status: 'unmatched' });
-          unmatched++;
-        }
-      }
-
-      // Summary log — list all DB records that still have no photo
-      const unmatchedRecords = await DataRecord.find(
-        { projectId: projectOid, category, 'variables.photo': { $exists: false } },
-        { 'variables.Name': 1, 'variables.name': 1, 'variables.StudentName': 1 }
-      ).lean();
-      if (unmatchedRecords.length > 0) {
-        const names = unmatchedRecords.map((r) => getRecordName((r.variables || {}) as Record<string, unknown>) || '(no name)');
-        console.warn(`[upload-images/zip] ⚠ ${unmatchedRecords.length} record(s) still have no photo: ${names.slice(0, 20).join(', ')}${names.length > 20 ? ' …' : ''}`);
-      } else {
-        console.log(`[upload-images/zip] ✅ All records now have a photo.`);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[upload-images/zip] DB matching error:', msg);
-      errors.push(`DB matching failed: ${msg}`);
-      uploadedUrls.forEach((url, i) => {
-        results.push({ filename: imageEntries[i].filename, url, status: 'unmatched' });
-        unmatched++;
-      });
+  // ── 4. Return extracted + uploaded file list ────────────────────────────
+  // Matching is now done entirely on the frontend using the same matchImages()
+  // engine as folder upload. This ensures identical matching behaviour for
+  // both upload paths (no database-vs-memory discrepancy).
+  const files: Array<{ filename: string; url: string }> = [];
+  for (let i = 0; i < imageEntries.length; i++) {
+    const url = uploadedUrls[i];
+    if (!url) {
+      errors.push(`${imageEntries[i].filename}: upload produced no URL`);
+      continue;
     }
-  } else {
-    // No projectId — just return URLs without matching
-    uploadedUrls.forEach((url, i) => {
-      results.push({ filename: imageEntries[i].filename, url, status: 'unmatched' });
-      unmatched++;
-    });
+    files.push({ filename: imageEntries[i].filename, url });
   }
 
+  console.log(`[upload-images/zip] ✅ Returning ${files.length} uploaded file(s) to frontend for matching`);
+
   res.json({
-    success: true,
+    success:  true,
     total:    imageEntries.length,
-    uploaded: uploadedUrls.length,
-    matched,
-    unmatched,
+    uploaded: files.length,
+    files,
     errors,
-    results,
   });
 });
 

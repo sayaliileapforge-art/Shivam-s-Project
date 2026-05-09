@@ -55,7 +55,7 @@ export interface BulkMatchResult {
   unmatched: UnmatchedImage[];
 }
 
-export type MatchType = 'exact_id' | 'exact_name' | 'partial_name' | 'fuzzy' | 'none';
+export type MatchType = 'exact_filename' | 'exact_id' | 'exact_name' | 'partial_name' | 'fuzzy' | 'none';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -64,9 +64,10 @@ export type MatchType = 'exact_id' | 'exact_name' | 'partial_name' | 'fuzzy' | '
 /** Minimum score (0-100) to consider a record as a candidate. */
 const MATCH_THRESHOLD = 80;
 
-const SCORE_EXACT_ID   = 100;
-const SCORE_EXACT_NAME = 95;
-const SCORE_PARTIAL    = 85;
+const SCORE_EXACT_FILENAME = 110;
+const SCORE_EXACT_ID       = 100;
+const SCORE_EXACT_NAME     = 95;
+const SCORE_PARTIAL        = 85;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Normalization
@@ -100,6 +101,20 @@ function normalizeName(s: unknown): string {
 /** Normalize a CSV column key for loosy lookup. */
 function normKey(k: string): string {
   return k.toLowerCase().trim().replace(/[_.\s]+/g, ' ');
+}
+
+/**
+ * Normalise a filename for the exact photo-column key comparison.
+ * Strips invisible characters that Excel/Windows CSV exports introduce:
+ *   \\r (Windows CRLF), \\n, \\t, non-breaking space (\\u00a0), BOM (\\ufeff).
+ * Also applies Unicode NFC normalisation and lowercases.
+ * Both the CSV column value AND the uploaded filename go through this, so
+ * any invisible-character mismatch is eliminated.
+ */
+function normalizePhotoKey(filename: string): string {
+  let s = String(filename).trim().replace(/[\r\n\t\u00a0\ufeff]/g, '');
+  try { s = s.normalize('NFC'); } catch { /* ignore in unsupported env */ }
+  return s.toLowerCase();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -302,6 +317,29 @@ export interface ImageFile {
   dataUrl: string;
 }
 
+/**
+ * Read the explicit photo-filename column value from a record.
+ * Returns e.g. "101_syali.jpg" or '' if no photo column exists.
+ */
+function getPhotoColumnValue(rec: AnyRecord): string {
+  const photoKeys = [
+    'Profile Picture', 'profile_picture', 'ProfilePicture', 'profilePicture',
+    'Profile Pic', 'profile_pic', 'ProfilePic',
+    'Photo', 'photo', 'Photo File', 'photo_file', 'PhotoFile', 'photoFile',
+    'Filename', 'filename', 'File Name', 'file_name', 'FileName',
+    'Photo Filename', 'photo_filename', 'Image', 'image', 'Image File', 'image_file',
+  ];
+  for (const k of photoKeys) {
+    const v = rec[k];
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+  }
+  const photoPattern = /^(profile\s*pic(ture)?|photo|photo\s*file|photo\s*filename|filename|file\s*name|image|image\s*file)$/i;
+  for (const [k, v] of Object.entries(rec)) {
+    if (photoPattern.test(k.trim()) && v) return String(v).trim();
+  }
+  return '';
+}
+
 export function matchImages(
   imageFiles: ImageFile[],
   records: AnyRecord[],
@@ -313,17 +351,82 @@ export function matchImages(
   // userId → filename of the image that claimed it
   const claimedBy = new Map<string, string>();
 
+  // Build exact photo-filename index (if CSV has a Photo/Filename column)
+  // Key = normalizePhotoKey(value) so invisible chars/casing can't cause false misses.
+  const photoIndex = new Map<string, AnyRecord>();
+  let hasPhotoColumn = false;
+  for (const rec of records) {
+    const photoFile = getPhotoColumnValue(rec);
+    if (photoFile) {
+      hasPhotoColumn = true;
+      photoIndex.set(normalizePhotoKey(photoFile), rec);
+    }
+  }
+
   for (const img of imageFiles) {
     const fp = decompose(img.name);
+    const lookupKey = normalizePhotoKey(img.name);
 
     console.debug('[imageMatch] Processing', {
       filename:    img.name,
+      lookupKey,
       schoolCode:  fp.schoolCode,
       rollOrAdmNo: fp.rollOrAdmNo,
       firstName:   fp.firstName,
       lastName:    fp.lastName,
       nameFragment: fp.nameFragment,
     });
+
+    // ── Priority 0: Exact photo-filename column match ─────────────────────
+    // When the CSV has a Photo/Filename column, ONLY accept exact filename
+    // matches (both sides normalised via normalizePhotoKey).
+    if (hasPhotoColumn) {
+      const exactRec = photoIndex.get(lookupKey) ?? null;
+      if (exactRec) {
+        const recId   = String(exactRec['id'] ?? '');
+        const recName = getName(exactRec);
+        claimedBy.set(recId, img.name);
+        matched.push({
+          userId:          recId,
+          name:            recName,
+          filename:        img.name,
+          dataUrl:         img.dataUrl,
+          confidenceScore: SCORE_EXACT_FILENAME,
+          matchType:       'exact_filename',
+        });
+        console.debug('[imageMatch] Exact filename match', { filename: img.name, student: recName });
+      } else {
+        const indexKeys  = Array.from(photoIndex.keys());
+        const noExt      = lookupKey.replace(/\.[^.]+$/, '');
+        const nearMatch  = indexKeys.find(k => k.replace(/\.[^.]+$/, '') === noExt);
+        const nearest    = indexKeys.find(k => {
+          if (Math.abs(k.length - lookupKey.length) > 3) return false;
+          let diffs = 0;
+          for (let ci = 0; ci < Math.max(k.length, lookupKey.length); ci++) {
+            if (k[ci] !== lookupKey[ci]) diffs++;
+            if (diffs > 3) return false;
+          }
+          return diffs > 0;
+        });
+        console.warn(
+          `[imageMatch] ✗ UNMATCHED "${img.name}"\n` +
+          `  lookup key      : "${lookupKey}"\n` +
+          `  key char codes  : [${[...lookupKey].slice(0, 40).map(c => c.charCodeAt(0)).join(',')}]\n` +
+          `  photoIndex size : ${photoIndex.size}\n` +
+          `  sample keys     : [${indexKeys.slice(0, 6).map(k => `"${k}"`).join(', ')}]` +
+          (nearMatch ? `\n  ext-only near-match: "${nearMatch}"` : '') +
+          (nearest   ? `\n  char-diff near-match: "${nearest}"` : '')
+        );
+        unmatched.push({
+          filename:           img.name,
+          normalizedFilename: lookupKey,
+          reason: nearMatch
+            ? `Filename matches but extension differs: CSV has "${nearMatch}", ZIP has "${lookupKey}" — check file extension`
+            : `No record has Profile Picture / Photo = "${img.name}" (exact match required)`,
+        });
+      }
+      continue;
+    }
 
     // Score all records; keep only candidates that meet the threshold
     let candidates: Candidate[] = records

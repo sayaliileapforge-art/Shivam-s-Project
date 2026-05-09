@@ -3180,7 +3180,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       setBackgroundImage(dataUrl: string, fitMode: "cover" | "contain" = "contain") {
         const fc = fabricRef.current;
         if (!fc) return;
-        bgStringRef.current = "image";
+        // Do NOT set bgStringRef here — set it only after the image is placed so that
+        // any toJSON() call during the async load captures the correct state.
         bgFitModeRef.current = fitMode;
         bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset
         setCanvasBackgroundObject(fc, null);
@@ -3200,6 +3201,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             evented: false,
           } as any);
           setCanvasBackgroundObject(fc, img);
+          // Mark bgString AFTER the image is placed on canvas so serialisation is consistent.
+          bgStringRef.current = "image";
           if (marginGroupRef.current) fc.bringObjectToFront(marginGroupRef.current);
           fc.renderAll();
           pushUndoSnapshot(true);
@@ -3209,7 +3212,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       setBackgroundSVG(svgString: string, fitMode: "cover" | "contain" = "contain") {
         const fc = fabricRef.current;
         if (!fc) return;
-        bgStringRef.current = "svg";
+        // Do NOT set bgStringRef here — set it after the SVG is placed to avoid
+        // stale _bgString being serialised during the async load.
         bgFitModeRef.current = fitMode;
         bgOffsetRef.current = { x: 0, y: 0 }; // Reset offset
         
@@ -3245,6 +3249,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             
             svgElement.setCoords();
             setCanvasBackgroundObject(fc, svgElement);
+            // Mark bgString AFTER the SVG is placed so serialisation is consistent.
+            bgStringRef.current = "svg";
             if (marginGroupRef.current) fc.bringObjectToFront(marginGroupRef.current);
             
             // Store reference for zoom rescaling

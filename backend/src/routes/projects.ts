@@ -106,17 +106,20 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
     const objectId = new mongoose.Types.ObjectId(id);
 
-    // Delete all related data in parallel
+    // Delete all related data in parallel.
+    // IMPORTANT: isGlobal:true templates are gallery templates — they must never be
+    // cascade-deleted when a project is removed. Only delete project-specific copies.
     await Promise.all([
       DataRecord.deleteMany({ projectId: objectId }),
       ProductTemplate.deleteMany({
         $or: [{ projectId: id }, { productId: objectId }],
+        isGlobal: { $ne: true },
       }),
     ]);
 
     await project.deleteOne();
 
-    console.log(`[Projects] DELETE /${id} — project and related data deleted`);
+    console.log(`[Projects] DELETE /${id} — project and non-global templates deleted (gallery templates preserved)`);
     res.json({ success: true, message: 'Project and all related data deleted' });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });

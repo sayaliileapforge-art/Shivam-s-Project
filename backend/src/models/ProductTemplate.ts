@@ -68,7 +68,7 @@ ProductTemplateSchema.set('toJSON', {
 
 ProductTemplateSchema.index(
   { productId: 1, templateName: 1 },
-  { unique: true, partialFilterExpression: { productId: { $exists: true, $ne: null } } }
+  { unique: true, partialFilterExpression: { productId: { $type: 'objectId' } } }
 );
 
 export default mongoose.model<IProductTemplate>('ProductTemplate', ProductTemplateSchema);
