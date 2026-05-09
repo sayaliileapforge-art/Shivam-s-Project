@@ -37,6 +37,10 @@ import { createLogger }           from '../utils/logger';
 
 const log = createLogger('Worker');
 
+// ─── Module-level exports (null when Redis is not configured) ──────────────
+export let bulkImportWorker: Worker | null = null;
+export let bulkImportQueueEvents: QueueEvents | null = null;
+
 // Skip everything when Redis is not configured — avoids ECONNREFUSED spam in logs.
 if (!REDIS_ENABLED) {
   log.warn('Redis not configured (REDIS_HOST not set) — BullMQ worker disabled. Bulk import background processing is unavailable.');
@@ -46,7 +50,7 @@ if (!REDIS_ENABLED) {
 const CONCURRENCY = parseInt(process.env.BULK_IMPORT_CONCURRENCY ?? '3', 10);
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
-export const bulkImportWorker = new Worker(
+bulkImportWorker = new Worker(
   BULK_IMPORT_QUEUE,
   bulkImportProcessor,
   {
@@ -90,7 +94,7 @@ bulkImportWorker.on('stalled', (jobId) => {
 });
 
 // ─── Queue Events ─────────────────────────────────────────────────────────────
-export const bulkImportQueueEvents = new QueueEvents(BULK_IMPORT_QUEUE, {
+bulkImportQueueEvents = new QueueEvents(BULK_IMPORT_QUEUE, {
   connection: redisConnectionOptions,
 });
 
@@ -106,8 +110,8 @@ bulkImportQueueEvents.on('error', (err) => {
 async function shutdown(signal: string): Promise<void> {
   log.info(`Received ${signal} — closing worker gracefully…`);
   try {
-    await bulkImportWorker.close();
-    await bulkImportQueueEvents.close();
+    await bulkImportWorker?.close();
+    await bulkImportQueueEvents?.close();
     log.info('Worker shutdown complete');
     process.exit(0);
   } catch (err) {
