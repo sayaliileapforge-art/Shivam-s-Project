@@ -384,6 +384,7 @@ export function TemplateGallery() {
   const realtimeRefreshRef = useRef<number | null>(null);
   const lastFetchTimeRef   = useRef<number>(0);
   const pollingIntervalRef = useRef<number | null>(null);
+  const retryTimerRef      = useRef<number | null>(null);
 
   // Sidebar filters
   const [selectedCategories, setSelectedCategories] = useState<string[]>(["all"]);
@@ -411,11 +412,17 @@ export function TemplateGallery() {
   const [deleteTarget, setDeleteTarget]                   = useState<TemplateRecord | null>(null);
   const [isDeleting, setIsDeleting]                       = useState(false);
 
-  const fetchTemplates = useCallback(() => {
+  const fetchTemplates = useCallback((isRetry = false) => {
     // Prevent overlapping concurrent fetches (e.g. SSE + polling both firing at once).
     const now = Date.now();
-    if (now - lastFetchTimeRef.current < 500) return;
+    if (!isRetry && now - lastFetchTimeRef.current < 500) return;
     lastFetchTimeRef.current = now;
+
+    // Cancel any pending auto-retry before starting a fresh request.
+    if (retryTimerRef.current !== null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
 
     setLoading(true);
     setError("");
@@ -438,7 +445,21 @@ export function TemplateGallery() {
         setTemplates(unique);
         setError("");
       })
-      .catch((err) => setError((err as Error).message ?? "Failed to load templates"))
+      .catch((err) => {
+        const msg = (err as Error).message ?? "Failed to load templates";
+        // On timeout, auto-retry once after 10 s with a friendly message instead of
+        // showing a hard error and making the user click Retry manually.
+        if (msg.includes('timed out')) {
+          setError("Server is starting up… retrying automatically in 10 s.");
+          retryTimerRef.current = window.setTimeout(() => {
+            retryTimerRef.current = null;
+            lastFetchTimeRef.current = 0;
+            fetchTemplates(true);
+          }, 10_000);
+        } else {
+          setError(msg);
+        }
+      })
       .finally(() => setLoading(false));
   }, []);
 
@@ -479,6 +500,10 @@ export function TemplateGallery() {
       if (pollingIntervalRef.current !== null) {
         window.clearInterval(pollingIntervalRef.current);
         pollingIntervalRef.current = null;
+      }
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
       }
     };
   }, [fetchTemplates]);
@@ -853,13 +878,13 @@ export function TemplateGallery() {
 
           {/* Error */}
           {error && (
-            <div className="flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            <div className={`flex items-center justify-between gap-3 rounded-xl border px-4 py-3 text-sm ${error.includes('starting up') ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-red-200 bg-red-50 text-red-700'}`}>
               <span>{error}</span>
               <button
-                onClick={() => { lastFetchTimeRef.current = 0; fetchTemplates(); }}
-                className="shrink-0 rounded-lg border border-red-300 bg-white px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 transition-colors"
+                onClick={() => { lastFetchTimeRef.current = 0; if (retryTimerRef.current !== null) { window.clearTimeout(retryTimerRef.current); retryTimerRef.current = null; } fetchTemplates(true); }}
+                className={`shrink-0 rounded-lg border bg-white px-3 py-1.5 text-xs font-medium transition-colors ${error.includes('starting up') ? 'border-amber-300 text-amber-800 hover:bg-amber-50' : 'border-red-300 text-red-700 hover:bg-red-50'}`}
               >
-                Retry
+                Retry now
               </button>
             </div>
           )}

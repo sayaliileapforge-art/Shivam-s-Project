@@ -430,7 +430,7 @@ function inspectTemplatePreview(
     hasRenderablePreview: hasDesignElements && hasThumbnail,
     requiredFieldKeys,
     missingFieldKeys,
-    fallbackMessage: hasDesignElements ? "" : "No preview available. Please configure the template.",
+    fallbackMessage: hasDesignElements ? "" : "Click 'Edit' to open Designer Studio and create a design.",
   };
 }
 
@@ -723,7 +723,7 @@ export function ProjectDetail() {
     }
 
     const controller = new AbortController();
-    const timeoutId  = window.setTimeout(() => controller.abort(), 15_000);
+    const timeoutId  = window.setTimeout(() => controller.abort(), 45_000);
 
     const requestUrl = `${API_BASE}/templates?projectId=${encodeURIComponent(id)}`;
     setRemoteTemplatesLoading(true);
@@ -2767,25 +2767,24 @@ export function ProjectDetail() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {previewTemplateGroups.projectTemplates.map((tmpl) => {
                     const previewDiagnostics = templateDiagnosticsMap[tmpl.id];
-                    const canRenderCardImage = Boolean(
-                      tmpl.thumbnail
-                      && previewDiagnostics?.hasDesignElements
-                      && !brokenTemplatePreviewIds[tmpl.id]
-                    );
+                    const showThumbnail = Boolean(tmpl.thumbnail && !brokenTemplatePreviewIds[tmpl.id]);
+                    // Blank card shape SVG so cards always look like cards, not error states
+                    const w = tmpl.canvas.width || 54;
+                    const h = tmpl.canvas.height || 86;
+                    const blankPlaceholder = `data:image/svg+xml,${encodeURIComponent(
+                      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">` +
+                      `<rect width="${w}" height="${h}" rx="2" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>` +
+                      `<text x="${w/2}" y="${h * 0.45}" font-family="sans-serif" font-size="${Math.max(5, Math.min(w,h)*0.1)}" fill="#94a3b8" text-anchor="middle" dominant-baseline="middle">No Design Yet</text>` +
+                      `<text x="${w/2}" y="${h * 0.62}" font-family="sans-serif" font-size="${Math.max(4, Math.min(w,h)*0.08)}" fill="#cbd5e1" text-anchor="middle" dominant-baseline="middle">${w}\xd7${h}mm</text>` +
+                      `</svg>`
+                    )}`;
                     // Own project's template (has edit/delete rights)
                     const isOwnTemplate = tmpl.projectId === id;
 
                     return (
                       <div key={tmpl.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow space-y-3">
                         <div className="bg-muted/30 rounded flex items-center justify-center h-28 relative overflow-hidden">
-                          {canRenderCardImage ? (
-                            <img
-                              src={tmpl.thumbnail}
-                              alt={tmpl.templateName}
-                              className="max-h-full max-w-full object-contain rounded shadow"
-                              onError={() => markTemplatePreviewBroken(tmpl.id)}
-                            />
-                          ) : tmpl.thumbnail && !brokenTemplatePreviewIds[tmpl.id] ? (
+                          {showThumbnail ? (
                             <img
                               src={tmpl.thumbnail}
                               alt={tmpl.templateName}
@@ -2793,12 +2792,11 @@ export function ProjectDetail() {
                               onError={() => markTemplatePreviewBroken(tmpl.id)}
                             />
                           ) : (
-                            <div className="h-full w-full bg-muted/20 flex flex-col items-center justify-center gap-1.5 px-3 text-center">
-                              <Layers className="h-5 w-5 text-muted-foreground" />
-                              <p className="text-[11px] text-muted-foreground leading-snug">
-                                {previewDiagnostics?.fallbackMessage || "Open in designer to generate a preview."}
-                              </p>
-                            </div>
+                            <img
+                              src={blankPlaceholder}
+                              alt={`${tmpl.templateName} — no design yet`}
+                              className="max-h-full max-w-full object-contain rounded"
+                            />
                           )}
                         </div>
                         <div>
@@ -2807,7 +2805,7 @@ export function ProjectDetail() {
                             <Badge variant="secondary" className="text-[10px] capitalize">{tmpl.templateType.replace("_"," ")}</Badge>
                             <Badge variant="outline" className="text-[10px]">{tmpl.canvas.width}x{tmpl.canvas.height}mm</Badge>
                           </div>
-                          {!previewDiagnostics?.hasDesignElements && !tmpl.thumbnail && (
+                          {!previewDiagnostics?.hasDesignElements && (
                             <Badge variant="outline" className="text-[10px] mt-1 text-muted-foreground border-dashed">
                               Draft
                             </Badge>

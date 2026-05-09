@@ -133,7 +133,9 @@ function withTimeout(ms: number): { signal: AbortSignal; clear: () => void } {
   return { signal: controller.signal, clear: () => window.clearTimeout(id) };
 }
 
-const FETCH_TIMEOUT_MS = 15_000;
+// Render free-tier cold starts can take up to 50 s. Use 45 s so the first
+// request after a spin-down survives the wake-up without timing out.
+const FETCH_TIMEOUT_MS = 45_000;
 
 export async function getTemplatesByProductId(productId: string, params?: { category?: string; search?: string }): Promise<TemplateRecord[]> {
   const query = new URLSearchParams();
