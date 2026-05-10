@@ -5,11 +5,12 @@ import path from 'path';
 import fs from 'fs';
 import { connectDB } from './config/database';
 import ProductTemplate from './models/ProductTemplate';
+import TemplateGalleryMeta from './models/TemplateGalleryMeta';
 import { hasPostgresConfig, initAuthSchema, testAuthDbConnection } from './config/postgres';
 import projectRoutes from './routes/projects';
 import clientRoutes from './routes/clients';
 import productRoutes from './routes/products';
-import templateRoutes from './routes/templates';
+import templateRoutes, { warmGalleryCache } from './routes/templates';
 import orderRoutes from './routes/orders';
 import authRoutes from './routes/auth';
 import previewRoutes from './routes/preview';
@@ -139,6 +140,19 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 async function startServer() {
   try {
     await connectDB();
+
+    // Build indexes before accepting traffic. With autoIndex:false in database.ts the
+    // background index creation is disabled; we do it here so queries are never blocked
+    // by an in-progress index build once app.listen() fires.
+    // On Atlas M0 this can take up to 60 s on first run (when compound indexes don't yet
+    // exist), but subsequent starts are instant (indexes already exist).
+    try {
+      await ProductTemplate.createIndexes();
+      console.log('✓ ProductTemplate indexes ready');
+    } catch (idxErr) {
+      console.warn('! Index creation failed (non-fatal):', (idxErr as Error).message);
+    }
+
     // --- AUTO SEED LOGIC: Insert default templates if none exist ---
     const templateCount = await ProductTemplate.countDocuments();
     console.log(`✓ ProductTemplate count: ${templateCount}`);
@@ -170,6 +184,63 @@ async function startServer() {
     } catch (migErr) {
       console.warn('! Could not promote root templates to global (non-fatal):', (migErr as Error).message);
     }
+
+    // Kick off gallery cache warmup in the background — it runs the slow Atlas document
+    // read after the server is already accepting traffic (non-blocking startup).
+    // The first gallery request may still be slow if it arrives before the warmup finishes,
+    // but the amber-banner + auto-retry in the frontend handles that gracefully.
+    setImmediate(() => warmGalleryCache());
+
+    // --- MIGRATION: populate TemplateGalleryMeta from existing ProductTemplates ---
+    // TemplateGalleryMeta is a lean mirror (no designData) that allows instant gallery reads
+    // even on Atlas M0 cold storage. Run non-blocking so startup is not delayed.
+    setImmediate(async () => {
+      try {
+        const totalTemplates = await ProductTemplate.countDocuments();
+        const existingMetaCount = await TemplateGalleryMeta.countDocuments();
+        if (existingMetaCount >= totalTemplates) {
+          console.log(`✓ TemplateGalleryMeta already populated (${existingMetaCount} records)`);
+          return;
+        }
+        console.log(`[migration] Populating TemplateGalleryMeta (${existingMetaCount}/${totalTemplates} done)...`);
+        // Use batchSize(1) cursor: Atlas M0 returns each doc as it's read from cold storage
+        // instead of blocking until all docs are loaded.
+        const cursor = (ProductTemplate as any).collection.find(
+          {},
+          { projection: { designData: 0 } }
+        ).batchSize(1);
+        let upserted = 0;
+        for await (const t of cursor) {
+          try {
+            await TemplateGalleryMeta.findOneAndUpdate(
+              { templateId: t._id },
+              {
+                templateId: t._id,
+                productId: t.productId,
+                projectId: t.projectId != null ? String(t.projectId) : undefined,
+                templateName: t.templateName,
+                description: t.description,
+                category: t.category,
+                previewImageUrl: t.previewImageUrl,
+                preview_image: t.preview_image,
+                designFileUrl: t.designFileUrl,
+                isGlobal: t.isGlobal ?? false,
+                isActive: t.isActive ?? true,
+                tags: t.tags,
+              },
+              { upsert: true, new: false }
+            );
+            upserted++;
+            console.log(`[migration] ✓ [${upserted}/${totalTemplates}] ${t.templateName}`);
+          } catch (docErr) {
+            console.warn(`[migration] ✗ ${t.templateName}: ${(docErr as Error).message}`);
+          }
+        }
+        console.log(`✓ TemplateGalleryMeta migration done: ${upserted}/${totalTemplates} upserted`);
+      } catch (migErr) {
+        console.warn('! TemplateGalleryMeta migration failed (non-fatal):', (migErr as Error).message);
+      }
+    });
     if (hasPostgresConfig()) {
       await testAuthDbConnection();
       await initAuthSchema();

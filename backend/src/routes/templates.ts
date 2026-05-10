@@ -5,6 +5,7 @@ import multer from 'multer';
 import { randomUUID } from 'crypto';
 import mongoose from 'mongoose';
 import ProductTemplate from '../models/ProductTemplate';
+import TemplateGalleryMeta from '../models/TemplateGalleryMeta';
 import Product from '../models/Product';
 import Project from '../models/Project';
 import TemplateSelection from '../models/TemplateSelection';
@@ -130,6 +131,115 @@ const GALLERY_SELECT_FIELDS =
   '_id productId projectId templateName description category ' +
   'previewImageUrl preview_image designFileUrl isGlobal isActive tags createdAt updatedAt';
 
+/**
+ * Upsert the lightweight gallery metadata mirror for a template.
+ * Called non-blocking after each template create/update so the TemplateGalleryMeta
+ * collection stays in sync without blocking the HTTP response.
+ */
+async function syncGalleryMeta(t: Record<string, any>): Promise<void> {
+  try {
+    await TemplateGalleryMeta.findOneAndUpdate(
+      { templateId: t._id },
+      {
+        templateId: t._id,
+        productId: t.productId,
+        projectId: t.projectId,
+        templateName: t.templateName,
+        description: t.description,
+        category: t.category,
+        previewImageUrl: t.previewImageUrl,
+        preview_image: t.preview_image,
+        designFileUrl: t.designFileUrl,
+        isGlobal: t.isGlobal ?? false,
+        isActive: t.isActive ?? true,
+        tags: t.tags,
+      },
+      { upsert: true, new: true }
+    );
+  } catch (err) {
+    console.warn('[templates] syncGalleryMeta failed (non-fatal):', (err as Error).message);
+  }
+}
+
+
+// Atlas M0 reads 5 multi-MB documents from cold storage on every request (~50-60 s).
+// By caching the result we pay that cost only once per TTL (5 minutes) and serve
+// subsequent requests instantly from memory.
+interface GalleryCache { data: Array<Record<string, any>>; expiresAt: number }
+let galleryCache: GalleryCache | null = null;
+const GALLERY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// File-based gallery cache — survives backend restarts and Atlas M0 sleep periods.
+const GALLERY_CACHE_FILE = path.join(__dirname, '..', '..', 'tmp', 'gallery-cache.json');
+
+function loadGalleryCacheFromFile(): void {
+  try {
+    if (fs.existsSync(GALLERY_CACHE_FILE)) {
+      const raw = fs.readFileSync(GALLERY_CACHE_FILE, 'utf-8');
+      const parsed = JSON.parse(raw) as GalleryCache;
+      if (parsed && Array.isArray(parsed.data)) {
+        galleryCache = parsed;
+        console.log(`✓ Gallery file cache loaded: ${parsed.data.length} template(s)`);
+      }
+    }
+  } catch (e) {
+    console.warn('! Gallery file cache load failed (non-fatal):', (e as Error).message);
+  }
+}
+
+function saveGalleryCacheToFile(cache: GalleryCache): void {
+  try {
+    const dir = path.dirname(GALLERY_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(GALLERY_CACHE_FILE, JSON.stringify(cache), 'utf-8');
+  } catch (e) {
+    console.warn('! Gallery file cache save failed (non-fatal):', (e as Error).message);
+  }
+}
+
+// Load file cache immediately so first requests are served from disk if Atlas is asleep
+loadGalleryCacheFromFile();
+
+// Shared promise for the in-flight cache warm-up — ensures only ONE Atlas query runs
+// at a time even if multiple HTTP requests or the background warmup arrive concurrently.
+let warmupInFlight: Promise<void> | null = null;
+
+const WARMUP_TIMEOUT_MS = 90_000; // abort warmup query after 90 s (Atlas M0 cold read limit)
+
+/** Pre-warm (or re-warm) the gallery cache. Concurrent calls share the same query. */
+export function warmGalleryCache(): Promise<void> {
+  if (warmupInFlight) return warmupInFlight; // deduplicate concurrent callers
+  warmupInFlight = (async () => {
+    try {
+      // Read from lean TemplateGalleryMeta (no designData) — fast even on Atlas M0 cold storage
+      const metaPromise = TemplateGalleryMeta
+        .find({ isGlobal: true })
+        .sort({ updatedAt: -1 })
+        .lean<Array<Record<string, any>>>();
+      const warmupTimeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('warmup timed out after 60000ms')), 60000)
+      );
+      const metaDocs = await Promise.race([metaPromise, warmupTimeoutPromise]);
+      const seenNames = new Set<string>();
+      const unique = metaDocs.filter((t) => {
+        const key = String(t.templateName || '').trim().toLowerCase();
+        if (seenNames.has(key)) return false;
+        seenNames.add(key);
+        return true;
+      });
+      const data = unique.map((t) => ({ ...t, _id: t.templateId ?? t._id }));
+      galleryCache = { data, expiresAt: Date.now() + GALLERY_CACHE_TTL_MS };
+      saveGalleryCacheToFile(galleryCache);
+      console.log(`✓ Gallery cache warm: ${data.length} template(s)`);
+    } catch (err) {
+      console.warn('! Gallery cache warmup failed (non-fatal):', (err as Error).message);
+    } finally {
+      warmupInFlight = null;
+    }
+  })();
+  return warmupInFlight;
+}
+
 function parseJsonField<T>(value: unknown, fallback: T): T {
   if (value == null) return fallback;
   if (typeof value === 'string') {
@@ -180,6 +290,55 @@ router.get('/', async (req: Request, res: Response) => {
 
     const isGalleryMode = !requestedProductId && !requestedProjectId;
 
+    // ─── Gallery fast path: read from the lean TemplateGalleryMeta collection ───
+    // These documents contain no designData so they are tiny (<2 KB each) and
+    // Atlas M0 serves them from memory in <100 ms even from cold storage.
+    if (isGalleryMode) {
+      // Try the lean TemplateGalleryMeta collection first (tiny docs, fast on Atlas M0).
+      // On error (Atlas offline), fall back to the in-memory galleryCache if available.
+      let metaDocs: Array<Record<string, any>> | null = null;
+      try {
+        const GALLERY_META_TIMEOUT_MS = 5000; // 5s — if Atlas doesn't respond, use file cache
+        const metaPromise = TemplateGalleryMeta
+          .find({ isGlobal: true })
+          .sort({ updatedAt: -1 })
+          .lean<Array<Record<string, any>>>();
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`gallery meta timeout after ${GALLERY_META_TIMEOUT_MS}ms`)), GALLERY_META_TIMEOUT_MS)
+        );
+        metaDocs = await Promise.race([metaPromise, timeoutPromise]);
+      } catch (metaErr) {
+        console.warn('[templates] TemplateGalleryMeta read failed, trying cache:', (metaErr as Error).message);
+        if (galleryCache && Date.now() < galleryCache.expiresAt + 7 * 24 * 60 * 60 * 1000) {
+          // Serve stale cache (up to 7 days) when Atlas is offline
+          console.log('[templates] Gallery served from stale cache', { count: galleryCache.data.length });
+          res.setHeader('Cache-Control', 'no-store');
+          res.json({ success: true, data: galleryCache.data, meta: { total: galleryCache.data.length } });
+          return;
+        }
+        throw metaErr; // no cache — let outer catch handle it
+      }
+      const seenNames = new Set<string>();
+      const unique = metaDocs.filter((t) => {
+        const key = String(t.templateName || '').trim().toLowerCase();
+        if (seenNames.has(key)) return false;
+        seenNames.add(key);
+        return true;
+      });
+      // Remap templateId → _id so frontend code using ._id continues to work
+      const data = unique.map((t) => ({
+        ...t,
+        _id: t.templateId ?? t._id,
+      }));
+      // Populate in-memory cache so fallback works during Atlas offline periods
+      galleryCache = { data, expiresAt: Date.now() + GALLERY_CACHE_TTL_MS };
+      saveGalleryCacheToFile(galleryCache);
+      console.log('[templates] Gallery served from TemplateGalleryMeta', { count: data.length });
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ success: true, data, meta: { total: data.length } });
+      return;
+    }
+
     // Fetch templates by projectId or productId
     let filter: Record<string, any> = {};
     if (requestedProductId) {
@@ -205,10 +364,7 @@ router.get('/', async (req: Request, res: Response) => {
       filter = { $or: projectConditions };
     } else {
       // Gallery mode (no productId / projectId): only return public global templates.
-      // The { isGlobal: 1, updatedAt: -1 } compound index makes this fast and avoids
-      // the 32 MB in-memory sort limit on Atlas free tier.
-      // Root templates (no projectId) are automatically promoted to isGlobal=true at
-      // server startup (see server.ts ensureRootTemplatesAreGlobal()).
+      // Results are served from the in-memory cache above after the first DB hit.
       filter = { isGlobal: true };
     }
 
@@ -216,6 +372,13 @@ router.get('/', async (req: Request, res: Response) => {
     // lean() for 3-5x faster query execution. Full designData is fetched on-demand via GET /:id.
     // Project/product mode: return full documents (including designData) so the frontend can render
     // previews immediately, but still use lean() for lower memory overhead.
+    // Atlas M0 free tier has a 32 MB in-memory sort limit. Any query whose filter is not
+    // covered by a compound index triggers an in-memory sort on the full documents (including
+    // the large designData blobs) and OOMs.
+    //   • Gallery uses filter={isGlobal:true} + sort={updatedAt:-1}: fully covered by the
+    //     {isGlobal:1,updatedAt:-1} compound index — no in-memory sort, no OOM.
+    //   • Project/product uses $or (no single compound index covers all branches) — skip sort
+    //     to avoid OOM; the order doesn't matter for project template lists.
     const rawTemplates = isGalleryMode
       ? await ProductTemplate
           .find(filter)
@@ -224,7 +387,6 @@ router.get('/', async (req: Request, res: Response) => {
           .lean<Array<Record<string, any>>>()
       : await ProductTemplate
           .find(filter)
-          .sort({ updatedAt: -1 })
           .lean<Array<Record<string, any>>>();
 
     // Normalize preview fields — Mongoose toJSON transform doesn't run on lean() results.
@@ -242,6 +404,11 @@ router.get('/', async (req: Request, res: Response) => {
           return true;
         })
       : normalizedTemplates;
+
+    // Populate the gallery cache for subsequent fast-path responses.
+    if (isGalleryMode) {
+      galleryCache = { data: templates, expiresAt: Date.now() + GALLERY_CACHE_TTL_MS };
+    }
 
     console.log('[templates] Templates found', {
       count: templates.length,
@@ -482,6 +649,9 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       isGlobal: savedTemplate.isGlobal === true,
     });
 
+    // Non-blocking: sync lightweight gallery metadata (no designData)
+    setImmediate(() => syncGalleryMeta(savedTemplate.toObject()));
+
     res.status(201).json({ success: true, data: savedTemplate });
   } catch (error) {
     const err = error as Error;
@@ -539,6 +709,9 @@ router.put('/:id', async (req: Request, res: Response) => {
       productId: template?.productId?.toString(),
       isGlobal: template?.isGlobal === true,
     });
+
+    // Non-blocking: sync lightweight gallery metadata (no designData)
+    if (template) setImmediate(() => syncGalleryMeta(template.toObject()));
 
     res.json({ success: true, data: template });
   } catch (error) {

@@ -71,7 +71,10 @@ ProductTemplateSchema.index(
   { unique: true, partialFilterExpression: { productId: { $type: 'objectId' } } }
 );
 
-// Compound indexes for fast gallery and project-specific queries
+// Compound indexes allow MongoDB to use an index-covered sort, which avoids the 32 MB
+// in-memory sort limit on Atlas M0 free tier. The leading key (isGlobal / projectId)
+// covers the filter; the trailing updatedAt covers the sort so no documents need to be
+// loaded into memory just to sort them.
 ProductTemplateSchema.index({ isGlobal: 1, updatedAt: -1 });
 ProductTemplateSchema.index({ projectId: 1, isGlobal: 1, updatedAt: -1 });
 ProductTemplateSchema.index({ projectId: 1, updatedAt: -1 });

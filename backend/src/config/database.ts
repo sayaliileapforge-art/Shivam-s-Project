@@ -33,7 +33,12 @@ export async function connectDB() {
     const mongoUri = normalizeMongoUri(process.env.MONGODB_URI || process.env.MONGO_URI);
     const dbName = mongoUri.includes('/') ? mongoUri.split('/').pop()?.split('?')[0] : 'unknown';
 
-    await mongoose.connect(mongoUri);
+    await mongoose.connect(mongoUri, {
+      // autoIndex:false prevents Mongoose from creating indexes in the background after
+      // connect(). We create them explicitly in server.ts (before app.listen) so the
+      // server never accepts traffic while an index build might be blocking queries.
+      autoIndex: false,
+    });
     console.log('✓ MongoDB connected successfully', {
       database: dbName,
       host: mongoUri.includes('@') ? mongoUri.split('@')[1].split('/')[0] : 'unknown',

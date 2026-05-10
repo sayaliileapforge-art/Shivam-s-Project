@@ -428,8 +428,8 @@ export function TemplateGallery() {
     setError("");
     getTemplates()
       .then((data) => {
-        // Deduplicate: skip any template whose name (case-insensitive) or _id was already seen.
-        // Also exclude "(Copy)" templates — those are project-local clones, not gallery items.
+        // Deduplicate by _id and name — the backend already deduplicates by name,
+        // but an extra client-side guard protects against duplicate API calls.
         const seenIds   = new Set<string>();
         const seenNames = new Set<string>();
         const unique = data.filter((t) => {
@@ -438,8 +438,6 @@ export function TemplateGallery() {
           const nameKey = t.templateName.trim().toLowerCase();
           if (seenNames.has(nameKey)) return false;
           seenNames.add(nameKey);
-          // Hide project-local copy templates from the global gallery
-          if (/\(copy\)/i.test(t.templateName)) return false;
           return true;
         });
         setTemplates(unique);
@@ -450,12 +448,12 @@ export function TemplateGallery() {
         // On timeout, auto-retry once after 10 s with a friendly message instead of
         // showing a hard error and making the user click Retry manually.
         if (msg.includes('timed out')) {
-          setError("Server is starting up… retrying automatically in 10 s.");
+          setError("Server is waking up… retrying in 3 s.");
           retryTimerRef.current = window.setTimeout(() => {
             retryTimerRef.current = null;
             lastFetchTimeRef.current = 0;
             fetchTemplates(true);
-          }, 10_000);
+          }, 3_000);
         } else {
           setError(msg);
         }
