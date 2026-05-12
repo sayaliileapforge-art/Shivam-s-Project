@@ -1,0 +1,54 @@
+name: Deploy to Hostinger VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: SSH deploy → 72.62.241.170
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 72.62.241.170
+          username: root
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: 22
+          script: |
+            set -e
+            echo "=== Pulling latest code ==="
+            cd /var/www/saasapp
+            git pull origin main
+
+            echo "=== Installing backend dependencies ==="
+            cd /var/www/saasapp/backend
+            npm ci --omit=dev
+
+            echo "=== Building backend (TypeScript) ==="
+            npm run build
+
+            echo "=== Installing frontend dependencies ==="
+            cd /var/www/saasapp
+            npm ci
+
+            echo "=== Building frontend (Vite) ==="
+            npm run build
+
+            echo "=== Ensuring upload directories exist ==="
+            mkdir -p /var/www/uploads/templates
+            mkdir -p /var/www/uploads/assets
+
+            echo "=== Reloading nginx config ==="
+            cp /var/www/saasapp/tmp/saasapp-nginx.conf /etc/nginx/sites-enabled/saasapp.conf
+            nginx -t && systemctl reload nginx
+
+            echo "=== Restarting backend with PM2 ==="
+            pm2 restart saasapp --update-env || pm2 start /var/www/saasapp/backend/dist/server.js --name saasapp --env production
+            pm2 save
+
+            echo "=== Deploy complete ==="
+            pm2 status
