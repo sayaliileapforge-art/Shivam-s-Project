@@ -63,16 +63,43 @@ app.use('/api', apiCorsMiddleware);
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-// Serve uploads from backend/public/uploads/ — consistent with uploads route
+// Serve uploads from backend/public/uploads/ — consistent with uploads route.
+// UPLOADS_DIR env var lets VPS deployments point to a persistent directory that
+// survives redeploys and container restarts (e.g. /var/data/uploads or a mounted volume).
 const uploadsDir = process.env.UPLOADS_DIR?.trim()
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.resolve(backendRootDir, 'public', 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-  console.log(`[server] Uploads directory created: ${uploadsDir}`);
+
+// Auto-create the uploads root and required subdirectories.
+// These directories must exist before multer or fs.promises.writeFile is called.
+const uploadSubdirs = ['templates', 'assets'];
+for (const subdir of [uploadsDir, ...uploadSubdirs.map((s) => path.join(uploadsDir, s))]) {
+  if (!fs.existsSync(subdir)) {
+    fs.mkdirSync(subdir, { recursive: true });
+    console.log(`[server] Uploads directory created: ${subdir}`);
+  }
 }
-app.use('/uploads', express.static(uploadsDir));
-app.use('/images', express.static(uploadsDir));
+console.log(`[server] Uploads root: ${uploadsDir}`);
+
+// CORS middleware for static asset routes.
+// Required so Fabric.js (canvas) can load images from /uploads and /images
+// without tainting the canvas (which would break toPNG() preview generation).
+function staticCors(_req: express.Request, res: express.Response, next: express.NextFunction) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+}
+
+app.use('/uploads', staticCors, express.static(uploadsDir));
+app.use('/images', staticCors, express.static(uploadsDir));
+
+// Also serve backend/uploads/ (legacy path used by the products route via process.cwd()/uploads).
+// This ensures product thumbnails saved there are still accessible at /uploads/products/...
+const legacyUploadsDir = path.resolve(backendRootDir, 'uploads');
+if (fs.existsSync(legacyUploadsDir)) {
+  app.use('/uploads', staticCors, express.static(legacyUploadsDir));
+}
 
 const isRenderEnvironment = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID);
 const studentPhotosDir = process.env.STUDENT_PHOTOS_DIR?.trim()

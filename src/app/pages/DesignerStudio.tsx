@@ -54,7 +54,7 @@ import {
   loadProjects, type Project, type ProjectTemplate,
 } from "../../lib/projectStore";
 import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
-import { createTemplate, updateTemplate, getTemplateById, readTemplateFromLocalCache, mapTemplateRecordToProjectTemplate } from "../../lib/templateApi";
+import { createTemplate, updateTemplate, uploadTemplatePreview, getTemplateById, readTemplateFromLocalCache, mapTemplateRecordToProjectTemplate } from "../../lib/templateApi";
 import { normalizeShapePreviewSvg, type ShapeItem } from "../../lib/shapesGallery";
 
 // --- Types --------------------------------------------------------------------
@@ -440,6 +440,9 @@ export function DesignerStudio() {
   const [pageLoadNonce, setPageLoadNonce] = useState(0);
   const activeCanvasHashRef = useRef("");
   const lastPersistedHashRef = useRef("");
+  // Tracks which templateId has already had its post-load preview auto-uploaded
+  // so we don't re-upload on every re-render.
+  const postLoadPreviewUploadedRef = useRef("");
   // Stable ref to the latest autoSaveTemplateNow — lets keyboard/button handlers
   // call an immediate save without being stale closures in their own effects.
   const autoSaveNowRef = useRef<(reason?: "debounce" | "unmount") => boolean>(
@@ -519,6 +522,11 @@ export function DesignerStudio() {
         },
         isGlobal: saveIsPublic,
         isPublic: saveIsPublic,
+      }).then((saved) => {
+        // Persist preview as a real file on VPS storage (non-blocking, fire-and-forget)
+        if (thumb && thumb.startsWith('data:') && saved?._id) {
+          void uploadTemplatePreview(saved._id, thumb);
+        }
       }).catch((error) => {
         console.warn("[designer] Failed to persist template to MongoDB", error);
       });
@@ -690,8 +698,11 @@ export function DesignerStudio() {
   }, [designerContext?.projectId]);
 
   // -- Canvas pixel dimensions ------------------------------------------------
-  const canvasPxW  = mmToPx(config.canvas.width);
-  const canvasPxH  = mmToPx(config.canvas.height);
+  // Guard against 0 / NaN dimensions (template data loading in-flight) so that
+  // MAX_W / 0 = Infinity and Math.round(0 * Infinity) = NaN never reach the SVG
+  // ruler attributes and trigger React's NaN-attribute warning.
+  const canvasPxW  = mmToPx(Math.max(1, config.canvas.width  || 0));
+  const canvasPxH  = mmToPx(Math.max(1, config.canvas.height || 0));
   const MAX_W = 1100;
   const MAX_H = 760;
   const fitScale       = Math.min(MAX_W / canvasPxW, MAX_H / canvasPxH);
@@ -1012,13 +1023,17 @@ export function DesignerStudio() {
 
         // Always apply template-level config so width/height/margins from modal
         // are reflected even for newly created templates without canvasJSON.
-        setConfig((prev) => ({
-          ...prev,
-          templateName: tmpl.templateName || prev.templateName,
-          templateType: tmpl.templateType || prev.templateType,
-          canvas: tmpl.canvas || prev.canvas,
-          margin: resolvedMargin,
-        }));
+        setConfig((prev) => {
+          const mergedW = Math.max(1, tmpl.canvas?.width  || 0) || prev.canvas.width;
+          const mergedH = Math.max(1, tmpl.canvas?.height || 0) || prev.canvas.height;
+          return {
+            ...prev,
+            templateName: tmpl.templateName || prev.templateName,
+            templateType: tmpl.templateType || prev.templateType,
+            canvas: { width: mergedW, height: mergedH },
+            margin: resolvedMargin,
+          };
+        });
 
         if (!tmpl.canvasJSON) {
           setPages([{ id: "page-1", name: "Page 1", canvas: EMPTY_CANVAS_JSON }]);
@@ -1035,12 +1050,17 @@ export function DesignerStudio() {
             const parsed = JSON.parse(tmpl.canvasJSON!);
             if (parsed?.config) {
               const parsedConfig = parsed.config as TemplateConfig;
+              const mergedCanvas = tmpl.canvas || parsedConfig.canvas;
               setConfig({
                 ...parsedConfig,
                 // Template record values from modal form must win.
                 templateName: tmpl.templateName || parsedConfig.templateName,
                 templateType: tmpl.templateType || parsedConfig.templateType,
-                canvas: tmpl.canvas || parsedConfig.canvas,
+                // Guard against 0/NaN from old template records — use DEFAULT as last resort.
+                canvas: {
+                  width:  Math.max(1, mergedCanvas?.width  || 0) || DEFAULT_CONFIG.canvas.width,
+                  height: Math.max(1, mergedCanvas?.height || 0) || DEFAULT_CONFIG.canvas.height,
+                },
                 margin: resolvedMargin,
               });
             }
@@ -1088,6 +1108,54 @@ export function DesignerStudio() {
     }, 80);
     return () => clearTimeout(t);
   }, [activePageId, pageLoadNonce, refresh]);
+
+  // After a template loads from a URL, capture the browser canvas and upload a
+  // fresh preview. The browser supports AVIF/WebP natively so the thumbnail
+  // will show the actual design, unlike the server-side node-canvas script.
+  // A 2.5 s delay lets all async images (AVIF, WebP) finish decoding before
+  // we call toDataURL. Runs once per templateId per session.
+  useEffect(() => {
+    const templateId = designerContext?.templateId;
+    if (!templateId || !isMongoId(templateId)) return;
+    if (postLoadPreviewUploadedRef.current === templateId) return;
+
+    const timer = setTimeout(() => {
+      if (!initialTemplateLoadDoneRef.current) return;
+      if (postLoadPreviewUploadedRef.current === templateId) return;
+
+      const fc = canvasRef.current?.getCanvas();
+      if (!fc) return;
+
+      try {
+        const prevClipPath = (fc as any).clipPath;
+        const prevBg = fc.backgroundColor;
+        if (!prevBg) fc.backgroundColor = "#ffffff";
+        (fc as any).clipPath = undefined;
+        fc.renderAll();
+        const dataUrl = fc.toDataURL({
+          format: "png",
+          multiplier: 1,
+          left: 0,
+          top: 0,
+          width: fc.getWidth(),
+          height: fc.getHeight(),
+          enableRetinaScaling: false,
+        } as any);
+        (fc as any).clipPath = prevClipPath;
+        if (!prevBg) fc.backgroundColor = prevBg;
+        fc.renderAll();
+        if (dataUrl && dataUrl.startsWith('data:image/')) {
+          postLoadPreviewUploadedRef.current = templateId;
+          void uploadTemplatePreview(templateId, dataUrl);
+        }
+      } catch {
+        // Non-fatal: keep whatever preview is already stored.
+      }
+    }, 2500);
+
+    return () => clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [designerContext?.templateId, pageLoadNonce]);
 
   useEffect(() => {
     const fc = canvasRef.current?.getCanvas();
@@ -1243,6 +1311,10 @@ export function DesignerStudio() {
         },
         isGlobal: saveIsPublic,
         isPublic: saveIsPublic,
+      }).then((saved) => {
+        if (thumb && thumb.startsWith('data:') && saved?._id) {
+          void uploadTemplatePreview(saved._id, thumb);
+        }
       }).catch((error) => {
         console.warn("[designer] Failed to persist template to MongoDB", error);
       });
@@ -1374,6 +1446,10 @@ export function DesignerStudio() {
           isGlobal: saveIsPublic,
           isPublic: saveIsPublic,
         });
+        // Persist preview as a real file on VPS (non-blocking)
+        if (thumb && thumb.startsWith('data:') && updated?._id) {
+          void uploadTemplatePreview(updated._id, thumb);
+        }
 
         const mapped = mapTemplateRecordToProjectTemplate(updated);
         setActiveTemplate(mapped);
@@ -1401,6 +1477,10 @@ export function DesignerStudio() {
           isGlobal: saveIsPublic,
           isPublic: saveIsPublic,
         });
+        // Persist preview as a real file on VPS (non-blocking)
+        if (thumb && thumb.startsWith('data:') && created?._id) {
+          void uploadTemplatePreview(created._id, thumb);
+        }
 
         const mapped = mapTemplateRecordToProjectTemplate(created);
         setActiveTemplate(mapped);

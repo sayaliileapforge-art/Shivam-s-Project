@@ -59,7 +59,8 @@ import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { toast } from "sonner";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender, studentHasPhoto, getTemplateCached, resolveStudentPhotoUrl, resolveTemplateConfig, mapData, getRecordField, type DynamicTextObject } from "../components/preview/TemplateRenderer";
-import { createTemplate, deleteTemplate, unlinkTemplateFromProject, mapTemplateRecordToProjectTemplate, migrateProjectTemplatesToDatabase, type TemplateRecord } from "../../lib/templateApi";
+import { createTemplate, deleteTemplate, unlinkTemplateFromProject, mapTemplateRecordToProjectTemplate, migrateProjectTemplatesToDatabase, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
 import { matchImages, type BulkMatchResult } from "../../lib/imageMatchEngine";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
 
@@ -687,6 +688,75 @@ export function ProjectDetail() {
   const [templateFetchVersion, setTemplateFetchVersion] = useState(0);
   const refetchTemplates = useCallback(() => setTemplateFetchVersion((v) => v + 1), []);
 
+  // ── Background preview generation for project templates ───────────────────
+  // Track IDs that are missing a thumbnail or had a broken image URL.
+  const [missingProjectPreviewIds, setMissingProjectPreviewIds] = useState<string[]>([]);
+  const brokenProjectPreviewIdsRef = useRef<Set<string>>(new Set());
+
+  const handleProjectTemplateImgError = useCallback((templateId: string) => {
+    brokenProjectPreviewIdsRef.current.add(templateId);
+    setBrokenTemplatePreviewIds((prev) => prev[templateId] ? prev : { ...prev, [templateId]: true });
+    setMissingProjectPreviewIds((prev) => prev.includes(templateId) ? prev : [...prev, templateId]);
+  }, []);
+
+  /** onLoad handler — detect blank (white/transparent) thumbnail images and re-queue generation. */
+  const handleProjectTemplateImgLoad = useCallback(
+    (e: React.SyntheticEvent<HTMLImageElement>, templateId: string) => {
+      try {
+        const img = e.currentTarget;
+        if (!img.naturalWidth || !img.naturalHeight) return;
+        const size = 20;
+        const cv = document.createElement("canvas");
+        cv.width = size;
+        cv.height = size;
+        const ctx = cv.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0, size, size);
+        const data = ctx.getImageData(0, 0, size, size).data;
+        let nonWhite = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          const a = data[i + 3] ?? 0;
+          if (a < 10) continue;
+          if (data[i]! < 245 || data[i + 1]! < 245 || data[i + 2]! < 245) nonWhite++;
+        }
+        if (nonWhite < 5) {
+          handleProjectTemplateImgError(templateId);
+        }
+      } catch {
+        // Cross-origin canvas taint — ignore, trust the image is valid.
+      }
+    },
+    [handleProjectTemplateImgError],
+  );
+
+  const handleProjectPreviewGenerated = useCallback((templateId: string, url: string) => {
+    if (url) {
+      // Update the in-memory remoteTemplates so the card shows the new thumbnail.
+      setRemoteTemplates((prev) =>
+        prev.map((t) =>
+          t.id === templateId
+            ? { ...t, thumbnail: url }
+            : t,
+        ),
+      );
+      setBrokenTemplatePreviewIds((prev) => {
+        if (!prev[templateId]) return prev;
+        const next = { ...prev };
+        delete next[templateId];
+        return next;
+      });
+    }
+    setMissingProjectPreviewIds((prev) => prev.filter((x) => x !== templateId));
+    brokenProjectPreviewIdsRef.current.delete(templateId);
+  }, []);
+
+  const activeGeneratingProject = useGenerateMissingPreviews(
+    missingProjectPreviewIds,
+    brokenProjectPreviewIdsRef.current,
+    handleProjectPreviewGenerated,
+  );
+  // ─────────────────────────────────────────────────────────────────────────
+
   // Sync activeTab when the URL ?tab= param changes (e.g., after returning from Template Gallery)
   useEffect(() => {
     const tabFromUrl = searchParams.get("tab");
@@ -931,6 +1001,20 @@ export function ProjectDetail() {
     return diagnostics;
   }, [previewTemplates, availableTemplateFieldKeys]);
 
+  // Queue templates that are missing preview thumbnails for background generation.
+  useEffect(() => {
+    const idsNeedingPreview = previewTemplates
+      .filter((t) => !resolveTemplatePreview({ preview_image: t.thumbnail, previewImageUrl: t.thumbnail }))
+      .map((t) => t.id)
+      .filter(Boolean);
+    if (idsNeedingPreview.length === 0) return;
+    setMissingProjectPreviewIds((prev) => {
+      const prevSet = new Set(prev);
+      const added = idsNeedingPreview.filter((id) => !prevSet.has(id));
+      return added.length ? [...prev, ...added] : prev;
+    });
+  }, [previewTemplates]);
+
   const previewTemplateDiagnosticsMap = useMemo(() => {
     const diagnostics: Record<string, TemplatePreviewDiagnostics> = {};
     previewTemplates.forEach((template) => {
@@ -957,15 +1041,12 @@ export function ProjectDetail() {
   const canRenderSelectedTemplateImage = Boolean(
     previewTemplate
     && previewTemplate.thumbnail
-    && selectedPreviewTemplateDiagnostics?.hasDesignElements
     && !brokenTemplatePreviewIds[previewTemplate.id]
   );
 
   const markTemplatePreviewBroken = (templateId: string) => {
-    setBrokenTemplatePreviewIds((prev) => {
-      if (prev[templateId]) return prev;
-      return { ...prev, [templateId]: true };
-    });
+    // Delegate to the full broken-preview handler so regeneration is triggered.
+    handleProjectTemplateImgError(templateId);
   };
 
   useEffect(() => {
@@ -2688,6 +2769,12 @@ export function ProjectDetail() {
                         className="max-w-full max-h-[320px] object-contain rounded shadow-md border border-border"
                         onError={() => markTemplatePreviewBroken(previewTemplate.id)}
                       />
+                    ) : missingProjectPreviewIds.includes(previewTemplate.id) ? (
+                      // Preview is being generated in background — show a loading spinner
+                      <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
+                        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+                        <p className="text-sm text-muted-foreground">Generating preview…</p>
+                      </div>
                     ) : selectedPreviewTemplateDiagnostics?.hasDesignElements && previewTemplate.canvasJSON ? (
                       <TemplatePreviewCanvas
                         canvasJSON={previewTemplate.canvasJSON}
@@ -2705,7 +2792,7 @@ export function ProjectDetail() {
                     )}
                   </div>
 
-                  {!selectedPreviewTemplateDiagnostics?.hasDesignElements && (
+                  {!missingProjectPreviewIds.includes(previewTemplate.id) && !selectedPreviewTemplateDiagnostics?.hasDesignElements && (
                     <p className="text-xs text-destructive bg-destructive/10 rounded px-2.5 py-2">
                       No preview available. Please configure the template.
                     </p>
@@ -2834,6 +2921,8 @@ export function ProjectDetail() {
                   {previewTemplateGroups.projectTemplates.map((tmpl) => {
                     const previewDiagnostics = templateDiagnosticsMap[tmpl.id];
                     const showThumbnail = Boolean(tmpl.thumbnail && !brokenTemplatePreviewIds[tmpl.id]);
+                    // Is the hook currently generating a preview for this template?
+                    const isGeneratingPreview = !showThumbnail && activeGeneratingProject.has(tmpl.id);
                     // Blank card shape SVG so cards always look like cards, not error states
                     const w = tmpl.canvas.width || 54;
                     const h = tmpl.canvas.height || 86;
@@ -2854,9 +2943,17 @@ export function ProjectDetail() {
                             <img
                               src={tmpl.thumbnail}
                               alt={tmpl.templateName}
+                              loading="lazy"
+                              decoding="async"
                               className="max-h-full max-w-full object-contain rounded shadow"
-                              onError={() => markTemplatePreviewBroken(tmpl.id)}
+                              onError={() => handleProjectTemplateImgError(tmpl.id)}
+                              onLoad={(e) => handleProjectTemplateImgLoad(e, tmpl.id)}
                             />
+                          ) : isGeneratingPreview ? (
+                            <div className="flex flex-col items-center gap-1 text-muted-foreground">
+                              <Loader2 className="h-6 w-6 animate-spin" />
+                              <span className="text-[10px]">Generating…</span>
+                            </div>
                           ) : (
                             <img
                               src={blankPlaceholder}

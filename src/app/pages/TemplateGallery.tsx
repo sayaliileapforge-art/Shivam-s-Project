@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { cn } from "../components/ui/utils";
 import { getTemplates, createTemplate, getTemplateById, readTemplateFromLocalCache, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { toast } from "sonner";
@@ -103,19 +104,57 @@ interface TemplateCardProps {
   onDuplicate: (t: TemplateRecord) => void;
   onDelete: (t: TemplateRecord) => void;
   isDuplicating?: boolean;
+  onImgError?: (id: string) => void;
+  isGenerating?: boolean;
 }
 
 function TemplateCard({
   template: t, onUse, onPreview, isFavorite, onToggleFavorite,
-  projectId, isAttaching, onDuplicate, onDelete, isDuplicating,
+  projectId, isAttaching, onDuplicate, onDelete, isDuplicating, onImgError, isGenerating,
 }: TemplateCardProps) {
   const navigate = useNavigate();
   const [imgError, setImgError] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const previewSrc = resolveTemplatePreview(t);
+
+  // Reset error state whenever the resolved preview URL changes (e.g. after
+  // a background preview is generated and the template record is updated).
+  useEffect(() => { setImgError(false); }, [previewSrc]);
   const displayCategory = deriveDisplayCategory(t);
   const size = deriveSize(t);
+
+  // Detect blank/all-white preview images that loaded successfully (200 OK)
+  // but contain no visible content (e.g. canvas rendered without images).
+  // Treat these the same as a load error so they're queued for regeneration.
+  const handleImgLoad = useCallback(
+    (e: React.SyntheticEvent<HTMLImageElement>) => {
+      const img = e.currentTarget;
+      if (!img.naturalWidth || !img.naturalHeight) return;
+      try {
+        const SAMPLE = 20;
+        const c = document.createElement("canvas");
+        c.width = SAMPLE; c.height = SAMPLE;
+        const ctx = c.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0, SAMPLE, SAMPLE);
+        const { data } = ctx.getImageData(0, 0, SAMPLE, SAMPLE);
+        let nonWhite = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          const [r, g, b, a] = [data[i], data[i + 1], data[i + 2], data[i + 3]];
+          if (a > 20 && (r < 235 || g < 235 || b < 235)) nonWhite++;
+        }
+        if (nonWhite < 5) {
+          // Image is essentially blank — treat as broken and regenerate
+          setImgError(true);
+          onImgError?.(t._id);
+        }
+      } catch {
+        // CORS or canvas error — leave as-is
+      }
+    },
+    [onImgError, t._id],
+  );
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -135,9 +174,17 @@ function TemplateCard({
           <img
             src={previewSrc}
             alt={t.templateName}
+            loading="lazy"
+            decoding="async"
             className="h-full w-full object-contain transition-transform duration-200 group-hover:scale-105"
-            onError={() => setImgError(true)}
+            onLoad={handleImgLoad}
+            onError={() => { setImgError(true); onImgError?.(t._id); }}
           />
+        ) : isGenerating ? (
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-gray-400">
+            <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
+            <span className="text-xs">Generating…</span>
+          </div>
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-gray-400">
             <ImageOff className="h-8 w-8" />
@@ -495,6 +542,45 @@ export function TemplateGallery() {
   useEffect(() => { localStorage.setItem("tg_recent", JSON.stringify(recentlyUsed)); }, [recentlyUsed]);
 
   const activeTemplates = useMemo(() => templates.filter((t) => t.isActive !== false), [templates]);
+
+  // ── Background preview generation ──────────────────────────────────────────
+  // Track template IDs whose preview image is missing or failed to load.
+  const [missingPreviewIds, setMissingPreviewIds] = useState<string[]>([]);
+  // Track IDs whose preview URL loaded but the <img> fired onError (broken file).
+  // These must be re-rendered from canvas — using the DB path would just break again.
+  const brokenUrlIdsRef = useRef<Set<string>>(new Set());
+
+  // Collect IDs that need thumbnails after every templates update.
+  useEffect(() => {
+    const ids = activeTemplates
+      .filter((t) => !resolveTemplatePreview(t))
+      .map((t) => t._id);
+    setMissingPreviewIds((prev) => {
+      const prevSet = new Set(prev);
+      const merged = [...prev, ...ids.filter((id) => !prevSet.has(id))];
+      return merged;
+    });
+  }, [activeTemplates]);
+
+  // Called by TemplateCard when the <img> fires onError (broken URL).
+  const handleImgError = useCallback((id: string) => {
+    brokenUrlIdsRef.current.add(id);
+    setMissingPreviewIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+  }, []);
+
+  // Called when a background thumbnail has been generated and uploaded.
+  const handlePreviewGenerated = useCallback((id: string, url: string) => {
+    setTemplates((prev: TemplateRecord[]) =>
+      prev.map((t) =>
+        t._id === id ? { ...t, preview_image: url, previewImageUrl: url } : t,
+      ),
+    );
+    setMissingPreviewIds((prev) => prev.filter((x) => x !== id));
+    brokenUrlIdsRef.current.delete(id);
+  }, []);
+
+  const activeGenerating = useGenerateMissingPreviews(missingPreviewIds, brokenUrlIdsRef.current, handlePreviewGenerated);
+  // ───────────────────────────────────────────────────────────────────────────
 
   const applyFilters = useCallback((list: TemplateRecord[]) => {
     const effSizes    = dropdownSize     !== "all" ? [dropdownSize]     : selectedSizes;
@@ -923,6 +1009,8 @@ export function TemplateGallery() {
                       onDuplicate={handleDuplicate}
                       onDelete={setDeleteTarget}
                       isDuplicating={duplicatingTemplateId === t._id}
+                      onImgError={handleImgError}
+                      isGenerating={activeGenerating.has(t._id)}
                     />
                   </div>
                 ))}
@@ -971,6 +1059,8 @@ export function TemplateGallery() {
                     onDuplicate={handleDuplicate}
                     onDelete={setDeleteTarget}
                     isDuplicating={duplicatingTemplateId === t._id}
+                    onImgError={handleImgError}
+                    isGenerating={activeGenerating.has(t._id)}
                   />
                 ))}
               </div>

@@ -27,12 +27,15 @@ export function generatePreview(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL('image/png');
 }
 
-export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_image' | 'previewImageUrl'> | null | undefined): string {
-  const raw = template?.preview_image || template?.previewImageUrl || '';
-  if (!raw) return '/placeholder.png';
-  if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) {
-    return raw;
+export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_image' | 'previewImageUrl' | 'imageUrl'> | null | undefined): string {
+  const raw = (template?.preview_image || template?.previewImageUrl || template?.imageUrl || '').trim();
+  if (!raw) return '';
+  // Any data: URI that is NOT a valid image data URL (e.g. corrupt/partial 'data:J,1') must be
+  // discarded — resolveProfileImageUrl would otherwise turn it into /uploads/data%3A... (404).
+  if (/^data:/i.test(raw)) {
+    return /^data:image\//i.test(raw) ? raw : '';
   }
+  if (/^(blob:|https?:\/\/)/i.test(raw)) return raw;
   return resolveProfileImageUrl(raw);
 }
 
@@ -55,8 +58,10 @@ export function mapTemplateRecordToProjectTemplate(template: TemplateRecord): Pr
     templateName: template.templateName,
     templateType: (designData.templateType as ProjectTemplate['templateType']) || 'custom',
     canvas: {
-      width: Number(canvas.width || 0) || 0,
-      height: Number(canvas.height || 0) || 0,
+      // Fall back to 54×86 mm (standard ID card) when the template record has no
+      // canvas dimensions — prevents division-by-zero / NaN in the designer ruler.
+      width: Number(canvas.width || 0) || 54,
+      height: Number(canvas.height || 0) || 86,
     },
     margin: {
       top: Number(margin.top || 0) || 0,
@@ -223,7 +228,10 @@ export async function getTemplates(params?: { productId?: string }): Promise<Tem
   }
 }
 
-export async function getTemplateById(templateId: string): Promise<TemplateRecord> {
+export async function getTemplateById(
+  templateId: string,
+  options?: { timeoutMs?: number },
+): Promise<TemplateRecord> {
   // Check localStorage first — avoids cold Atlas M0 reads after the first successful load.
   const cached = readTemplateFromLocalCache(templateId);
   if (cached) {
@@ -232,7 +240,7 @@ export async function getTemplateById(templateId: string): Promise<TemplateRecor
   }
 
   const requestUrl = `${TEMPLATE_API_BASE}/${templateId}`;
-  const { signal, clear } = withTimeout(FETCH_TIMEOUT_MS);
+  const { signal, clear } = withTimeout(options?.timeoutMs ?? FETCH_TIMEOUT_MS);
   try {
     const response = await fetch(requestUrl, { cache: 'no-store', signal });
     console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
@@ -312,6 +320,32 @@ export async function updateTemplate(templateId: string, input: Partial<Template
   // template list always load the latest canvas data, not a 7-day-old snapshot.
   writeTemplateToLocalCache(templateId, updated);
   return updated;
+}
+
+/**
+ * Upload a canvas preview image for a template directly to the backend storage.
+ * Converts the data URL to a PNG file on the VPS, stores the path in MongoDB,
+ * and returns the persisted path (e.g. /uploads/templates/preview-xxx.png).
+ *
+ * Use this after createTemplate / updateTemplate to ensure the preview image is
+ * stored as a real file on disk (not as a large base64 blob in MongoDB).
+ */
+export async function uploadTemplatePreview(templateId: string, previewDataUrl: string): Promise<string> {
+  if (!previewDataUrl || !previewDataUrl.startsWith('data:image/')) return previewDataUrl;
+  try {
+    const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}/upload-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preview_image: previewDataUrl }),
+    });
+    const json = await handleResponse<{ previewPath: string }>(response);
+    console.info('[templateApi] ✓ Preview uploaded:', json.previewPath);
+    return json.previewPath;
+  } catch (err) {
+    // Non-fatal: preview upload failure should not break the save flow.
+    console.warn('[templateApi] uploadTemplatePreview failed (non-fatal):', (err as Error).message);
+    return previewDataUrl;
+  }
 }
 
 export async function deleteTemplate(templateId: string): Promise<void> {

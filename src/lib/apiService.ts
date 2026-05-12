@@ -75,18 +75,25 @@ export function resolveProfileImageUrl(profilePic?: string): string {
   const raw = String(profilePic || '').trim();
   if (!raw) return '';
 
-  if (/^(data:image\/|blob:)/i.test(raw)) {
+  // Reject any data: URI that is not a valid image data URL — these are corrupt/partial
+  // values (e.g. 'data:J,1') that would be URL-encoded and resolved as broken paths.
+  if (/^data:/i.test(raw)) {
+    return /^data:image\//i.test(raw) ? raw : '';
+  }
+
+  if (/^blob:/i.test(raw)) {
     return raw;
   }
 
-  // Absolute URL: if it points to localhost/127.0.0.1 with an /uploads/ path,
-  // the file actually lives on Hostinger — rewrite the origin so it resolves
-  // through the /uploads/ Vite proxy (→ Hostinger) instead of local Express.
-  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/uploads\//i.test(raw)) {
+  // Absolute localhost/127.0.0.1 URL pointing to /uploads/ or /images/:
+  // Strip the local origin so the path becomes relative. In development the Vite
+  // proxy forwards /uploads/* and /images/* to the local Express backend.
+  // In production (same-origin deploy) they hit the backend directly.
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/(uploads|images)\//i.test(raw)) {
     return raw.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i, '/');
   }
 
-  // Other absolute URLs: return as-is (could be Hostinger direct URL, CDN, etc.).
+  // Other absolute URLs: return as-is (Hostinger SFTP absolute URL, CDN, etc.).
   if (/^https?:\/\//i.test(raw)) {
     return raw;
   }
@@ -104,8 +111,15 @@ export function resolveProfileImageUrl(profilePic?: string): string {
   };
   const encodeSegments = (filePath: string) => filePath.split('/').map(encodeSeg).join('/');
 
+  // Relative paths starting with /uploads/ or /images/ — served by backend static middleware.
+  // UPLOADS_ORIGIN is '' by default (same-origin / Vite proxy). Set VITE_UPLOADS_BASE_URL
+  // in frontend .env only for cross-origin deployments where uploads live on a separate host.
   if (normalized.startsWith('/uploads/')) {
     return `${UPLOADS_ORIGIN}/uploads/${encodeSegments(normalized.slice('/uploads/'.length))}`;
+  }
+
+  if (normalized.startsWith('/images/')) {
+    return `${UPLOADS_ORIGIN}/images/${encodeSegments(normalized.slice('/images/'.length))}`;
   }
 
   if (normalized.startsWith('uploads/')) {

@@ -18,22 +18,21 @@ function resolveUploadsDir(): string {
   if (configured) {
     return path.resolve(configured);
   }
-  return path.resolve(__dirname, '..', '..', 'uploads');
+  return path.resolve(__dirname, '..', '..', 'public', 'uploads');
 }
 
-function normalizeImagesRoute(value?: string): string {
-  const raw = (value || '/images').trim();
-  const withSlash = raw.startsWith('/') ? raw : `/${raw}`;
-  return withSlash.replace(/\/+$/, '');
-}
-
-const uploadsDir = resolveUploadsDir();
-const imagesRoute = normalizeImagesRoute(process.env.IMAGES_ROUTE);
+// Template preview images go into a dedicated subdirectory so they're easy to
+// identify and back up independently of general asset uploads.
+const uploadsBase = resolveUploadsDir();
+const templatesUploadsDir = path.join(uploadsBase, 'templates');
 const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 5) || 5;
 const maxUploadBytes = maxUploadMb * 1024 * 1024;
 
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+for (const dir of [uploadsBase, templatesUploadsDir]) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    console.log(`[templates] Directory created: ${dir}`);
+  }
 }
 
 const allowedMimeTypes = new Set(['image/jpeg', 'image/png']);
@@ -44,7 +43,7 @@ const mimeToExt: Record<string, string> = {
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
-    cb(null, uploadsDir);
+    cb(null, templatesUploadsDir);
   },
   filename: (_req, file, cb) => {
     const ext = mimeToExt[file.mimetype]
@@ -68,10 +67,55 @@ const upload = multer({
   },
 });
 
-function buildPublicImageUrl(req: Request, filename: string): string {
-  const baseUrl = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`)
-    .replace(/\/+$/, '');
-  return `${baseUrl}${imagesRoute}/${filename}`;
+/**
+ * Build the public URL path for a template image.
+ * Returns a RELATIVE path (/uploads/templates/filename) so the stored value
+ * is host-independent and resolves correctly in dev (Vite proxy) and production
+ * (same-origin Express static / Nginx). When PUBLIC_BASE_URL is set in .env
+ * an absolute URL is returned instead — useful for multi-origin deployments.
+ */
+function buildPublicImageUrl(_req: Request, filename: string): string {
+  const relativePath = `/uploads/templates/${filename}`;
+  const base = process.env.PUBLIC_BASE_URL?.trim().replace(/\/+$/, '');
+  if (base) {
+    return `${base}${relativePath}`;
+  }
+  return relativePath;
+}
+
+/**
+ * If `previewValue` is a base64 data URL, save it as a PNG file inside
+ * backend/public/uploads/templates/ (or UPLOADS_DIR/templates/ on VPS) and
+ * return the relative path `/uploads/templates/<filename>.png`.
+ *
+ * On VPS set UPLOADS_DIR to a directory OUTSIDE the app folder so the file
+ * survives git pull / redeploy / container restart:
+ *   UPLOADS_DIR=/var/data/saas_uploads
+ *
+ * Files that are already a path or empty are returned unchanged.
+ * Errors are caught and logged — on failure the original value is kept so the
+ * save does not fail just because preview persistence failed.
+ */
+async function persistPreviewImage(previewValue: string, filenameHint = 'preview'): Promise<string> {
+  if (!previewValue || !previewValue.startsWith('data:image/')) {
+    return previewValue; // already a path, absolute URL, or empty — pass through
+  }
+  try {
+    const match = /^data:(image\/[a-z+]+);base64,(.+)$/is.exec(previewValue);
+    if (!match) return previewValue;
+    const ext = match[1].toLowerCase() === 'image/jpeg' ? '.jpg' : '.png';
+    const buffer = Buffer.from(match[2], 'base64');
+    const safe = filenameHint.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60);
+    const filename = `preview-${safe}${ext}`;
+    const filePath = path.join(templatesUploadsDir, filename);
+    await fs.promises.writeFile(filePath, buffer);
+    const relativePath = `/uploads/templates/${filename}`;
+    console.log(`[templates] ✓ Preview image saved to disk: ${filename}  (${Math.round(buffer.length / 1024)} KB)  →  ${relativePath}`);
+    return relativePath;
+  } catch (err) {
+    console.warn('[templates] ! persistPreviewImage failed (non-fatal):', (err as Error).message);
+    return previewValue; // fall back to the data URL so the save itself doesn't fail
+  }
 }
 
 function handleUploadError(error: unknown, res: Response): void {
@@ -257,6 +301,7 @@ function parseJsonField<T>(value: unknown, fallback: T): T {
 router.post('/upload-image', (req: Request, res: Response) => {
   upload.single('image')(req, res, (error) => {
     if (error) {
+      console.error('[templates] upload-image failed:', (error as Error).message);
       handleUploadError(error, res);
       return;
     }
@@ -268,6 +313,7 @@ router.post('/upload-image', (req: Request, res: Response) => {
     }
 
     const url = buildPublicImageUrl(req, file.filename);
+    console.log(`[templates] ✓ upload-image saved: ${file.path}  →  ${url}`);
     res.status(201).json({
       success: true,
       data: {
@@ -533,7 +579,10 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
 
     const file = (req as Request & { file?: Express.Multer.File }).file;
     const uploadedImageUrl = file ? buildPublicImageUrl(req, file.filename) : '';
-    const normalizedPreview = uploadedImageUrl || resolvePreviewImage({ preview_image, previewImageUrl, imageUrl });
+    const rawPreview = uploadedImageUrl || resolvePreviewImage({ preview_image, previewImageUrl, imageUrl });
+    // If preview is a base64 data URL, persist it as an actual file on disk so
+    // MongoDB stores a small path instead of megabytes of image data.
+    const normalizedPreview = await persistPreviewImage(rawPreview, String(title || templateName || 'preview').trim());
     const resolvedTemplateName = String(title || templateName || '').trim();
 
     if (!productId || !resolvedTemplateName) {
@@ -609,6 +658,10 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       isActualProduct,
       isActualProject,
       templateName: template.templateName,
+      hasPreview: Boolean(normalizedPreview),
+      previewType: normalizedPreview
+        ? (normalizedPreview.startsWith('data:') ? 'dataURL' : 'path')
+        : 'none',
       collection: 'producttemplates',
       database: mongoose.connection.name,
     });
@@ -691,10 +744,12 @@ router.put('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const normalizedPreview = resolvePreviewImage(req.body as Record<string, any>)
+    const rawPreview = resolvePreviewImage(req.body as Record<string, any>)
       || existingTemplate.preview_image
       || existingTemplate.previewImageUrl
       || '';
+    // Persist data URL previews as files; paths and empty strings pass through.
+    const normalizedPreview = await persistPreviewImage(rawPreview, existingTemplate.templateName || id);
 
     const updatePayload: Record<string, any> = {
       ...req.body,
@@ -705,6 +760,10 @@ router.put('/:id', async (req: Request, res: Response) => {
     console.log('[templates] Updating template', {
       _id: id,
       database: mongoose.connection.name,
+      hasPreview: Boolean(normalizedPreview),
+      previewType: normalizedPreview
+        ? (normalizedPreview.startsWith('data:') ? 'dataURL' : 'path')
+        : 'none',
       updateFields: Object.keys(updatePayload),
     });
 
@@ -993,6 +1052,165 @@ router.post('/migration/sync-project-templates', async (req: Request, res: Respo
       stack: err.stack,
     });
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── Dedicated preview upload endpoint ───────────────────────────────────────
+// POST /api/templates/:id/upload-preview
+//
+// Accepts either a multipart image file (field: "preview") or a JSON body with
+// { preview_image: "<base64 data URL>" } and saves the image to disk.
+// Returns the relative path that is stored in MongoDB.
+//
+// Used by the Designer Studio "Save" flow to decouple canvas capture from the
+// full template save request (large canvases can exceed JSON body size limits).
+const previewUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(jpeg|png|webp)$/i.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only JPEG, PNG, or WEBP images allowed'));
+  },
+});
+
+router.post('/:id/upload-preview', (req: Request, res: Response) => {
+  previewUpload.single('preview')(req, res, async (err) => {
+    if (err) {
+      res.status(400).json({ success: false, error: (err as Error).message });
+      return;
+    }
+    try {
+      const { id } = req.params;
+      if (!isValidObjectId(id)) {
+        res.status(400).json({ success: false, error: 'Invalid template id' });
+        return;
+      }
+
+      const template = await ProductTemplate.findById(id);
+      if (!template) {
+        res.status(404).json({ success: false, error: 'Template not found' });
+        return;
+      }
+
+      let previewPath: string;
+
+      const file = (req as Request & { file?: Express.Multer.File }).file;
+      if (file) {
+        // Multipart file upload — use stable templateId-based filename so re-uploads overwrite
+        const ext = /jpeg/.test(file.mimetype) ? '.jpg' : '.png';
+        const filename = `preview-${id}${ext}`;
+        const filePath = path.join(templatesUploadsDir, filename);
+        await fs.promises.writeFile(filePath, file.buffer);
+        previewPath = `/uploads/templates/${filename}`;
+        console.log(`[templates] ✓ upload-preview (file): ${filename}  (${Math.round(file.size / 1024)} KB)`);
+      } else if (typeof (req.body as Record<string, any>).preview_image === 'string') {
+        // JSON body with base64 data URL — use stable templateId-based filename
+        previewPath = await persistPreviewImage(
+          (req.body as Record<string, any>).preview_image as string,
+          id
+        );
+      } else {
+        res.status(400).json({ success: false, error: 'Provide a "preview" file or "preview_image" data URL' });
+        return;
+      }
+
+      // Update MongoDB with the new path
+      await ProductTemplate.findByIdAndUpdate(id, {
+        preview_image: previewPath,
+        previewImageUrl: previewPath,
+      });
+      // Also update TemplateGalleryMeta mirror (upsert so the record is created
+      // even if syncGalleryMeta hasn't run yet for this template).
+      await TemplateGalleryMeta.findOneAndUpdate(
+        { templateId: id },
+        { preview_image: previewPath, previewImageUrl: previewPath },
+        { upsert: true },
+      );
+
+      // Invalidate in-memory gallery cache so the next GET /api/templates
+      // rebuilds from MongoDB with the new preview URL.
+      // Also update the file-based cache entry for this template so that
+      // the new preview survives a backend restart / Render spin-down without
+      // requiring a full gallery reload from Atlas.
+      galleryCache = null;
+      try {
+        if (fs.existsSync(GALLERY_CACHE_FILE)) {
+          const raw = fs.readFileSync(GALLERY_CACHE_FILE, 'utf-8');
+          const parsed = JSON.parse(raw) as GalleryCache;
+          if (parsed && Array.isArray(parsed.data)) {
+            parsed.data = parsed.data.map((entry: Record<string, any>) => {
+              const entryId = String(entry.templateId ?? entry._id ?? '');
+              if (entryId === id) {
+                return { ...entry, preview_image: previewPath, previewImageUrl: previewPath };
+              }
+              return entry;
+            });
+            saveGalleryCacheToFile(parsed);
+          }
+        }
+      } catch {
+        // Non-fatal — file cache patch failed, next gallery request will rebuild it.
+      }
+
+      console.log(`[templates] ✓ preview path persisted for ${id}: ${previewPath}`);
+      res.json({ success: true, data: { previewPath } });
+    } catch (routeErr) {
+      console.error('[templates] upload-preview error:', (routeErr as Error).message);
+      res.status(500).json({ success: false, error: (routeErr as Error).message });
+    }
+  });
+});
+
+// ─── Backfill endpoint ────────────────────────────────────────────────────────
+// POST /api/templates/backfill-previews
+//
+// Scans ALL templates that have a base64 data URL stored in preview_image /
+// previewImageUrl, saves each one as a file, and updates the DB record.
+// Safe to run multiple times (already-migrated paths are skipped).
+// ⚠️  Can be slow if many templates have large data URLs — run once after deploy.
+router.post('/backfill-previews', async (_req: Request, res: Response) => {
+  try {
+    // Use a cursor with projection to avoid loading all large fields at once.
+    // Process one document at a time so Atlas M0 doesn't time out on a full scan.
+    const cursor = ProductTemplate.find({})
+      .select('_id templateName preview_image previewImageUrl')
+      .lean<Record<string, any>>()
+      .cursor({ batchSize: 1 });
+
+    const results: Array<{ id: string; name: string; path: string | null; error?: string }> = [];
+
+    let scanned = 0;
+    for await (const t of cursor) {
+      scanned++;
+      const raw: string = t.preview_image || t.previewImageUrl || '';
+      if (!raw.startsWith('data:image/')) continue; // skip non-data-URL records
+
+      try {
+        const previewPath = await persistPreviewImage(raw, String(t.templateName || t._id));
+        await ProductTemplate.findByIdAndUpdate(t._id, {
+          preview_image: previewPath,
+          previewImageUrl: previewPath,
+        });
+        await TemplateGalleryMeta.findOneAndUpdate(
+          { templateId: t._id },
+          { preview_image: previewPath, previewImageUrl: previewPath },
+        );
+        results.push({ id: String(t._id), name: String(t.templateName), path: previewPath });
+        console.log(`[templates] ✓ backfill: ${t.templateName}  →  ${previewPath}`);
+      } catch (bErr) {
+        results.push({ id: String(t._id), name: String(t.templateName), path: null, error: (bErr as Error).message });
+        console.warn(`[templates] ! backfill failed for ${t.templateName}:`, (bErr as Error).message);
+      }
+    }
+
+    console.log(`[templates] backfill-previews done: scanned ${scanned}, migrated ${results.length}`);
+    res.json({
+      success: true,
+      data: { processed: results.length, results },
+    });
+  } catch (err) {
+    console.error('[templates] backfill-previews error:', (err as Error).message);
+    res.status(500).json({ success: false, error: (err as Error).message });
   }
 });
 

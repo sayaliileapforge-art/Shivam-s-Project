@@ -6,7 +6,9 @@ import Product from '../models/Product';
 
 const router = Router();
 
-const uploadsRoot = path.resolve(process.cwd(), 'uploads');
+const uploadsRoot = process.env.UPLOADS_DIR?.trim()
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.resolve(__dirname, '..', '..', 'public', 'uploads');
 const imageUploadDir = path.join(uploadsRoot, 'products', 'images');
 const videoUploadDir = path.join(uploadsRoot, 'products', 'videos');
 

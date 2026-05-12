@@ -27,23 +27,19 @@ if (sftpEnabled) {
 
 // ─── Local disk fallback ──────────────────────────────────────────────────────
 const backendRootDir  = path.resolve(__dirname, '../..');
-// Store uploads under backend/public/uploads/ — Express serves this at /uploads
-const localUploadsDir = process.env.UPLOADS_DIR?.trim()
+// Store uploads under backend/public/uploads/ — Express serves this at /uploads.
+// On VPS set UPLOADS_DIR to a directory OUTSIDE the app folder so files survive
+// redeploys and container/server restarts (e.g. /var/data/uploads).
+const localUploadsBase = process.env.UPLOADS_DIR?.trim()
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.resolve(backendRootDir, 'public', 'uploads');
 
+// General asset uploads go into /uploads/assets/ subdirectory.
+const localUploadsDir = path.join(localUploadsBase, 'assets');
 if (!fs.existsSync(localUploadsDir)) fs.mkdirSync(localUploadsDir, { recursive: true });
 
-// Absolute base URL used when building local-disk image URLs.
-// Set BACKEND_URL in .env (e.g. http://localhost:5000) so stored URLs are
-// always resolvable without relying on the Vite dev-proxy.
-const backendLocalUrl = (
-  process.env.BACKEND_URL?.trim()
-  ?? `http://localhost:${process.env.PORT ?? '5000'}`
-).replace(/\/$/, '');
-
 if (!sftpEnabled) {
-  console.log(`[upload-images] Local disk mode  dir: ${localUploadsDir}  url-base: ${backendLocalUrl}/uploads/`);
+  console.log(`[upload-images] Local disk mode  dir: ${localUploadsDir}  url: /uploads/assets/`);
 }
 
 // ─── Multer ───────────────────────────────────────────────────────────────────
@@ -87,9 +83,13 @@ async function saveToLocal(file: Express.Multer.File): Promise<string> {
   const filename = cleanFileName(file.originalname);
   const filePath = path.join(localUploadsDir, filename);
   await fs.promises.writeFile(filePath, file.buffer);
-  const url = `${backendLocalUrl}/uploads/${filename}`;
-  console.log(`[upload-images] File saved: ${filePath}  →  ${url}`);
-  return url; // absolute URL — works without Vite proxy
+  // Store a relative path — no host prefix.
+  // The Vite dev proxy forwards /uploads/* to the local Express server.
+  // In production (same-origin VPS deploy) /uploads/* is served directly by Express.
+  // For cross-origin production setups set VITE_UPLOADS_BASE_URL on the frontend.
+  const relativePath = `/uploads/assets/${filename}`;
+  console.log(`[upload-images] ✓ File saved: ${filePath}  →  ${relativePath}`);
+  return relativePath;
 }
 
 /**

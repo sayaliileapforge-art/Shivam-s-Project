@@ -21,9 +21,12 @@ export default defineConfig({
   assetsInclude: ['**/*.svg', '**/*.csv'],
 
   // API Proxy for development
-  // /api             → local backend (project data, auth, etc.)
-  // /uploads         → Hostinger file server (SFTP-uploaded student photos)
-  // /backend-uploads → local backend (fallback when SFTP disabled, stored at http://localhost:5000/uploads/)
+  // /api             → local backend (project data, auth, templates, etc.)
+  // /uploads         → local backend (template previews & assets stored on disk locally)
+  // /images          → Hostinger (legacy template thumbnails were saved under /images/ on VPS)
+  //                    New previews use /uploads/templates/ instead; old ones still live on Hostinger.
+  // /backend-uploads → local backend (alias kept for backward compat)
+  // /student-photos  → local backend (student photo directory served by Express)
   server: {
     proxy: {
       '/api': {
@@ -31,17 +34,21 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path,
       },
+      '/uploads': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
+      '/images': {
+        target: 'http://72.62.241.170',
+        changeOrigin: true,
+      },
       '/backend-uploads': {
         target: 'http://localhost:5000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/backend-uploads/, '/uploads'),
       },
-      '/uploads': {
-        target: 'http://72.62.241.170',
-        changeOrigin: true,
-      },
       '/student-photos': {
-        target: 'http://72.62.241.170',
+        target: 'http://localhost:5000',
         changeOrigin: true,
       },
     },
