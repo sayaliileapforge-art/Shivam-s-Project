@@ -24,6 +24,22 @@ jobs:
             cd /var/www/saasapp
             git pull origin main
 
+            echo "=== Aligning UPLOADS_DIR to git-checkout path ==="
+            # Ensure backend .env always points to the directory inside the repo.
+            # This means Express writes new previews to the same place git puts
+            # committed ones, and nginx serves them from the same place.
+            if grep -q '^UPLOADS_DIR=' /var/www/saasapp/backend/.env 2>/dev/null; then
+              sed -i 's|^UPLOADS_DIR=.*|UPLOADS_DIR=/var/www/saasapp/backend/public/uploads|' /var/www/saasapp/backend/.env
+            else
+              echo 'UPLOADS_DIR=/var/www/saasapp/backend/public/uploads' >> /var/www/saasapp/backend/.env
+            fi
+            # Keep SFTP_REMOTE_DIR in sync so SFTP uploads also land here
+            if grep -q '^SFTP_REMOTE_DIR=' /var/www/saasapp/backend/.env 2>/dev/null; then
+              sed -i 's|^SFTP_REMOTE_DIR=.*|SFTP_REMOTE_DIR=/var/www/saasapp/backend/public/uploads|' /var/www/saasapp/backend/.env
+            else
+              echo 'SFTP_REMOTE_DIR=/var/www/saasapp/backend/public/uploads' >> /var/www/saasapp/backend/.env
+            fi
+
             echo "=== Installing backend dependencies ==="
             cd /var/www/saasapp/backend
             npm ci --omit=dev
@@ -39,8 +55,8 @@ jobs:
             npm run build
 
             echo "=== Ensuring upload directories exist ==="
-            mkdir -p /var/www/uploads/templates
-            mkdir -p /var/www/uploads/assets
+            mkdir -p /var/www/saasapp/backend/public/uploads/templates
+            mkdir -p /var/www/saasapp/backend/public/uploads/assets
 
             echo "=== Reloading nginx config ==="
             cp /var/www/saasapp/tmp/saasapp-nginx.conf /etc/nginx/sites-enabled/saasapp.conf

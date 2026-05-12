@@ -18,10 +18,15 @@ echo "[4/6] Installing & building frontend..."
 cd .. && npm ci && npm run build
 
 echo "[5/6] Ensuring upload directories..."
-mkdir -p /var/www/uploads/templates /var/www/uploads/assets /var/www/saasapp/backend/public/uploads/templates
+mkdir -p /var/www/saasapp/backend/public/uploads/templates
+mkdir -p /var/www/saasapp/backend/public/uploads/assets
 
-# Copy preview PNGs from repo to the uploads directory nginx currently serves
-cp -n /var/www/saasapp/backend/public/uploads/templates/*.png /var/www/uploads/templates/ 2>/dev/null || true
+# Align UPLOADS_DIR in .env to the git-checkout path
+if grep -q '^UPLOADS_DIR=' /var/www/saasapp/backend/.env 2>/dev/null; then
+  sed -i 's|^UPLOADS_DIR=.*|UPLOADS_DIR=/var/www/saasapp/backend/public/uploads|' /var/www/saasapp/backend/.env
+else
+  echo 'UPLOADS_DIR=/var/www/saasapp/backend/public/uploads' >> /var/www/saasapp/backend/.env
+fi
 
 echo "[6/6] Restarting backend..."
 pm2 restart saasapp --update-env 2>/dev/null || pm2 start /var/www/saasapp/backend/dist/server.js --name saasapp
