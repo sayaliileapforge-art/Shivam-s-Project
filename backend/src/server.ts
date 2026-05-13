@@ -216,7 +216,14 @@ async function startServer() {
     // read after the server is already accepting traffic (non-blocking startup).
     // The first gallery request may still be slow if it arrives before the warmup finishes,
     // but the amber-banner + auto-retry in the frontend handles that gracefully.
-    setImmediate(() => warmGalleryCache());
+    // Guard: on rare cold-start tsx/esbuild runs the named export may not yet be resolved.
+    setImmediate(() => {
+      if (typeof warmGalleryCache === 'function') {
+        warmGalleryCache().catch(() => {});
+      } else {
+        console.warn('! warmGalleryCache not yet available — gallery cache will be warmed on next request.');
+      }
+    });
 
     // --- MIGRATION: populate TemplateGalleryMeta from existing ProductTemplates ---
     // TemplateGalleryMeta is a lean mirror (no designData) that allows instant gallery reads

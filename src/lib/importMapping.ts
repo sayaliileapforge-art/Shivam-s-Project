@@ -84,67 +84,7 @@ export function normalise(value: string): string {
   return String(value || "").toLowerCase().replace(/[\s_-]/g, "");
 }
 
-// ─── Date normalization ────────────────────────────────────────────────────────
-
-/** System field keys that hold date values — these get extra serial-date normalization. */
-export const DATE_FIELD_KEYS = new Set<string>(["dob", "admDate", "admissionDate", "joiningDate", "createdAt"]);
-
-const EXCEL_EPOCH_MS = new Date(Date.UTC(1899, 11, 30)).getTime();
-
-function formatDDMMYYYY(d: Date): string {
-  const dd   = String(d.getUTCDate()).padStart(2, "0");
-  const mm   = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const yyyy = String(d.getUTCFullYear());
-  return `${dd}-${mm}-${yyyy}`;
-}
-
-/**
- * Convert an Excel serial number to DD-MM-YYYY.
- * Returns null when the number is outside a plausible date range.
- */
-export function excelSerialToDate(serial: number): string | null {
-  const wholeDays = Math.floor(serial);
-  if (wholeDays < 1 || wholeDays > 2958465) return null;
-  const d = new Date(EXCEL_EPOCH_MS + wholeDays * 86400000);
-  if (isNaN(d.getTime())) return null;
-  return formatDDMMYYYY(d);
-}
-
-/** True when a string value looks like a raw Excel date serial (5-7 digit number). */
-function looksLikeExcelSerial(v: string): boolean {
-  if (!/^\d{5,7}(\.\d+)?$/.test(v.trim())) return false;
-  const n = parseFloat(v);
-  return n >= 1000 && n <= 2958465;
-}
-
-/**
- * Normalize a cell value that may be a JS Date, an Excel serial number,
- * or a regular string. Returns a DD-MM-YYYY string for dates, or the
- * original value for non-dates.
- */
-export function normalizeExcelDate(value: unknown): string {
-  if (value == null || value === "") return "";
-  if (value instanceof Date) {
-    if (isNaN((value as Date).getTime())) return "";
-    return formatDDMMYYYY(value as Date);
-  }
-  if (typeof value === "number") {
-    const converted = excelSerialToDate(value);
-    return converted ?? String(value);
-  }
-  const str = String(value).replace(/\s+/g, " ").trim();
-  if (looksLikeExcelSerial(str)) {
-    const converted = excelSerialToDate(parseFloat(str));
-    if (converted) return converted;
-  }
-  return str;
-}
-
 export function sanitizeCell(value: unknown): string {
-  if (value instanceof Date) {
-    if (isNaN((value as Date).getTime())) return "";
-    return formatDDMMYYYY(value as Date);
-  }
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
@@ -327,10 +267,7 @@ export function mapRowToRecord(
   for (const field of fields) {
     const mappedColumn = mapping[field.key];
     if (!isMappedColumn(mappedColumn)) continue;
-    const rawValue = row[mappedColumn];
-    rec[field.key] = DATE_FIELD_KEYS.has(field.key)
-      ? normalizeExcelDate(rawValue)
-      : sanitizeCell(rawValue);
+    rec[field.key] = sanitizeCell(row[mappedColumn]);
   }
 
   const firstName = getRowValueByAliases(row, ["first name", "firstname"]);

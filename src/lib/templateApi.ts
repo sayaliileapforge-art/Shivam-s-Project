@@ -27,59 +27,17 @@ export function generatePreview(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL('image/png');
 }
 
-export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_image' | 'previewImageUrl' | 'imageUrl'> | null | undefined): string {
-  const raw = (template?.preview_image || template?.previewImageUrl || template?.imageUrl || '').trim();
-  if (!raw) return '';
-  // Any data: URI that is NOT a valid image data URL (e.g. corrupt/partial 'data:J,1') must be
-  // discarded — resolveProfileImageUrl would otherwise turn it into /uploads/data%3A... (404).
-  if (/^data:/i.test(raw)) {
-    return /^data:image\//i.test(raw) ? raw : '';
+export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_image' | 'previewImageUrl'> | null | undefined): string {
+  const raw = template?.preview_image || template?.previewImageUrl || '';
+  if (!raw) return '/placeholder.png';
+  if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) {
+    return raw;
   }
-  if (/^(blob:|https?:\/\/)/i.test(raw)) return raw;
   return resolveProfileImageUrl(raw);
-}
-
-export function mapTemplateRecordToProjectTemplate(template: TemplateRecord): ProjectTemplate {
-  const designData = (template.designData || {}) as Record<string, any>;
-  const canvas = (designData.canvas && typeof designData.canvas === 'object') ? designData.canvas : {};
-  const margin = (designData.margin && typeof designData.margin === 'object') ? designData.margin : {};
-  const canvasJSON = typeof designData.canvasJSON === 'string'
-    ? designData.canvasJSON
-    : (typeof designData.canvasJson === 'string' ? designData.canvasJson : '');
-  const rawApplicableFor = designData.applicableFor;
-  const applicableFor = Array.isArray(rawApplicableFor)
-    ? rawApplicableFor.join(', ')
-    : (rawApplicableFor ? String(rawApplicableFor) : '');
-
-  return {
-    id: template._id,
-    remoteId: template._id,
-    projectId: String(template.projectId || template.productId || ''),
-    templateName: template.templateName,
-    templateType: (designData.templateType as ProjectTemplate['templateType']) || 'custom',
-    canvas: {
-      // Fall back to 54×86 mm (standard ID card) when the template record has no
-      // canvas dimensions — prevents division-by-zero / NaN in the designer ruler.
-      width: Number(canvas.width || 0) || 54,
-      height: Number(canvas.height || 0) || 86,
-    },
-    margin: {
-      top: Number(margin.top || 0) || 0,
-      left: Number(margin.left || 0) || 0,
-      right: Number(margin.right || 0) || 0,
-      bottom: Number(margin.bottom || 0) || 0,
-    },
-    applicableFor,
-    createdAt: template.createdAt,
-    canvasJSON: canvasJSON || undefined,
-    thumbnail: template.preview_image || template.previewImageUrl || undefined,
-    isPublic: template.isGlobal === true,
-  };
 }
 
 type TemplateSaveInput = {
   productId: string;
-  projectId?: string;
   templateName: string;
   userId?: string;
   description?: string;
@@ -131,50 +89,6 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return json.data as T;
 }
 
-/** Creates an AbortController that automatically aborts after `ms` milliseconds. */
-function withTimeout(ms: number): { signal: AbortSignal; clear: () => void } {
-  const controller = new AbortController();
-  const id = window.setTimeout(() => controller.abort(), ms);
-  return { signal: controller.signal, clear: () => window.clearTimeout(id) };
-}
-
-// Atlas M0 cold-storage reads can take 60-120 s to complete.
-// Frontend timeout matches the backend limit so we get a proper error, not a silent hang.
-const FETCH_TIMEOUT_MS = 130_000;
-
-// ---------------------------------------------------------------------------
-// localStorage template cache
-// Stores the full template record (including designData / canvasJSON) so that
-// Atlas M0 cold-read delays only block the VERY FIRST open of each template.
-// All subsequent opens are instant, even across page refreshes.
-// ---------------------------------------------------------------------------
-const TEMPLATE_CACHE_PREFIX = 'tmpl_v1_';
-const TEMPLATE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-interface LocalTemplateCache { data: TemplateRecord; cachedAt: number; }
-
-/** Read a full template record from localStorage. Returns null if not cached or expired. */
-export function readTemplateFromLocalCache(id: string): TemplateRecord | null {
-  try {
-    const raw = localStorage.getItem(TEMPLATE_CACHE_PREFIX + id);
-    if (!raw) return null;
-    const parsed: LocalTemplateCache = JSON.parse(raw);
-    if (Date.now() - parsed.cachedAt > TEMPLATE_CACHE_TTL_MS) {
-      localStorage.removeItem(TEMPLATE_CACHE_PREFIX + id);
-      return null;
-    }
-    return parsed.data;
-  } catch { return null; }
-}
-
-/** Write a full template record to localStorage. Silently ignores storage-full errors. */
-export function writeTemplateToLocalCache(id: string, template: TemplateRecord): void {
-  try {
-    const entry: LocalTemplateCache = { data: template, cachedAt: Date.now() };
-    localStorage.setItem(TEMPLATE_CACHE_PREFIX + id, JSON.stringify(entry));
-  } catch { /* quota exceeded — non-fatal */ }
-}
-
 export async function getTemplatesByProductId(productId: string, params?: { category?: string; search?: string }): Promise<TemplateRecord[]> {
   const query = new URLSearchParams();
   if (params?.category) query.set('category', params.category);
@@ -182,106 +96,53 @@ export async function getTemplatesByProductId(productId: string, params?: { cate
   const queryString = query.toString();
 
   const requestUrl = `${TEMPLATE_API_BASE}/product/${productId}${queryString ? `?${queryString}` : ''}`;
-  const { signal, clear } = withTimeout(FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(requestUrl, { cache: 'no-store', signal });
-    const payload = await handleResponse<TemplateRecord[]>(response);
+  const response = await fetch(requestUrl);
+  const payload = await handleResponse<TemplateRecord[]>(response);
 
-    console.info('[templateApi] /api/templates response', {
-      url: requestUrl,
-      status: response.status,
-      count: Array.isArray(payload) ? payload.length : 0,
-    });
+  console.info('[templateApi] /api/templates response', {
+    url: requestUrl,
+    status: response.status,
+    count: Array.isArray(payload) ? payload.length : 0,
+  });
 
-    return payload;
-  } catch (err) {
-    if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error('Template request timed out. Please try again.');
-    }
-    throw err;
-  } finally {
-    clear();
-  }
+  return payload;
 }
 
 export async function getTemplates(params?: { productId?: string }): Promise<TemplateRecord[]> {
   const query = new URLSearchParams();
   if (params?.productId) query.set('productId', params.productId);
   const requestUrl = `${TEMPLATE_API_BASE}${query.toString() ? `?${query}` : ''}`;
-  const { signal, clear } = withTimeout(FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(requestUrl, { cache: 'no-store', signal });
-    const payload = await handleResponse<TemplateRecord[]>(response);
-    console.info('[templateApi] GET templates', {
-      url: requestUrl,
-      status: response.status,
-      count: Array.isArray(payload) ? payload.length : 0,
-    });
-    return payload;
-  } catch (err) {
-    if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error('Template request timed out. Please try again.');
-    }
-    throw err;
-  } finally {
-    clear();
-  }
+  const response = await fetch(requestUrl);
+  const payload = await handleResponse<TemplateRecord[]>(response);
+  console.info('[templateApi] GET templates', {
+    url: requestUrl,
+    status: response.status,
+    count: Array.isArray(payload) ? payload.length : 0,
+  });
+  return payload;
 }
 
-export async function getTemplateById(
-  templateId: string,
-  options?: { timeoutMs?: number },
-): Promise<TemplateRecord> {
-  // Check localStorage first — avoids cold Atlas M0 reads after the first successful load.
-  const cached = readTemplateFromLocalCache(templateId);
-  if (cached) {
-    console.info('[templateApi] GET template by id (localStorage cache hit)', { id: templateId });
-    return cached;
-  }
-
+export async function getTemplateById(templateId: string, options?: { timeoutMs?: number }): Promise<TemplateRecord> {
   const requestUrl = `${TEMPLATE_API_BASE}/${templateId}`;
-  const { signal, clear } = withTimeout(options?.timeoutMs ?? FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(requestUrl, { cache: 'no-store', signal });
-    console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
-    const template = await handleResponse<TemplateRecord>(response);
-    // Cache for future instant loads (across refreshes and sessions).
-    writeTemplateToLocalCache(templateId, template);
-    return template;
-  } catch (err) {
-    if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error('Template request timed out. Please try again.');
-    }
-    throw err;
-  } finally {
-    clear();
-  }
+  const signal = options?.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined;
+  const response = await fetch(requestUrl, { signal });
+  console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
+  return handleResponse<TemplateRecord>(response);
 }
 
-export async function createTemplate(input: TemplateSaveInput): Promise<TemplateRecord & { alreadyExists?: boolean }> {
+export async function createTemplate(input: TemplateSaveInput): Promise<TemplateRecord> {
   const preview = resolvePreviewForSave(input);
   const response = await fetch(TEMPLATE_API_BASE, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       ...input,
-      preview_image: preview || '',
-      previewImageUrl: preview || '',
+      preview_image: preview,
+      previewImageUrl: preview,
     }),
   });
 
-  const raw = await response.text();
-  let json: { success?: boolean; data?: TemplateRecord; error?: string; message?: string; alreadyExists?: boolean } = {};
-  if (raw) {
-    try { json = JSON.parse(raw); } catch { throw new Error(raw || `Request failed with status ${response.status}`); }
-  }
-  if (!response.ok || json.success === false) {
-    throw new Error(json.error || json.message || `Request failed with status ${response.status}`);
-  }
-  const result = { ...(json.data as TemplateRecord), alreadyExists: json.alreadyExists };
-  // Cache the created template so subsequent getTemplateById calls are instant.
-  if (result._id) writeTemplateToLocalCache(result._id, result);
-  return result;
+  return handleResponse<TemplateRecord>(response);
 }
 
 export async function createTemplateWithImage(input: TemplateUploadInput): Promise<TemplateRecord> {
@@ -315,60 +176,7 @@ export async function updateTemplate(templateId: string, input: Partial<Template
     }),
   });
 
-  const updated = await handleResponse<TemplateRecord>(response);
-  // Keep the tmpl_v1_ localStorage cache in sync so the designer and project
-  // template list always load the latest canvas data, not a 7-day-old snapshot.
-  writeTemplateToLocalCache(templateId, updated);
-  return updated;
-}
-
-/**
- * Upload a canvas preview image for a template directly to the backend storage.
- * Converts the data URL to a PNG file on the VPS, stores the path in MongoDB,
- * and returns the persisted path (e.g. /uploads/templates/preview-xxx.png).
- *
- * Use this after createTemplate / updateTemplate to ensure the preview image is
- * stored as a real file on disk (not as a large base64 blob in MongoDB).
- */
-export async function uploadTemplatePreview(templateId: string, previewDataUrl: string): Promise<string> {
-  if (!previewDataUrl || !previewDataUrl.startsWith('data:image/')) return previewDataUrl;
-  try {
-    const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}/upload-preview`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ preview_image: previewDataUrl }),
-    });
-    const json = await handleResponse<{ previewPath: string }>(response);
-    console.info('[templateApi] ✓ Preview uploaded:', json.previewPath);
-    return json.previewPath;
-  } catch (err) {
-    // Non-fatal: preview upload failure should not break the save flow.
-    console.warn('[templateApi] uploadTemplatePreview failed (non-fatal):', (err as Error).message);
-    return previewDataUrl;
-  }
-}
-
-export async function deleteTemplate(templateId: string): Promise<void> {
-  const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}`, {
-    method: 'DELETE',
-  });
-  await handleResponse<unknown>(response);
-  // Evict from localStorage cache so the deleted template is not served from cache.
-  try { localStorage.removeItem(TEMPLATE_CACHE_PREFIX + templateId); } catch { /* non-fatal */ }
-}
-
-/**
- * Removes a template from a project without deleting the template document.
- * The template remains in the Template Gallery if it is globally shared (isGlobal).
- * Only the project-template association is severed.
- */
-export async function unlinkTemplateFromProject(templateId: string, projectId: string): Promise<void> {
-  const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}/unlink`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ projectId }),
-  });
-  await handleResponse<unknown>(response);
+  return handleResponse<TemplateRecord>(response);
 }
 
 export async function saveSelectedTemplate(input: {
@@ -391,7 +199,7 @@ export async function saveSelectedTemplate(input: {
  * This syncs locally-stored templates to the backend for persistence
  */
 export async function migrateProjectTemplatesToDatabase(projectId: string, templates: any[]): Promise<{
-  saved: Array<{ _id: string; templateName: string; sourceId?: string }>;
+  saved: Array<{ _id: string; templateName: string }>;
   errors: Array<{ templateName: string; error: string }>;
 }> {
   console.log('[templateApi:migration] Starting migration', {
@@ -413,13 +221,12 @@ export async function migrateProjectTemplatesToDatabase(projectId: string, templ
         thumbnail: t.thumbnail,
         isPublic: t.isPublic,
         applicableFor: t.applicableFor,
-        canvasJSON: t.canvasJSON,
       })),
     }),
   });
 
   const result = await handleResponse<{
-    saved: Array<{ _id: string; templateName: string; sourceId?: string }>;
+    saved: Array<{ _id: string; templateName: string }>;
     errors: Array<{ templateName: string; error: string }>;
   }>(response);
 
@@ -429,4 +236,59 @@ export async function migrateProjectTemplatesToDatabase(projectId: string, templ
   });
 
   return result;
+}
+
+// ── Local cache helpers ───────────────────────────────────────────────────────
+
+const LOCAL_CACHE_PREFIX = 'template_cache_';
+
+export function readTemplateFromLocalCache(id: string): TemplateRecord | null {
+  try {
+    const raw = localStorage.getItem(LOCAL_CACHE_PREFIX + id);
+    return raw ? (JSON.parse(raw) as TemplateRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeTemplateToLocalCache(id: string, record: TemplateRecord): void {
+  try {
+    localStorage.setItem(LOCAL_CACHE_PREFIX + id, JSON.stringify(record));
+  } catch {
+    // Storage quota exceeded — silently ignore
+  }
+}
+
+export async function uploadTemplatePreview(templateId: string, dataUrl: string): Promise<string> {
+  try {
+    const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preview_image: dataUrl, previewImageUrl: dataUrl }),
+    });
+    if (!response.ok) return dataUrl;
+    const json = await response.json().catch(() => ({}));
+    return (json?.data?.preview_image || json?.data?.previewImageUrl || dataUrl) as string;
+  } catch {
+    return dataUrl;
+  }
+}
+
+export function mapTemplateRecordToProjectTemplate(t: TemplateRecord): Omit<ProjectTemplate, 'createdAt'> {
+  const dd = t.designData as Record<string, any> | undefined;
+  const canvasW = dd?.width ?? dd?.canvas?.width ?? 800;
+  const canvasH = dd?.height ?? dd?.canvas?.height ?? 600;
+  return {
+    id: t._id,
+    remoteId: t._id,
+    projectId: t.projectId ?? '',
+    templateName: t.templateName,
+    templateType: (dd?.templateType ?? 'custom') as ProjectTemplate['templateType'],
+    canvas: { width: Number(canvasW), height: Number(canvasH) },
+    margin: dd?.margin ?? { top: 0, left: 0, right: 0, bottom: 0 },
+    applicableFor: dd?.applicableFor ?? '',
+    canvasJSON: dd?.canvasJSON ?? dd?.canvasJson ?? undefined,
+    thumbnail: t.preview_image || t.previewImageUrl || undefined,
+    isPublic: t.isGlobal ?? false,
+  };
 }

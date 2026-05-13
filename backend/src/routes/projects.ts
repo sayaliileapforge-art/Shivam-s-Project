@@ -18,7 +18,9 @@ router.get('/:id/templates', async (req: Request, res: Response) => {
       { projectId: id },
       { productId: new mongoose.Types.ObjectId(id) },
     ];
-    const templates = await ProductTemplate.find({ $or: conditions }).sort({ updatedAt: -1 });
+    const templates = (await ProductTemplate.find({ $or: conditions })).sort(
+      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+    );
     console.log(`[Projects] GET /${id}/templates — found ${templates.length} templates`);
     res.json({ success: true, data: templates });
   } catch (error) {

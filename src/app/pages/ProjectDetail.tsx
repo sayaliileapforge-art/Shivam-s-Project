@@ -9,7 +9,7 @@ import {
   Package, ListTodo, FolderOpen, Database, Layers, Printer, Pencil, FilePlus, X,
   Filter, MoreHorizontal, UserCircle, FileSpreadsheet, Settings2, Users, GripVertical,
   Crop, Wand2, RotateCcw, ImageIcon, UserPlus, FileDown, Archive, Camera, Loader2,
-  QrCode, UserRound, AlertTriangle, Globe, ChevronDown,
+  QrCode, UserRound, AlertTriangle, Globe, ChevronDown, LayoutGrid,
 } from "lucide-react";
 import JSZip from "jszip";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -37,7 +37,7 @@ import {
   loadProjectProducts, addProjectProduct, deleteProjectProduct,
   loadProjectTasks, addProjectTask, updateProjectTask, deleteProjectTask,
   loadProjectFiles, addProjectFile, deleteProjectFile,
-  loadProjectTemplates, updateProjectTemplate, deleteProjectTemplate, syncProjectTemplatesFromRemote,
+  loadProjectTemplates, loadAllProjectTemplates, addProjectTemplate, deleteProjectTemplate, updateProjectTemplate,
   loadDataFields, saveDataFields, loadDataGroups, addDataGroup, deleteDataGroup, updateDataGroup,
   loadDataRecords, saveDataRecords, deleteDataRecord, updateDataRecord,
   type ProjectProduct, type ProjectTask, type ProjectFile, type ProjectTemplate,
@@ -48,21 +48,13 @@ import {
   updateProject as apiUpdateProject,
   deleteProject as apiDeleteProject,
   resolveProfileImageUrl,
-  uploadImages,
-  uploadZipImages,
-  fetchProjectRecords,
-  saveProjectRecords,
-  updateRecordPhoto,
   API_BASE,
 } from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
-import { toast } from "sonner";
 import { BulkImportWizard } from "../components/BulkImportWizard";
-import { IdCard, IdCardGrid, getTemplateSlugForRender, studentHasPhoto, getTemplateCached, resolveStudentPhotoUrl, resolveTemplateConfig, mapData, getRecordField, type DynamicTextObject } from "../components/preview/TemplateRenderer";
-import { createTemplate, deleteTemplate, unlinkTemplateFromProject, mapTemplateRecordToProjectTemplate, migrateProjectTemplatesToDatabase, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
+import { createTemplate, getTemplateById, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
-import { matchImages, type BulkMatchResult } from "../../lib/imageMatchEngine";
-import { subscribeToTemplateUpdates } from "../../lib/realtime";
 
 // ─── Template dialog types ───────────────────────────────────────────────────
 type PageFormat = "a4" | "13x19" | "custom";
@@ -81,9 +73,39 @@ const TEMPLATE_TYPES: { value: ProjectTemplate["templateType"]; label: string }[
 type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean };
 
 function mapApiTemplateToProjectTemplate(template: TemplateRecord): PreviewTemplateOption {
-  const mapped = mapTemplateRecordToProjectTemplate(template);
+  const designData = (template.designData || {}) as Record<string, any>;
+  const canvas = (designData.canvas && typeof designData.canvas === "object") ? designData.canvas : {};
+  const margin = (designData.margin && typeof designData.margin === "object") ? designData.margin : {};
+  const canvasJSON = typeof designData.canvasJSON === "string"
+    ? designData.canvasJSON
+    : (typeof designData.canvasJson === "string" ? designData.canvasJson : "");
+  const rawApplicableFor = designData.applicableFor;
+  const applicableFor = Array.isArray(rawApplicableFor)
+    ? rawApplicableFor.join(", ")
+    : (rawApplicableFor ? String(rawApplicableFor) : "");
+
   return {
-    ...mapped,
+    id: template._id,
+    remoteId: template._id,
+    projectId: String(template.projectId || template.productId || ""),
+    clientId: String((template as any).clientId || ""),
+    templateName: template.templateName,
+    templateType: (designData.templateType as ProjectTemplate["templateType"]) || "custom",
+    canvas: {
+      width: Number(canvas.width || 0) || 0,
+      height: Number(canvas.height || 0) || 0,
+    },
+    margin: {
+      top: Number(margin.top || 0) || 0,
+      left: Number(margin.left || 0) || 0,
+      right: Number(margin.right || 0) || 0,
+      bottom: Number(margin.bottom || 0) || 0,
+    },
+    applicableFor,
+    createdAt: template.createdAt,
+    canvasJSON: canvasJSON || undefined,
+    thumbnail: resolveProfileImageUrl(template.preview_image || template.previewImageUrl || "") || undefined,
+    isPublic: template.isGlobal === true,
     isGlobal: template.isGlobal === true,
   };
 }
@@ -156,8 +178,6 @@ const emptyPreviewForm: PreviewGenerationForm = {
 };
 
 const GROUP_FILTER_ALL = "__all__";
-const MONGO_ID_REGEX = /^[a-f\d]{24}$/i;
-const isMongoId = (value?: string | null) => Boolean(value && MONGO_ID_REGEX.test(value));
 
 const emptyNewGroupFilters = {
   classValue: GROUP_FILTER_ALL,
@@ -431,7 +451,7 @@ function inspectTemplatePreview(
     hasRenderablePreview: hasDesignElements && hasThumbnail,
     requiredFieldKeys,
     missingFieldKeys,
-    fallbackMessage: hasDesignElements ? "" : "Click 'Edit' to open Designer Studio and create a design.",
+    fallbackMessage: hasDesignElements ? "" : "No preview available. Please configure the template.",
   };
 }
 
@@ -492,19 +512,7 @@ function isPhotoFieldKey(key: string): boolean {
 
 function getRecordPhotoUrl(rec: ProjectDataRecord): string {
   const value = getRecordPhoto(rec);
-  if (!value) return '';
-  const trimmed = value.trim();
-  // Only display values that are confirmed uploaded URLs or embedded data.
-  // A bare filename like "101_syali.jpg" (from a CSV Photo column) is just
-  // matching metadata — it has NOT been uploaded yet and must not be resolved
-  // to an upload URL. After a real ZIP/folder upload the backend overwrites
-  // this field with the full http:// URL.
-  const isConfirmedUrl =
-    /^(data:image\/|blob:|https?:\/\/)/i.test(trimmed) ||
-    trimmed.startsWith('/uploads/') ||
-    trimmed.startsWith('uploads/');
-  if (!isConfirmedUrl) return '';
-  return resolveProfileImageUrl(trimmed);
+  return resolveProfileImageUrl(value);
 }
 const DEFAULT_AVATAR =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Ccircle cx='18' cy='18' r='18' fill='%23e2e8f0'/%3E%3Ccircle cx='18' cy='14' r='6' fill='%2394a3b8'/%3E%3Cellipse cx='18' cy='30' rx='10' ry='7' fill='%2394a3b8'/%3E%3C/svg%3E";
@@ -512,28 +520,11 @@ const MM_TO_PX = 96 / 25.4;
 const PREVIEW_CARD_WIDTH_PX = 250;
 const PREVIEW_CARD_HEIGHT_PX = 350;
 
-/**
- * Returns a copy of records with base64 data URLs removed from the `photo` field.
- * Base64 images can be hundreds of KB each — storing them in MongoDB causes the
- * document to exceed the 16 MB BSON limit and the save fails silently.
- * Only server-relative paths ("/uploads/...") or absolute https:// URLs are kept.
- */
-function toDbSafeRecords(records: ProjectDataRecord[]): ProjectDataRecord[] {
-  return records.map((r) => {
-    const photo = String((r as Record<string, unknown>).photo ?? "");
-    if (photo.startsWith("data:")) {
-      const { photo: _stripped, ...rest } = r as Record<string, unknown>;
-      return rest as ProjectDataRecord;
-    }
-    return r;
-  });
-}
-
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
-  const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const [version, setVersion] = useState(0);
   const [project, setProject] = useState<ReturnType<typeof mapApiProjectToUi> | null>(null);
   const [projectLoading, setProjectLoading] = useState(true);
@@ -586,44 +577,13 @@ export function ProjectDetail() {
   const [newGroupTemplateId, setNewGroupTemplateId] = useState("");
   const [newGroupFilters, setNewGroupFilters] = useState({ ...emptyNewGroupFilters });
 
-  // Reload data records: prefer backend (persistent), fall back to localStorage
+  // Reload data from localStorage whenever project id or category changes
   useEffect(() => {
     if (!id) return;
-    // Immediately load from localStorage for a fast first render
-    const localRecords = loadDataRecords(id, dataCategory);
-    setDataRecords(localRecords);
+    setDataRecords(loadDataRecords(id, dataCategory));
     setDataFields(loadDataFields(id, dataCategory));
     setDataGroups(loadDataGroups(id, dataCategory));
     setDataSelectedIds(new Set());
-
-    // Hydrate from backend — backend is the source of truth for server-hosted images.
-    // MERGE strategy: if a DB record has no photo but the local record does (e.g. a
-    // base64 fallback from when the upload API was unavailable), keep the local photo
-    // so photos are never silently erased by a stale DB document.
-    let cancelled = false;
-    fetchProjectRecords(id, dataCategory).then((backendRecords) => {
-      if (cancelled) return; // component unmounted or deps changed — discard stale result
-      if (backendRecords && backendRecords.length > 0) {
-        const localById = new Map(localRecords.map((r) => [r.id, r]));
-        const merged: ProjectDataRecord[] = backendRecords.map((br) => {
-          const brTyped = br as ProjectDataRecord;
-          const brPhoto = String((brTyped as Record<string, unknown>).photo ?? "").trim();
-          if (!brPhoto) {
-            // DB record has no photo — preserve whatever is in localStorage for this record
-            const local = localById.get(brTyped.id);
-            const localPhoto = String((local as Record<string, unknown> | undefined)?.photo ?? "").trim();
-            if (localPhoto) return { ...brTyped, photo: localPhoto };
-          }
-          return brTyped;
-        });
-        setDataRecords(merged);
-        // Save merged back to localStorage, but strip any base64 photos to
-        // prevent QuotaExceededError (282+ records × ~100 KB each = localStorage overflow).
-        // Only server-relative /uploads/... paths survive in localStorage.
-        saveDataRecords(id, dataCategory, toDbSafeRecords(merged));
-      }
-    });
-    return () => { cancelled = true; };
   }, [id, dataCategory]);
 
   // ── Data action dialog state ──
@@ -634,12 +594,11 @@ export function ProjectDetail() {
   const [isBulkImageUploadOpen, setIsBulkImageUploadOpen] = useState(false);
 
   const [bulkImageProcessing, setBulkImageProcessing] = useState(false);
-  const [bulkImageResults, setBulkImageResults] = useState<BulkMatchResult | null>(null);
-  const [manualAssign, setManualAssign] = useState<Record<string, string>>({}); // filename → userId override
-  const bulkImageDataUrlsRef = useRef<Map<string, string>>(new Map()); // filename → dataUrl
-  const bulkImageFilesRef = useRef<Map<string, File>>(new Map()); // filename → File (for server upload)
-  // Pre-uploaded server URLs for ZIP upload (files already on server — no re-upload needed)
-  const zipServerUrlsRef = useRef<Map<string, string>>(new Map()); // filename → serverUrl
+  const [bulkImageResults, setBulkImageResults] = useState<{
+    matched: { userId: string; name: string; filename: string; dataUrl: string }[];
+    unmatched: { filename: string; reason: string }[];
+    duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[];
+  } | null>(null);
   const [isAddDataOpen, setIsAddDataOpen] = useState(false);
   const [addDataDraft, setAddDataDraft] = useState<Record<string, string>>({});
   const [isBulkEditOpen, setIsBulkEditOpen] = useState(false);
@@ -649,12 +608,8 @@ export function ProjectDetail() {
   const [isGenerateBarcodeOpen, setIsGenerateBarcodeOpen] = useState(false);
   const [barcodeField, setBarcodeField] = useState("");
   const [isGeneratePreviewOpen, setIsGeneratePreviewOpen] = useState(false);
-  const [previewDialogStep, setPreviewDialogStep] = useState<1 | 2>(1);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [previewError, setPreviewError] = useState("");
-  const [previewProgressText, setPreviewProgressText] = useState("");
-  // Used to abort an in-progress generation when the dialog is closed.
-  const abortRef = useRef<AbortController | null>(null);
   const [previewForm, setPreviewForm] = useState<PreviewGenerationForm>(emptyPreviewForm);
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
 
@@ -665,138 +620,13 @@ export function ProjectDetail() {
   const [templateErrors, setTemplateErrors] = useState<{ templateName?: string; applicableFor?: string }>({});
   const [previewTemplate, setPreviewTemplate] = useState<ProjectTemplate | null>(null);
   const [brokenTemplatePreviewIds, setBrokenTemplatePreviewIds] = useState<Record<string, true>>({});
-  const [activeTab, setActiveTab] = useState(() => searchParams.get("tab") || "details");
-  // Pre-populate from localStorage so templates appear instantly after refresh while
-  // the DB fetch runs in the background. The fetch will either confirm these (override)
-  // or fail gracefully (these remain visible with an error banner).
-  const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>(() => {
-    if (!id) return [];
-    try {
-      return loadProjectTemplates(id)
-        .filter((t) => t.projectId === id && (isMongoId(t.id) || isMongoId(t.remoteId)))
-        .map((t) => ({ ...t, isGlobal: t.isPublic ?? false }));
-    } catch { return []; }
-  });
+  const [bgGeneratedPreviews, setBgGeneratedPreviews] = useState<Record<string, string>>({});
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState("details");
+  const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>([]);
   const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(false);
   const [remoteTemplatesError, setRemoteTemplatesError] = useState("");
-  const [deleteConfirmTemplate, setDeleteConfirmTemplate] = useState<ProjectTemplate | null>(null);
-  const [isDeletingTemplate, setIsDeletingTemplate] = useState(false);
-  const templateMigrationRef = useRef(false);
-  const realtimeRefreshRef = useRef<number | null>(null);
-  // Separate version counter for templates-only re-fetch.
-  // Incrementing this triggers a template reload without touching project data.
-  const [templateFetchVersion, setTemplateFetchVersion] = useState(0);
-  const refetchTemplates = useCallback(() => setTemplateFetchVersion((v) => v + 1), []);
-
-  // ── Background preview generation for project templates ───────────────────
-  // Track IDs that are missing a thumbnail or had a broken image URL.
-  const [missingProjectPreviewIds, setMissingProjectPreviewIds] = useState<string[]>([]);
-  const brokenProjectPreviewIdsRef = useRef<Set<string>>(new Set());
-
-  const handleProjectTemplateImgError = useCallback((templateId: string) => {
-    brokenProjectPreviewIdsRef.current.add(templateId);
-    setBrokenTemplatePreviewIds((prev) => prev[templateId] ? prev : { ...prev, [templateId]: true });
-    setMissingProjectPreviewIds((prev) => prev.includes(templateId) ? prev : [...prev, templateId]);
-  }, []);
-
-  /** onLoad handler — detect blank (white/transparent) thumbnail images and re-queue generation. */
-  const handleProjectTemplateImgLoad = useCallback(
-    (e: React.SyntheticEvent<HTMLImageElement>, templateId: string) => {
-      try {
-        const img = e.currentTarget;
-        if (!img.naturalWidth || !img.naturalHeight) return;
-        const size = 20;
-        const cv = document.createElement("canvas");
-        cv.width = size;
-        cv.height = size;
-        const ctx = cv.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(img, 0, 0, size, size);
-        const data = ctx.getImageData(0, 0, size, size).data;
-        let nonWhite = 0;
-        for (let i = 0; i < data.length; i += 4) {
-          const a = data[i + 3] ?? 0;
-          if (a < 10) continue;
-          if (data[i]! < 245 || data[i + 1]! < 245 || data[i + 2]! < 245) nonWhite++;
-        }
-        if (nonWhite < 5) {
-          handleProjectTemplateImgError(templateId);
-        }
-      } catch {
-        // Cross-origin canvas taint — ignore, trust the image is valid.
-      }
-    },
-    [handleProjectTemplateImgError],
-  );
-
-  const handleProjectPreviewGenerated = useCallback((templateId: string, url: string) => {
-    if (url) {
-      // Update the in-memory remoteTemplates so the card shows the new thumbnail.
-      setRemoteTemplates((prev) =>
-        prev.map((t) =>
-          t.id === templateId
-            ? { ...t, thumbnail: url }
-            : t,
-        ),
-      );
-      setBrokenTemplatePreviewIds((prev) => {
-        if (!prev[templateId]) return prev;
-        const next = { ...prev };
-        delete next[templateId];
-        return next;
-      });
-    }
-    setMissingProjectPreviewIds((prev) => prev.filter((x) => x !== templateId));
-    brokenProjectPreviewIdsRef.current.delete(templateId);
-  }, []);
-
-  const activeGeneratingProject = useGenerateMissingPreviews(
-    missingProjectPreviewIds,
-    brokenProjectPreviewIdsRef.current,
-    handleProjectPreviewGenerated,
-  );
-  // ─────────────────────────────────────────────────────────────────────────
-
-  // Sync activeTab when the URL ?tab= param changes (e.g., after returning from Template Gallery)
-  useEffect(() => {
-    const tabFromUrl = searchParams.get("tab");
-    if (tabFromUrl) setActiveTab(tabFromUrl);
-  }, [searchParams]);
-
-  // When returning from Template Gallery after attaching a template, immediately
-  // add the new template to remoteTemplates so it appears without waiting for
-  // the async Atlas DB re-fetch (which can be slow on Atlas M0).
-  useEffect(() => {
-    const attached = (location.state as Record<string, unknown> | null)?.justAttachedTemplate;
-    if (!attached) return;
-    const mapped = mapApiTemplateToProjectTemplate(attached as TemplateRecord);
-    setRemoteTemplates((prev) => {
-      if (prev.some((t) => t.id === mapped.id)) return prev;
-      const next = [...prev, mapped];
-      syncProjectTemplatesFromRemote(id ?? '', next);
-      return next;
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.state]);
-
-  useEffect(() => {
-    templateMigrationRef.current = false;
-    // When the project id changes (user navigates to a different project),
-    // reset remoteTemplates to the localStorage preload for the new project
-    // so we don't flash the previous project's templates while the fetch runs.
-    if (!id) {
-      setRemoteTemplates([]);
-      return;
-    }
-    try {
-      const preload = loadProjectTemplates(id)
-        .filter((t) => t.projectId === id && (isMongoId(t.id) || isMongoId(t.remoteId)))
-        .map((t) => ({ ...t, isGlobal: t.isPublic ?? false }));
-      setRemoteTemplates(preload);
-    } catch {
-      setRemoteTemplates([]);
-    }
-  }, [id]);
+  const [remoteTemplatesVersion, setRemoteTemplatesVersion] = useState(0);
 
   const updateTemplateMargin = (key: keyof typeof emptyTemplateForm.margin, val: number) =>
     setTemplateForm((f) => ({ ...f, margin: { ...f.margin, [key]: val } }));
@@ -837,89 +667,58 @@ export function ProjectDetail() {
       return;
     }
 
-    const controller = new AbortController();
-    const timeoutId  = window.setTimeout(() => controller.abort(), 45_000);
-
     const requestUrl = `${API_BASE}/templates?projectId=${encodeURIComponent(id)}`;
     setRemoteTemplatesLoading(true);
     setRemoteTemplatesError("");
 
-    fetch(requestUrl, { cache: 'no-store', signal: controller.signal })
+    fetch(requestUrl)
       .then(async (response) => {
         const json = await response.json();
         if (!response.ok || json?.success === false) {
           throw new Error(json?.error || "Failed to load templates");
         }
         const items = Array.isArray(json?.data) ? (json.data as TemplateRecord[]) : [];
+        console.log("Fetched Templates:", items);
         return items;
       })
-      .then(async (items) => {
+      .then((items) => {
         if (!mounted) return;
         const mapped = items.map(mapApiTemplateToProjectTemplate);
         const deduped = Array.from(new Map(mapped.map((t) => [t.id, t])).values());
         setRemoteTemplates(deduped);
-        syncProjectTemplatesFromRemote(id, deduped);
 
-        if (!templateMigrationRef.current) {
-          const legacy = loadProjectTemplates(id).filter(
-            (t) => t.projectId === id && !t.remoteId && !isMongoId(t.id)
-          );
-          templateMigrationRef.current = true;
-          if (legacy.length > 0) {
-            try {
-              const result = await migrateProjectTemplatesToDatabase(id, legacy);
-              result.saved.forEach((saved) => {
-                if (saved.sourceId) {
-                  updateProjectTemplate(saved.sourceId, { remoteId: saved._id });
-                }
-              });
-              // Re-fetch remote templates after migration to pick up DB ids.
-              if (mounted) {
-                const refreshResponse = await fetch(requestUrl, { cache: 'no-store' });
-                const refreshJson = await refreshResponse.json();
-                const refreshItems = Array.isArray(refreshJson?.data)
-                  ? (refreshJson.data as TemplateRecord[])
-                  : [];
-                const refreshMapped = refreshItems.map(mapApiTemplateToProjectTemplate);
-                const refreshDeduped = Array.from(new Map(refreshMapped.map((t) => [t.id, t])).values());
-                setRemoteTemplates(refreshDeduped);
-                syncProjectTemplatesFromRemote(id, refreshDeduped);
-              }
-            } catch (error) {
-              console.warn("[templates] Local migration failed", error);
-            }
+        // Sync thumbnails/canvasJSON back to localStorage: if a local template has a remoteId
+        // that matches an API template, and the local copy lacks a thumbnail or canvasJSON, update it.
+        const apiById = new Map(deduped.map((t) => [t.id, t]));
+        loadAllProjectTemplates().forEach((localTmpl) => {
+          if (!localTmpl.remoteId) return;
+          const apiTmpl = apiById.get(localTmpl.remoteId);
+          if (!apiTmpl) return;
+          const needsUpdate =
+            (!localTmpl.thumbnail && apiTmpl.thumbnail) ||
+            (!localTmpl.canvasJSON && apiTmpl.canvasJSON);
+          if (needsUpdate) {
+            updateProjectTemplate(localTmpl.id, {
+              thumbnail: localTmpl.thumbnail || apiTmpl.thumbnail,
+              canvasJSON: localTmpl.canvasJSON || apiTmpl.canvasJSON,
+            });
           }
-        }
+        });
       })
       .catch((error) => {
         if (!mounted) return;
-        const isAbort = error instanceof Error && error.name === 'AbortError';
         console.warn("[preview] Failed to load templates", error);
-        // Preserve existing state (from localStorage preload or a previous successful fetch).
-        // Never wipe templates because of a transient error — the user's data is still in
-        // MongoDB; we just couldn't reach it this time (Atlas M0 cold start, network hiccup).
-        setRemoteTemplatesError(
-          isAbort
-            ? "Templates loading slowly (server waking up). Showing cached data — refresh to retry."
-            : (error as Error).message || "Failed to load templates"
-        );
+        setRemoteTemplates([]);
+        setRemoteTemplatesError((error as Error).message || "Failed to load templates");
       })
       .finally(() => {
-        window.clearTimeout(timeoutId);
         if (mounted) setRemoteTemplatesLoading(false);
       });
 
     return () => {
       mounted = false;
-      window.clearTimeout(timeoutId);
-      controller.abort();
     };
-  // templateFetchVersion increments only when templates need a hard re-fetch
-  // (after create/delete/attach/detach). location.key changes when navigating
-  // back from Template Gallery to pick up newly attached templates.
-  // version is intentionally excluded: project-level refresh must not re-trigger
-  // a template fetch (which shows the spinner again unnecessarily).
-  }, [id, templateFetchVersion, location.key]);
+  }, [id, remoteTemplatesVersion]);
 
   // Load data
   const products = id ? loadProjectProducts(id) : [];
@@ -927,45 +726,73 @@ export function ProjectDetail() {
   const files = id ? loadProjectFiles(id) : [];
   const templates = id ? loadProjectTemplates(id, project?.clientId ?? "") : [];
   const previewTemplates = useMemo(() => {
-    // DB (remoteTemplates) is the single source of truth for live data.
-    // localStorage templates serve as:
-    //   a) the pre-populated initial state (set at useState init time), and
-    //   b) a fallback for unmigrated local-only templates (TMPL-xxx IDs).
     const merged = new Map<string, PreviewTemplateOption>();
-
-    // Step 1: DB templates (or localStorage preload) take unconditional priority.
-    remoteTemplates.forEach((t) => merged.set(t.id, t));
-
-    // Step 2: Append local-only templates not yet represented in remoteTemplates.
-    // Includes:
-    //   - Legacy TMPL-xxx records not yet migrated to DB (!isMongoId(t.id))
-    //   - DB-backed templates whose remoteId isn't in the current remoteTemplates set
-    //     (e.g., a new template created just before a failed refresh)
-    const remoteIds = new Set(remoteTemplates.map((t) => t.id));
-    const remoteByRemoteId = new Set(remoteTemplates.map((t) => t.remoteId).filter(Boolean));
+    // Lookup: remoteId (MongoDB _id) → API template
+    const apiById = new Map(remoteTemplates.map((t) => [t.id, t]));
+    // Lookup: remoteId → local template (for skipping duplication)
+    const localByRemoteId = new Map<string, PreviewTemplateOption>();
     templates.forEach((t) => {
-      if (merged.has(t.id)) return; // already in merged (was in remoteTemplates preload)
-      const syncedById = remoteIds.has(t.id) || (t.remoteId ? remoteIds.has(t.remoteId) : false);
-      const syncedByRemoteId = t.remoteId ? remoteByRemoteId.has(t.remoteId) : false;
-      if (!syncedById && !syncedByRemoteId && t.projectId === id) {
-        // Include both migrated DB templates (as fallback when DB is unreachable)
-        // and unmigrated local-only templates.
-        merged.set(t.id, { ...t, isGlobal: t.isPublic ?? false });
+      const rid = (t as any).remoteId as string | undefined;
+      if (rid) localByRemoteId.set(rid, t);
+    });
+
+    // Add API-only templates (no matching local template)
+    remoteTemplates.forEach((template) => {
+      if (!localByRemoteId.has(template.id)) {
+        merged.set(template.id, template);
       }
     });
 
-    return Array.from(merged.values());
-  }, [remoteTemplates, templates, id]);
+    // Add local templates, enriching with API metadata (thumbnail, canvas) when available
+    templates.forEach((template) => {
+      if (merged.has(template.id)) return;
+      const remoteId = (template as any).remoteId as string | undefined;
+      const apiVersion = remoteId ? apiById.get(remoteId) : undefined;
+      merged.set(template.id, {
+        ...template,
+        // Prefer absolute SFTP URL from API; only fall back to local if it's also absolute.
+        // Relative paths (/uploads/...) are intentionally excluded here — they 404 in dev
+        // and the API always has the authoritative persisted copy.
+        thumbnail:
+          (apiVersion?.thumbnail?.startsWith('http') ? apiVersion.thumbnail : null)
+          || (template.thumbnail?.startsWith('http') ? template.thumbnail : null)
+          || apiVersion?.thumbnail
+          || template.thumbnail
+          || undefined,
+        // Use API canvas dimensions if local has 0x0
+        canvas:
+          template.canvas?.width && template.canvas?.height
+            ? template.canvas
+            : (apiVersion?.canvas ?? template.canvas),
+        isGlobal: apiVersion?.isGlobal ?? (template as any).isGlobal ?? false,
+      } as PreviewTemplateOption);
+    });
+
+    // Deduplicate by templateName: collapses cards from past duplicate-attach operations
+    // (before the E11000 guard was added). Prefer entries with absolute thumbnail URLs;
+    // if both have the same quality, keep the more recent one (larger ObjectId string).
+    const dedupedByName = new Map<string, PreviewTemplateOption>();
+    for (const t of merged.values()) {
+      const existing = dedupedByName.get(t.templateName);
+      if (!existing) {
+        dedupedByName.set(t.templateName, t);
+      } else {
+        const tAbsolute = Boolean(t.thumbnail?.startsWith('http'));
+        const exAbsolute = Boolean(existing.thumbnail?.startsWith('http'));
+        if (tAbsolute && !exAbsolute) {
+          dedupedByName.set(t.templateName, t);
+        } else if (tAbsolute === exAbsolute && t.id > existing.id) {
+          dedupedByName.set(t.templateName, t);
+        }
+      }
+    }
+
+    return Array.from(dedupedByName.values());
+  }, [remoteTemplates, templates]);
 
   const previewTemplateGroups = useMemo(() => {
-    // A template belongs to this project if it was created here (projectId === id),
-    // even when it is also publicly shared (isGlobal: true).
-    const projectTemplates = previewTemplates.filter(
-      (template) => !template.isGlobal || template.projectId === id
-    );
-    const globalTemplates = previewTemplates.filter(
-      (template) => template.isGlobal && template.projectId !== id
-    );
+    const projectTemplates = previewTemplates.filter((template) => !template.isGlobal);
+    const globalTemplates = previewTemplates.filter((template) => template.isGlobal);
     return {
       projectTemplates: projectTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
       globalTemplates: globalTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
@@ -994,26 +821,11 @@ export function ProjectDetail() {
 
   const templateDiagnosticsMap = useMemo(() => {
     const diagnostics: Record<string, TemplatePreviewDiagnostics> = {};
-    // Include both local and remote (DB) templates so the card grid shows correct diagnostics
-    previewTemplates.forEach((template) => {
+    templates.forEach((template) => {
       diagnostics[template.id] = inspectTemplatePreview(template, availableTemplateFieldKeys);
     });
     return diagnostics;
-  }, [previewTemplates, availableTemplateFieldKeys]);
-
-  // Queue templates that are missing preview thumbnails for background generation.
-  useEffect(() => {
-    const idsNeedingPreview = previewTemplates
-      .filter((t) => !resolveTemplatePreview({ preview_image: t.thumbnail, previewImageUrl: t.thumbnail }))
-      .map((t) => t.id)
-      .filter(Boolean);
-    if (idsNeedingPreview.length === 0) return;
-    setMissingProjectPreviewIds((prev) => {
-      const prevSet = new Set(prev);
-      const added = idsNeedingPreview.filter((id) => !prevSet.has(id));
-      return added.length ? [...prev, ...added] : prev;
-    });
-  }, [previewTemplates]);
+  }, [templates, availableTemplateFieldKeys]);
 
   const previewTemplateDiagnosticsMap = useMemo(() => {
     const diagnostics: Record<string, TemplatePreviewDiagnostics> = {};
@@ -1024,7 +836,7 @@ export function ProjectDetail() {
   }, [previewTemplates, availableTemplateFieldKeys]);
 
   const selectedPreviewTemplateDiagnostics = previewTemplate
-    ? previewTemplateDiagnosticsMap[previewTemplate.id]
+    ? templateDiagnosticsMap[previewTemplate.id]
     : undefined;
 
   const selectedGenerateTemplate = previewForm.templateId
@@ -1040,14 +852,43 @@ export function ProjectDetail() {
 
   const canRenderSelectedTemplateImage = Boolean(
     previewTemplate
-    && previewTemplate.thumbnail
+    && (
+      previewTemplate.thumbnail
+      || bgGeneratedPreviews[previewTemplate.id]
+      || bgGeneratedPreviews[((previewTemplate as any).remoteId as string) ?? ""]
+    )
     && !brokenTemplatePreviewIds[previewTemplate.id]
   );
 
   const markTemplatePreviewBroken = (templateId: string) => {
-    // Delegate to the full broken-preview handler so regeneration is triggered.
-    handleProjectTemplateImgError(templateId);
+    setBrokenTemplatePreviewIds((prev) => {
+      if (prev[templateId]) return prev;
+      return { ...prev, [templateId]: true };
+    });
   };
+
+  // Auto-generate missing previews in the background for templates without a thumbnail.
+  // Only pass valid MongoDB IDs (24-char hex) — local TMPL-xxxx IDs won't be found by the API.
+  const brokenUrlIdsSet = useMemo(
+    () => new Set(Object.keys(brokenTemplatePreviewIds)),
+    [brokenTemplatePreviewIds]
+  );
+  const missingPreviewTemplateIds = useMemo(() => {
+    return previewTemplates
+      .filter((t) => {
+        const remoteId = (t as any).remoteId as string | undefined;
+        const thumb = t.thumbnail || bgGeneratedPreviews[t.id] || bgGeneratedPreviews[remoteId ?? ""];
+        return !thumb || brokenTemplatePreviewIds[t.id];
+      })
+      .map((t) => ((t as any).remoteId as string | undefined) || t.id)
+      .filter((mongoId) => /^[0-9a-f]{24}$/i.test(mongoId));
+  }, [previewTemplates, bgGeneratedPreviews, brokenTemplatePreviewIds]);
+
+  const handleBgPreviewGenerated = useCallback((mongoId: string, url: string) => {
+    setBgGeneratedPreviews((prev) => (prev[mongoId] === url ? prev : { ...prev, [mongoId]: url }));
+  }, []);
+
+  useGenerateMissingPreviews(missingPreviewTemplateIds, brokenUrlIdsSet, handleBgPreviewGenerated);
 
   useEffect(() => {
     if (!previewForm.templateId) return;
@@ -1061,31 +902,22 @@ export function ProjectDetail() {
 
   const refresh = () => setVersion((v) => v + 1);
 
+  // Handle returning from Template Gallery: switch to templates tab and refresh
   useEffect(() => {
-    if (!id) return;
-    const unsubscribe = subscribeToTemplateUpdates(id, () => {
-      // SSE event: debounce and re-fetch ONLY templates (not project metadata).
-      // Do NOT call refresh() here — that increments version, re-fetches project,
-      // and shows the template spinner on every real-time event.
-      if (realtimeRefreshRef.current) return;
-      realtimeRefreshRef.current = window.setTimeout(() => {
-        realtimeRefreshRef.current = null;
-        refetchTemplates();
-      }, 2_000); // 2 s debounce — avoids spinner on burst saves
-    });
-
-    // 30 s polling intentionally removed. It was causing the continuous
-    // "Loading templates…" flicker. SSE events handle real-time updates;
-    // manual actions call refetchTemplates() directly.
-
-    return () => {
-      if (realtimeRefreshRef.current) {
-        window.clearTimeout(realtimeRefreshRef.current);
-        realtimeRefreshRef.current = null;
-      }
-      unsubscribe();
-    };
-  }, [id, refetchTemplates]);
+    if (searchParams.get("tab") === "templates") {
+      setActiveTab("templates");
+    }
+    const justAttached = (location.state as any)?.justAttachedTemplate;
+    if (justAttached) {
+      // Refresh local templates list and remote API list
+      setVersion((v) => v + 1);
+      setRemoteTemplatesVersion((v) => v + 1);
+      setActiveTab("templates");
+      // Clear the navigation state so this doesn't re-trigger on back/forward
+      window.history.replaceState({}, "");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.state, searchParams]);
 
   // ── Template handlers ──
   const validateTemplate = () => {
@@ -1121,17 +953,16 @@ export function ProjectDetail() {
   const handleCreateTemplate = async () => {
     if (!validateTemplate() || !id) return;
     const thumb = createBlankTemplateThumbnail(templateForm.canvas.width, templateForm.canvas.height);
-    const blankCanvasJSON = JSON.stringify({
-      config: {
-        templateName: templateForm.templateName,
-        templateType: templateForm.templateType,
-        canvas: templateForm.canvas,
-        margin: templateForm.margin,
-      },
-      pages: [{ id: "page-1", name: "Page 1", canvas: { objects: [] } }],
-      activePageId: "page-1",
-      canvas: { objects: [] },
-      elementMetadata: [],
+    const localTemplate = addProjectTemplate({
+      projectId: id,
+      clientId: project?.clientId ?? "",
+      templateName: templateForm.templateName,
+      templateType: templateForm.templateType,
+      canvas: templateForm.canvas,
+      margin: templateForm.margin,
+      applicableFor: templateForm.applicableFor,
+      thumbnail: thumb,
+      isPublic: templateForm.isPublic,
     });
 
     setTemplateForm(emptyTemplateForm);
@@ -1143,125 +974,24 @@ export function ProjectDetail() {
     try {
       const remoteTemplate = await createTemplate({
         productId: id,
-        projectId: id,
-        templateName: templateForm.templateName,
+        templateName: localTemplate.templateName,
         preview_image: thumb,
         category: "Other",
         designData: {
-          templateType: templateForm.templateType,
-          canvas: templateForm.canvas,
-          margin: templateForm.margin,
-          applicableFor: templateForm.applicableFor,
-          canvasJSON: blankCanvasJSON,
+          templateType: localTemplate.templateType,
+          canvas: localTemplate.canvas,
+          margin: localTemplate.margin,
+          applicableFor: localTemplate.applicableFor,
         },
-        isGlobal: templateForm.isPublic,
-        isPublic: templateForm.isPublic,
+        isGlobal: localTemplate.isPublic,
+        isPublic: localTemplate.isPublic,
       });
 
-      const mapped = mapApiTemplateToProjectTemplate(remoteTemplate);
-      setRemoteTemplates((prev) => {
-        const next = [...prev.filter((t) => t.id !== mapped.id), mapped];
-        syncProjectTemplatesFromRemote(id, next);
-        return next;
-      });
-
-      // Open the Designer Studio for the newly created template
-      const normalizedMargin = {
-        top:    Number(templateForm.margin?.top    ?? 0) || 0,
-        left:   Number(templateForm.margin?.left   ?? 0) || 0,
-        right:  Number(templateForm.margin?.right  ?? 0) || 0,
-        bottom: Number(templateForm.margin?.bottom ?? 0) || 0,
-      };
-      const designerConfig = {
-        templateName: mapped.templateName,
-        templateType: mapped.templateType,
-        canvas: mapped.canvas,
-        margin: normalizedMargin,
-      };
-      localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
-      localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-        projectId: id,
-        templateId: mapped.id,
-        projectName: project?.name ?? "",
-        templateName: mapped.templateName,
-      }));
-      navigate(`/designer-studio?templateId=${mapped.id}`);
+      updateProjectTemplate(localTemplate.id, { remoteId: remoteTemplate._id });
     } catch (error) {
       console.warn("[templates] Failed to persist project template to MongoDB", error);
-      toast.error("Template could not be saved to the server.");
-      // Only refresh on failure so the UI reflects the actual DB state.
-      // On success the optimistic setRemoteTemplates update is the source of truth
-      // until the user returns from Designer Studio (which triggers a fresh fetch via location.key).
-      refetchTemplates();
     } finally {
       setIsTemplateSaving(false);
-    }
-  };
-
-  const resolveRemoteTemplateId = (template: ProjectTemplate) => {
-    if (isMongoId(template.remoteId)) return template.remoteId as string;
-    if (isMongoId(template.id)) return template.id;
-    return "";
-  };
-
-  const handleDeleteTemplate = async (template: ProjectTemplate) => {
-    if (!id) return;
-    const remoteId = resolveRemoteTemplateId(template);
-    setIsDeletingTemplate(true);
-    try {
-      if (remoteId) {
-        // Detach from this project only — does NOT delete the template document.
-        // The template remains in the Template Gallery if it is globally shared.
-        await unlinkTemplateFromProject(remoteId, id);
-        setRemoteTemplates((prev) => {
-          const next = prev.filter((t) => t.id !== remoteId);
-          syncProjectTemplatesFromRemote(id, next);
-          return next;
-        });
-      } else {
-        // Local-only template (never synced) — remove from localStorage only.
-        deleteProjectTemplate(template.id);
-        refetchTemplates();
-      }
-      toast.success(`"${template.templateName}" removed from project.`);
-      setDeleteConfirmTemplate(null);
-    } catch (error) {
-      console.warn("[templates] Failed to remove template from project", error);
-      toast.error("Failed to remove template.");
-    } finally {
-      setIsDeletingTemplate(false);
-    }
-  };
-
-  const handleCloneTemplate = async (template: ProjectTemplate) => {
-    if (!id) return;
-    try {
-      const created = await createTemplate({
-        productId: id,
-        projectId: id,
-        templateName: `${template.templateName} (Copy)`,
-        preview_image: template.thumbnail || "",
-        category: "Other",
-        designData: {
-          templateType: template.templateType,
-          canvas: template.canvas,
-          margin: template.margin,
-          applicableFor: template.applicableFor,
-          canvasJSON: template.canvasJSON,
-        },
-        isGlobal: false,
-        isPublic: false,
-      });
-
-      const mapped = mapApiTemplateToProjectTemplate(created);
-      setRemoteTemplates((prev) => {
-        const next = [...prev.filter((t) => t.id !== mapped.id), mapped];
-        syncProjectTemplatesFromRemote(id, next);
-        return next;
-      });
-    } catch (error) {
-      console.warn("[templates] Failed to clone template", error);
-      toast.error("Failed to create template copy.");
     }
   };
 
@@ -1407,26 +1137,9 @@ export function ProjectDetail() {
         return rec;
       });
       saveDataFields(projectId, category, newFields);
-      // Strip any lingering photo values from fresh CSV records
-      const cleanRecords = records.map((r) => {
-        const { photo: _p, Photo: _P, ...rest } = r as Record<string, unknown>;
-        void _p; void _P;
-        return rest as ProjectDataRecord;
-      });
-      saveDataRecords(projectId, category, cleanRecords);
+      saveDataRecords(projectId, category, records);
       setDataFields(newFields);
-      setDataRecords(cleanRecords);
-
-      // Persist to MongoDB so the ZIP-upload endpoint can match against fresh records.
-      // This is fire-and-forget from the user's perspective; errors are surfaced as toasts.
-      saveProjectRecords(projectId, category, cleanRecords).then((ok) => {
-        if (ok) {
-          console.log(`[CSV] ${cleanRecords.length} record(s) saved to MongoDB — ready for image mapping`);
-          toast.success(`${cleanRecords.length} record(s) imported and synced to server.`);
-        } else {
-          toast.error('CSV imported locally but failed to sync to server. Image mapping may not work.');
-        }
-      });
+      setDataRecords(records);
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -1726,75 +1439,36 @@ export function ProjectDetail() {
   };
 
   // Image Upload (match by filename, or direct assign when target set)
-  // Images are uploaded to the backend so they persist across refreshes.
-  const handleImageUploadFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUploadFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
     if (!files.length || !id) return;
-
-    let uploadedUrls: string[];
-    try {
-      uploadedUrls = await uploadImages(files);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error(`Photo upload failed: ${msg}. Please check your connection and try again.`);
-      return;
-    }
-
-    const updated = [...dataRecords];
-    const tgt = imageUploadTarget;
-
-    if (tgt !== "selection") {
-      if (uploadedUrls.length > 0) {
-        const i = updated.findIndex((r) => r.id === tgt);
-        if (i >= 0) updated[i] = { ...updated[i], photo: uploadedUrls[0] };
-      }
-    } else {
-      const targets = dataSelectedIds.size > 0
-        ? filteredRecords.filter((r) => dataSelectedIds.has(r.id))
-        : filteredRecords;
-      if (targets.length === 1 && uploadedUrls.length === 1) {
-        const i = updated.findIndex((r) => r.id === targets[0].id);
-        if (i >= 0) updated[i] = { ...updated[i], photo: uploadedUrls[0] };
+    Promise.all(
+      files.map((file) =>
+        new Promise<{ file: File; dataUrl: string }>((resolve) => {
+          const r = new FileReader();
+          r.onload = (ev) => resolve({ file, dataUrl: ev.target!.result as string });
+          r.readAsDataURL(file);
+        })
+      )
+    ).then((results) => {
+      const updated = [...dataRecords];
+      const tgt = imageUploadTarget;
+      if (tgt !== "selection") {
+        if (results.length > 0) {
+          const i = updated.findIndex((r) => r.id === tgt);
+          if (i >= 0) updated[i] = { ...updated[i], photo: results[0].dataUrl };
+        }
       } else {
-        // Check if any record has an explicit photo-filename column (e.g. "Photo", "Filename")
-        // If so, use EXACT filename matching only — no fuzzy/prefix fallback.
-        const photoColumnKeys = [
-          "Profile Picture", "profile_picture", "ProfilePicture", "profilePicture",
-          "Profile Pic", "profile_pic", "ProfilePic",
-          "Photo", "photo", "Photo File", "photo_file", "PhotoFile", "photoFile",
-          "Filename", "filename", "File Name", "file_name", "FileName",
-          "Photo Filename", "photo_filename", "Image", "image", "Image File", "image_file",
-        ] as const;
-        // Normalise a photo column value the same way as imageMatchEngine:
-        // strip \r\n, BOM (\ufeff), non-breaking space (\u00a0), Unicode NFC, lowercase.
-        const normalizePhotoKey = (s: string): string => {
-          let v = s.trim().replace(/[\r\n\t\u00a0\ufeff]/g, '');
-          try { v = v.normalize('NFC'); } catch { /* ignore */ }
-          return v.toLowerCase();
-        };
-        const getPhotoColumnValue = (r: ProjectDataRecord): string => {
-          for (const k of photoColumnKeys) {
-            const v = (r as Record<string, unknown>)[k];
-            if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
-          }
-          return "";
-        };
-        const hasPhotoColumn = targets.some((r) => getPhotoColumnValue(r) !== "");
-
-        files.forEach((f, idx) => {
-          const photoUrl = uploadedUrls[idx];
-          if (!photoUrl) return;
-          const filenameLower = f.name.toLowerCase();
-          const baseName = f.name.replace(/\.[^.]+$/, "").toLowerCase().trim();
-          let match: ProjectDataRecord | undefined;
-
-          if (hasPhotoColumn) {
-            // Exact filename match against photo column — both sides normalised
-            // (strips invisible chars, BOM, NBSP, lowercases)
-            match = targets.find((r) => normalizePhotoKey(getPhotoColumnValue(r)) === normalizePhotoKey(f.name));
-          } else {
-            match = targets.find((r) => {
+        const targets = dataSelectedIds.size > 0
+          ? filteredRecords.filter((r) => dataSelectedIds.has(r.id))
+          : filteredRecords;
+        if (targets.length === 1 && results.length === 1) {
+          const i = updated.findIndex((r) => r.id === targets[0].id);
+          if (i >= 0) updated[i] = { ...updated[i], photo: results[0].dataUrl };
+        } else {
+          results.forEach(({ file: f, dataUrl }) => {
+            const baseName = f.name.replace(/\.[^.]+$/, "").toLowerCase().trim();
+            const match = targets.find((r) => {
               // 1. Match by SchoolCode_AdmissionNumber prefix (e.g. "44837_10_Nitin_.jpg")
               const schoolCode = String(
                 r["School Code"] ?? r["schoolCode"] ?? r["school_code"] ?? ""
@@ -1810,12 +1484,14 @@ export function ProjectDetail() {
               const name = String(r["Name"] ?? r["name"] ?? "").toLowerCase().trim();
               if (name === baseName || baseName.startsWith(name) || name.startsWith(baseName)) return true;
               // 3. Match by name tokens appearing in filename segments
+              //    e.g. filename "44837_10_nitin_" contains segment "nitin" which matches name "nitin"
               if (name) {
                 const segments = baseName.split("_").filter(Boolean);
                 const nameTokens = name.split(/\s+/);
                 if (nameTokens.every((token) => segments.includes(token))) return true;
               }
-              // 4. Match by the record's existing photo field filename
+              // 4. Match by the record's existing photo field filename (for CSV-imported records
+              //    where the photo column contains a filename like "44837_10_Nitin_.jpg").
               const existingPhoto = String(getRecordPhoto(r) || "");
               const existingFilename = existingPhoto
                 .split("/").pop()!
@@ -1827,26 +1503,18 @@ export function ProjectDetail() {
                 existingFilename.startsWith(baseName)
               );
             });
-          }
-
-          if (match) {
-            const i = updated.findIndex((r) => r.id === match!.id);
-            if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
-          }
-        });
+            if (match) {
+              const i = updated.findIndex((r) => r.id === match.id);
+              if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
+            }
+          });
+        }
       }
-    }
-
-    saveDataRecords(id, dataCategory, toDbSafeRecords(updated));
-    setDataRecords(updated);
-    setImageUploadTarget("selection");
-    saveProjectRecords(id, dataCategory, toDbSafeRecords(updated)).then((ok) => {
-      if (ok) {
-        toast.success("Photo saved to server — will persist after refresh.");
-      } else {
-        toast.error("Photo uploaded but failed to save to server. It may disappear after refresh.");
-      }
+      saveDataRecords(id, dataCategory, updated);
+      setDataRecords(updated);
+      setImageUploadTarget("selection");
     });
+    e.target.value = "";
   };
 
   // ── Bulk Image Upload (ZIP or folder) ────────────────────────────────────
@@ -1855,34 +1523,186 @@ export function ProjectDetail() {
     if (!imageFiles.length || !id) return;
     setBulkImageProcessing(true);
     setBulkImageResults(null);
-    setManualAssign({});
 
-    // Store File objects keyed by filename for uploading when the user applies
-    const fileMap = new Map<string, File>();
-    imageFiles.forEach((f) => fileMap.set(f.name, f));
-    bulkImageFilesRef.current = fileMap;
-    // Ensure ZIP server-URL map is clear (this is a folder upload)
-    zipServerUrlsRef.current = new Map();
-
-    // Read all images as data URLs for the preview / matching UI
+    // Read all images as data URLs
     const loaded = await Promise.all(
       imageFiles.map(
         (file) =>
-          new Promise<{ name: string; dataUrl: string }>((resolve) => {
+          new Promise<{ file: File; dataUrl: string }>((resolve) => {
             const r = new FileReader();
-            r.onload = (ev) => resolve({ name: file.name, dataUrl: ev.target!.result as string });
+            r.onload = (ev) => resolve({ file, dataUrl: ev.target!.result as string });
             r.readAsDataURL(file);
           })
       )
     );
 
-    // Store dataUrls for UI preview
-    const urlMap = new Map<string, string>();
-    loaded.forEach(({ name, dataUrl }) => urlMap.set(name, dataUrl));
-    bulkImageDataUrlsRef.current = urlMap;
+    // Normalize a value: lowercase, trim, strip trailing Excel ".0" artifacts (e.g. "145.0" → "145")
+    const normVal = (s: unknown) =>
+      String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "");
 
-    const results = matchImages(loaded, dataRecords as Record<string, unknown>[]);
-    setBulkImageResults(results);
+    // Normalize a field key for comparison: lowercase, trim, collapse ALL
+    // separators (underscore, dot, multiple spaces) into a single space.
+    // Effect: "school_code" → "school code", "School Code" → "school code"  ← they now match!
+    const normKey = (k: string) =>
+      k.toLowerCase().trim().replace(/[_.\s]+/g, " ");
+
+    // Find a record field value by trying multiple key spellings.
+    // Matching strategy per key k:
+    //   1. Exact key match (rec[k])
+    //   2. normKey-equal match (unifies underscore/space/case differences)
+    const getField = (rec: ProjectDataRecord, ...keys: string[]): string => {
+      for (const k of keys) {
+        if (rec[k] !== undefined && rec[k] !== null) return normVal(rec[k]);
+        const nk = normKey(k);
+        const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
+        if (entry && entry[1] !== undefined && entry[1] !== null) return normVal(entry[1]);
+      }
+      return "";
+    };
+
+    const getName = (rec: ProjectDataRecord) =>
+      String(rec["Name"] ?? rec["name"] ?? rec["full_name"] ?? rec["Full Name"] ?? rec["Student Name"] ?? rec.id);
+
+    const matched: { userId: string; name: string; filename: string; dataUrl: string }[] = [];
+    const unmatched: { filename: string; reason: string }[] = [];
+    const duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[] = [];
+    const usedUserIds = new Set<string>();
+
+    // Internal fields that are never data-column values
+    const META_KEYS = new Set(["id", "projectId", "category", "photo"]);
+
+    /**
+     * Find matching records using TWO strategies (in order):
+     *
+     * 1. Named-field strategy — looks for well-known school-code and
+     *    roll/admission-number column names. Fast and precise.
+     *
+     * 2. Value-scan fallback — if strategy 1 returns nothing, scan every
+     *    field of every record looking for a record that has BOTH
+     *    fileSchoolCode and fileRollNumber as values in separate columns.
+     *    This is column-name-agnostic and handles any CSV format.
+     */
+    const findMatches = (fileSchoolCode: string, fileRollNumber: string): ProjectDataRecord[] => {
+      // ── Strategy 1: named fields ──────────────────────────────────────────
+      const byName = dataRecords.filter((rec) => {
+        const recSchoolCode = getField(
+          rec,
+          "school_code", "School Code", "schoolCode", "school_id", "School Id",
+          "Sch Code", "sch_code",
+        );
+        const recRoll = getField(
+          rec,
+          "roll_number", "Roll Number", "roll_no", "Roll No",
+          "rollNumber", "rollNo", "Roll_No", "Roll_Number",
+        );
+        const recAdm = getField(
+          rec,
+          "admission_number", "Admission Number", "admission_no", "Admission No",
+          "adm_no", "Adm No", "adm_number", "Adm Number", "Adm. No",
+          "admNo", "admissionNumber", "admissionNo",
+        );
+        const schoolMatch = recSchoolCode === fileSchoolCode;
+        const idMatch =
+          (recRoll !== "" && recRoll === fileRollNumber) ||
+          (recAdm  !== "" && recAdm  === fileRollNumber);
+        return schoolMatch && idMatch;
+      });
+
+      if (byName.length > 0) return byName;
+
+      // ── Strategy 2: value-scan (column-name-agnostic) ────────────────────
+      // For each record, collect data-column values (skip meta keys + long text
+      // like addresses).  A record matches if it has BOTH fileSchoolCode and
+      // fileRollNumber as values in DIFFERENT columns.
+      return dataRecords.filter((rec) => {
+        const values = Object.entries(rec)
+          .filter(([k]) => !META_KEYS.has(k))
+          .map(([, v]) => normVal(v))
+          .filter((v) => v.length > 0 && v.length <= 20); // ignore long text fields
+        const hasSchool = values.includes(fileSchoolCode);
+        const hasRoll   = values.includes(fileRollNumber);
+        return hasSchool && hasRoll && fileSchoolCode !== fileRollNumber;
+      });
+    };
+
+    loaded.forEach(({ file: f, dataUrl }) => {
+      // Strip extension
+      const basename = f.name.replace(/\.[^.]+$/, "");
+      const parts = basename.split("_");
+
+      // Filenames with at least 2 underscore-separated parts are matched using
+      // the format:  <school_code>_<roll_number>_[...rest]
+      // e.g.  145_3_Yash_katiyar.jpg  →  school_code=145, roll_number=3
+      if (parts.length < 2) {
+        unmatched.push({
+          filename: f.name,
+          reason: 'Invalid filename format — must contain underscore separator (e.g. 145_3_Name.jpg)',
+        });
+        return;
+      }
+
+      const fileSchoolCode = normVal(parts[0]);
+      const fileRollNumber = normVal(parts[1]);
+
+      // Both parts must be non-empty to attempt matching
+      if (!fileSchoolCode || !fileRollNumber) {
+        unmatched.push({
+          filename: f.name,
+          reason: 'Could not extract school code or roll number from filename',
+        });
+        return;
+      }
+
+      const hits = findMatches(fileSchoolCode, fileRollNumber);
+
+      if (hits.length === 0) {
+        // Build a debug hint showing the actual field keys in the first record
+        const sampleKeys = dataRecords.length > 0
+          ? Object.keys(dataRecords[0])
+              .filter((k) => !META_KEYS.has(k))
+              .slice(0, 6)
+              .join(", ")
+          : "no records loaded";
+        unmatched.push({
+          filename: f.name,
+          reason: `No match for school_code="${fileSchoolCode}" + id="${fileRollNumber}". ` +
+                  `Available columns: [${sampleKeys}]`,
+        });
+      } else if (hits.length > 1) {
+        const allMatchNames = hits.map(getName);
+        const rec = hits[0];
+        duplicates.push({ filename: f.name, allMatchNames, appliedName: getName(rec) });
+        // Still apply to first match
+        if (!usedUserIds.has(rec.id)) {
+          usedUserIds.add(rec.id);
+          matched.push({
+            userId: rec.id,
+            name: getName(rec),
+            filename: f.name,
+            dataUrl,
+          });
+        }
+      } else {
+        const rec = hits[0];
+        if (usedUserIds.has(rec.id)) {
+          duplicates.push({
+            filename: f.name,
+            allMatchNames: [getName(rec)],
+            appliedName: '(already assigned to another file)',
+          });
+        } else {
+          usedUserIds.add(rec.id);
+          matched.push({
+            userId: rec.id,
+            name: getName(rec),
+            filename: f.name,
+            dataUrl,
+          });
+        }
+      }
+    });
+
+    setBulkImageResults({ matched, unmatched, duplicates });
     setBulkImageProcessing(false);
   };
 
@@ -1895,172 +1715,41 @@ export function ProjectDetail() {
   const handleBulkImageZipChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const zipFile = e.target.files?.[0];
     e.target.value = "";
-    if (!zipFile || !id) return;
-
+    if (!zipFile) return;
     setBulkImageProcessing(true);
     setBulkImageResults(null);
-    setManualAssign({});
-    // Clear all stale refs from previous sessions
-    bulkImageFilesRef.current    = new Map();
-    bulkImageDataUrlsRef.current = new Map();
-    zipServerUrlsRef.current     = new Map();
-
     try {
-      // ── Step 1: Send ZIP to backend for extraction + upload only ──────────
-      // The backend extracts images and uploads each to the server, then
-      // returns [{filename, url}]. NO matching is done on the backend.
-      const result = await uploadZipImages(zipFile);
-
-      if (result.errors.length > 0) {
-        console.error("[zip-upload] upload errors:", result.errors);
-        toast.error(`${result.errors.length} file(s) failed to upload. Check console for details.`);
-      }
-
-      if (!result.files.length) {
-        toast.error("No images were extracted from the ZIP.");
-        return;
-      }
-
-      // ── Step 2: Store server URLs for use in Apply (no re-upload needed) ──
-      const serverUrlMap = new Map<string, string>();
-      result.files.forEach(({ filename, url }) => serverUrlMap.set(filename, url));
-      zipServerUrlsRef.current = serverUrlMap;
-      // Also populate dataUrlsRef with server URLs so preview images work
-      bulkImageDataUrlsRef.current = new Map(serverUrlMap);
-
-      // ── Step 3: Run the SAME matchImages() engine as folder upload ─────────
-      // Build ImageFile objects: use the server URL as the dataUrl so thumbnails
-      // can still render in the review panel via <img src="…">.
-      const imageFiles = result.files.map(({ filename, url }) => ({
-        name:    filename,
-        dataUrl: url,
-      }));
-
-      const matchResult = matchImages(imageFiles, dataRecords as Record<string, unknown>[]);
-      setBulkImageResults(matchResult);
-
-      // ── Step 4: Report summary toasts ─────────────────────────────────────
-      const matchedCount   = matchResult.matched.length;
-      const unmatchedCount = matchResult.unmatched.length;
-
-      if (matchedCount > 0) {
-        toast.success(
-          `${matchedCount} photo(s) matched. Click "Apply" to save them.`
-        );
-      }
-      if (unmatchedCount > 0) {
-        toast.error(
-          `${unmatchedCount} image(s) had no matching student. ` +
-          `Check that the "Profile Picture" column in your CSV matches the ZIP filenames exactly.`
-        );
-      }
-
-      // Keep dialog open so the user can review results and click Apply.
+      const zip = new JSZip();
+      const loaded = await zip.loadAsync(zipFile);
+      const imageEntries = Object.values(loaded.files).filter(
+        (entry) => !entry.dir && /\.(jpe?g|png|webp|gif|bmp)$/i.test(entry.name)
+      );
+      const files: File[] = await Promise.all(
+        imageEntries.map(async (entry) => {
+          const blob = await entry.async("blob");
+          // Use only the basename (not nested folder path)
+          const basename = entry.name.split("/").pop() ?? entry.name;
+          return new File([blob], basename, { type: blob.type || "image/jpeg" });
+        })
+      );
+      // processBulkImageFiles will handle setBulkImageProcessing(false)
+      await processBulkImageFiles(files);
+    } catch {
       setBulkImageProcessing(false);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error(`ZIP upload failed: ${msg}. Check your connection and try again.`);
-      setBulkImageProcessing(false);
-      setIsBulkImageUploadOpen(false);
     }
   };
 
-  const handleApplyBulkImages = async () => {
+  const handleApplyBulkImages = () => {
     if (!id || !bulkImageResults) return;
-
-    setBulkImageProcessing(true);
-
-    // ── Determine server URLs ──────────────────────────────────────────────
-    // ZIP upload: files already on server → use zipServerUrlsRef (no re-upload)
-    // Folder upload: files are local File objects → upload them now
-    const isZipMode = zipServerUrlsRef.current.size > 0;
-    const serverUrlByFilename = new Map<string, string>();
-
-    if (isZipMode) {
-      // Copy pre-uploaded ZIP server URLs
-      zipServerUrlsRef.current.forEach((url, filename) => {
-        serverUrlByFilename.set(filename, url);
-      });
-    } else {
-      // Folder upload: collect File objects and upload in chunks of 50
-      const fileMap = bulkImageFilesRef.current;
-      const filesToUpload: { filename: string; file: File }[] = [];
-      const collect = (filename: string) => {
-        const file = fileMap.get(filename);
-        if (file) filesToUpload.push({ filename, file });
-      };
-      bulkImageResults.matched.forEach(({ filename }) => collect(filename));
-      bulkImageResults.unmatched.forEach(({ filename }) => {
-        if (manualAssign[filename]) collect(filename);
-      });
-
-      if (filesToUpload.length > 0) {
-        const CHUNK = 50;
-        try {
-          for (let i = 0; i < filesToUpload.length; i += CHUNK) {
-            const slice = filesToUpload.slice(i, i + CHUNK);
-            const urls = await uploadImages(slice.map((x) => x.file));
-            slice.forEach(({ filename }, idx) => {
-              if (urls[idx]) serverUrlByFilename.set(filename, urls[idx]);
-            });
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          toast.error(`Photo upload failed: ${msg}. Please check your connection and try again.`);
-          setBulkImageProcessing(false);
-          setIsBulkImageUploadOpen(false);
-          setBulkImageResults(null);
-          setManualAssign({});
-          bulkImageDataUrlsRef.current = new Map();
-          bulkImageFilesRef.current    = new Map();
-          zipServerUrlsRef.current     = new Map();
-          return;
-        }
-      }
-    }
-
     const updated = [...dataRecords];
-
-    // Apply auto-matched images — only use server-hosted URLs (never base64)
-    bulkImageResults.matched.forEach(({ userId, filename }) => {
-      const targetId = manualAssign[filename] ?? userId;
-      const photoUrl = serverUrlByFilename.get(filename);
-      if (!photoUrl) return;
-      const i = updated.findIndex((r) => r.id === targetId);
-      if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
+    bulkImageResults.matched.forEach(({ userId, dataUrl }) => {
+      const i = updated.findIndex((r) => r.id === userId);
+      if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
     });
-
-    // Apply manually reassigned unmatched images — only use server-hosted URLs
-    bulkImageResults.unmatched.forEach(({ filename }) => {
-      const targetId = manualAssign[filename];
-      if (!targetId) return;
-      const photoUrl = serverUrlByFilename.get(filename);
-      if (!photoUrl) return;
-      const i = updated.findIndex((r) => r.id === targetId);
-      if (i >= 0) updated[i] = { ...updated[i], photo: photoUrl };
-    });
-
-    saveDataRecords(id, dataCategory, toDbSafeRecords(updated));
+    saveDataRecords(id, dataCategory, updated);
     setDataRecords(updated);
-    setBulkImageProcessing(false);
     setIsBulkImageUploadOpen(false);
     setBulkImageResults(null);
-    setManualAssign({});
-    bulkImageDataUrlsRef.current = new Map();
-    bulkImageFilesRef.current    = new Map();
-    zipServerUrlsRef.current     = new Map();
-    // Count records that now have a server-hosted photo (any URL that isn't base64)
-    const savedCount = updated.filter((r) => {
-      const p = String((r as Record<string, unknown>).photo ?? "");
-      return p.length > 0 && !p.startsWith("data:");
-    }).length;
-    saveProjectRecords(id, dataCategory, toDbSafeRecords(updated)).then((ok) => {
-      if (ok) {
-        toast.success(`${savedCount} photo(s) saved to server — will persist after refresh.`);
-      } else {
-        toast.error("Photos uploaded but failed to save to server. They may disappear after refresh.");
-      }
-    });
   };
 
   // ── Generate Bar Code (draws Code128-style bars onto a canvas per record) ──
@@ -2104,6 +1793,7 @@ export function ProjectDetail() {
   };
 
   const selectedRecords = dataRecords.filter((record) => dataSelectedIds.has(record.id));
+  const previewCapturePagesRef = useRef<Array<HTMLDivElement | null>>([]);
 
   const printLayout = useMemo(() => {
     const sheetWidthMm = Number(previewForm.sheetWidthMm);
@@ -2157,19 +1847,32 @@ export function ProjectDetail() {
     return pages;
   }, [selectedRecords, printLayout.cardsPerPage]);
 
-  // Count students without a real photo to show a warning in the dialog.
-  const missingPhotosCount = useMemo(
-    () => selectedRecords.filter((r) => !studentHasPhoto(r)).length,
-    [selectedRecords]
-  );
+  useEffect(() => {
+    previewCapturePagesRef.current = previewCapturePagesRef.current.slice(0, previewPrintPages.length);
+  }, [previewPrintPages.length]);
+
+  const waitForImagesToLoad = async (element: HTMLElement) => {
+    const images = Array.from(element.querySelectorAll("img"));
+    await Promise.all(
+      images.map((image) => new Promise<void>((resolve) => {
+        if (image.complete && image.naturalWidth > 0) {
+          resolve();
+          return;
+        }
+        const done = () => resolve();
+        image.addEventListener("load", done, { once: true });
+        image.addEventListener("error", done, { once: true });
+      }))
+    );
+  };
 
   const handleOpenGeneratePreview = () => {
+    if (!selectedRecords.length) return;
+
     const templateFromGroup = dataGroups
       .find((group) => selectedRecords.some((record) => record.groupId === group.id) && Boolean(group.templateId))
       ?.templateId;
-    // Prefer own (non-global) templates as default selection
     const defaultTemplate = previewTemplates.find((template) => template.id === templateFromGroup)
-      || previewTemplates.find((t) => !t.isGlobal)
       || previewTemplates[0]
       || null;
 
@@ -2185,16 +1888,16 @@ export function ProjectDetail() {
       sheetHeightMm: String(PAGE_SIZE_DIMENSIONS.A4.height),
       fileName: `${project?.name || "project"}_${dataCategory}_preview`,
     }));
-    setPreviewDialogStep(1);
     setPreviewError("");
-    setPreviewProgressText("");
     setIsGeneratePreviewOpen(true);
   };
 
   const handleGeneratePreviewPdf = async () => {
     if (!id) return;
 
-    const selectedTemplate = previewTemplates.find((t) => t.id === previewForm.templateId);
+    const selectedTemplate = previewTemplates.find((template) => template.id === previewForm.templateId);
+    const selectedTemplateSlug = selectedTemplate ? getTemplateSlugForRender(selectedTemplate) : "";
+    const selectedTemplateDiagnostics = selectedTemplate ? previewTemplateDiagnosticsMap[selectedTemplate.id] : undefined;
     const sheetWidthMm = printLayout.sheetWidthMm;
     const sheetHeightMm = printLayout.sheetHeightMm;
     const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
@@ -2202,130 +1905,80 @@ export function ProjectDetail() {
     const rowMarginMm = Number(previewForm.rowMarginMm || "0");
     const columnMarginMm = Number(previewForm.columnMarginMm || "0");
 
-    if (!selectedRecords.length) { setPreviewError("Please select at least one record."); return; }
-    if (!previewForm.templateId || !selectedTemplate) { setPreviewError("Please select a template."); return; }
-    if (!previewForm.fileName.trim()) { setPreviewError("File name is required."); return; }
-    if (!Number.isFinite(sheetWidthMm) || sheetWidthMm <= 0 || !Number.isFinite(sheetHeightMm) || sheetHeightMm <= 0) {
-      setPreviewError("Sheet size must be valid positive values."); return;
+    if (!selectedRecords.length) {
+      setPreviewError("Please select at least one record.");
+      return;
     }
-    if (pageMarginTopMm < 0 || pageMarginLeftMm < 0 || rowMarginMm < 0 || columnMarginMm < 0) {
-      setPreviewError("Margins cannot be negative."); return;
+    if (!previewForm.templateId || !selectedTemplate) {
+      setPreviewError("Please select a template.");
+      return;
+    }
+    if (!selectedTemplateSlug) {
+      setPreviewError("Selected template could not be mapped to a render layout.");
+      return;
+    }
+    if (!selectedTemplateDiagnostics?.hasDesignElements) {
+      setPreviewError("No preview available. Please configure the template.");
+      return;
+    }
+    if (!previewForm.fileName.trim()) {
+      setPreviewError("File name is required.");
+      return;
+    }
+    if (!Number.isFinite(sheetWidthMm) || !Number.isFinite(sheetHeightMm) || sheetWidthMm <= 0 || sheetHeightMm <= 0) {
+      setPreviewError("Sheet size must be valid positive values.");
+      return;
+    }
+    if (!Number.isFinite(pageMarginTopMm) || !Number.isFinite(pageMarginLeftMm) || pageMarginTopMm < 0 || pageMarginLeftMm < 0) {
+      setPreviewError("Page margins cannot be negative.");
+      return;
+    }
+    if (!Number.isFinite(rowMarginMm) || !Number.isFinite(columnMarginMm) || rowMarginMm < 0 || columnMarginMm < 0) {
+      setPreviewError("Row and column margins cannot be negative.");
+      return;
     }
 
     setPreviewError("");
     setIsGeneratingPreview(true);
-    setPreviewProgressText("Preparing template…");
-
     try {
-      const cardWidthMm = selectedTemplate.canvas?.width || 54;
-      const cardHeightMm = selectedTemplate.canvas?.height || 86;
-      const cardWidthPx = Math.max(1, Math.round(cardWidthMm * MM_TO_PX));
-      const cardHeightPx = Math.max(1, Math.round(cardHeightMm * MM_TO_PX));
-
-      // ── Extract the first-page canvas object from the template JSON ───────
-      // Supported formats: { canvas: {...} }, { pages: [{canvas:{...}}] }, or
-      // the canvas object itself ({ objects: [...], ... }).
-      let canvasData: object | null = null;
-      if (selectedTemplate.canvasJSON) {
-        try {
-          const parsed = JSON.parse(selectedTemplate.canvasJSON) as Record<string, unknown>;
-          if (Array.isArray(parsed.pages) && parsed.pages.length > 0) {
-            canvasData = ((parsed.pages[0] as { canvas?: object }).canvas) ?? null;
-          } else if (parsed.canvas && typeof parsed.canvas === "object") {
-            canvasData = parsed.canvas as object;
-          } else if (Array.isArray((parsed as { objects?: unknown }).objects)) {
-            canvasData = parsed as object;
-          }
-        } catch {
-          /* ignore JSON errors — fall back to thumbnail below */
-        }
+      if (!previewPrintPages.length) {
+        throw new Error("No preview pages generated.");
       }
-
-      const baseJsonStr = canvasData ? JSON.stringify(canvasData) : null;
-      const hasThumbnail = typeof selectedTemplate.thumbnail === "string" && selectedTemplate.thumbnail.trim().length > 0;
-
-      if (!baseJsonStr && !hasThumbnail) {
-        throw new Error("Template has no design. Open it in the Designer and save first.");
-      }
-
-      // ── Layout calculation ────────────────────────────────────────────────
-      const usableWidthMm  = sheetWidthMm  - pageMarginLeftMm * 2;
-      const usableHeightMm = sheetHeightMm - pageMarginTopMm  * 2;
-      const columns     = Math.max(1, Math.floor((usableWidthMm  + columnMarginMm) / (cardWidthMm  + columnMarginMm)));
-      const rows        = Math.max(1, Math.floor((usableHeightMm + rowMarginMm)    / (cardHeightMm + rowMarginMm)));
-      const cardsPerPage = columns * rows;
 
       const orientation = sheetWidthMm > sheetHeightMm ? "landscape" : "portrait";
-      const doc = new jsPDF({ orientation, unit: "mm", format: [sheetWidthMm, sheetHeightMm], compress: true });
+      const doc = new jsPDF({
+        orientation,
+        unit: "mm",
+        format: [sheetWidthMm, sheetHeightMm],
+        compress: true,
+      });
 
-      // ── Render each record ────────────────────────────────────────────────
-      for (let i = 0; i < selectedRecords.length; i += 1) {
-        const record = selectedRecords[i];
-        const cardIndexOnPage = i % cardsPerPage;
-        const pageNum = Math.floor(i / cardsPerPage);
+      for (let pageIndex = 0; pageIndex < previewPrintPages.length; pageIndex += 1) {
+        const pageElement = previewCapturePagesRef.current[pageIndex];
+        if (!pageElement) {
+          throw new Error(`Unable to render preview page ${pageIndex + 1}.`);
+        }
 
-        if (cardIndexOnPage === 0 && pageNum > 0) {
+        await waitForImagesToLoad(pageElement);
+        const canvas = await html2canvas(pageElement, {
+          useCORS: true,
+          scale: 2,
+          backgroundColor: "#ffffff",
+        });
+        const imageData = canvas.toDataURL("image/png", 1);
+
+        if (pageIndex > 0) {
           doc.addPage([sheetWidthMm, sheetHeightMm], orientation);
         }
-
-        setPreviewProgressText(`Rendering card ${i + 1} of ${selectedRecords.length}…`);
-
-        const col  = cardIndexOnPage % columns;
-        const row  = Math.floor(cardIndexOnPage / columns);
-        const xMm  = pageMarginLeftMm + col * (cardWidthMm  + columnMarginMm);
-        const yMm  = pageMarginTopMm  + row * (cardHeightMm + rowMarginMm);
-
-        let pngDataUri: string | null = null;
-
-        // ── Path A: Render via Fabric.js with {{VARIABLE}} substitution ──
-        if (baseJsonStr) {
-          try {
-            // Substitute all {{KEY}} placeholders with values from the record.
-            // JSON.stringify(val).slice(1,-1) gives a properly JSON-escaped string
-            // so special characters like `"` or `\n` don't corrupt the JSON.
-            const substituted = baseJsonStr.replace(/\{\{([^}]+)\}\}/g, (_, rawKey: string) => {
-              const val = mapData(`{{${rawKey}}}`, record);
-              return JSON.stringify(val).slice(1, -1);
-            });
-
-            const canvasEl = document.createElement("canvas");
-            const fc = new fabric.StaticCanvas(canvasEl, {
-              width: cardWidthPx,
-              height: cardHeightPx,
-              renderOnAddRemove: false,
-              enableRetinaScaling: false,
-            } as ConstructorParameters<typeof fabric.StaticCanvas>[1]);
-            try {
-              await fc.loadFromJSON(substituted);
-              fc.renderAll();
-              pngDataUri = fc.toDataURL({ format: "png", multiplier: 2 } as Parameters<typeof fc.toDataURL>[0]);
-            } finally {
-              fc.dispose();
-            }
-          } catch (fabricErr) {
-            console.warn("[PDF] Fabric render failed for card", i + 1, fabricErr);
-            pngDataUri = null; // fall through to thumbnail
-          }
-        }
-
-        // ── Path B: Thumbnail fallback ────────────────────────────────────
-        if (!pngDataUri && hasThumbnail) {
-          pngDataUri = selectedTemplate.thumbnail!;
-        }
-
-        if (pngDataUri) {
-          doc.addImage(pngDataUri, "PNG", xMm, yMm, cardWidthMm, cardHeightMm);
-        }
+        doc.addImage(imageData, "PNG", 0, 0, sheetWidthMm, sheetHeightMm, undefined, "FAST");
       }
 
-      setPreviewProgressText("Saving PDF…");
       doc.save(`${previewForm.fileName.trim()}.pdf`);
       setIsGeneratePreviewOpen(false);
     } catch (error) {
       setPreviewError((error as Error).message || "Failed to generate preview PDF.");
     } finally {
       setIsGeneratingPreview(false);
-      setPreviewProgressText("");
     }
   };
 
@@ -2764,17 +2417,13 @@ export function ProjectDetail() {
                   <div className="bg-muted/40 rounded-lg p-4 flex items-center justify-center min-h-[200px]">
                     {canRenderSelectedTemplateImage ? (
                       <img
-                        src={previewTemplate.thumbnail}
+                        src={previewTemplate.thumbnail ||
+                          bgGeneratedPreviews[previewTemplate.id] ||
+                          bgGeneratedPreviews[(previewTemplate as any).remoteId ?? ""] || ""}
                         alt={previewTemplate.templateName}
                         className="max-w-full max-h-[320px] object-contain rounded shadow-md border border-border"
                         onError={() => markTemplatePreviewBroken(previewTemplate.id)}
                       />
-                    ) : missingProjectPreviewIds.includes(previewTemplate.id) ? (
-                      // Preview is being generated in background — show a loading spinner
-                      <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
-                        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-                        <p className="text-sm text-muted-foreground">Generating preview…</p>
-                      </div>
                     ) : selectedPreviewTemplateDiagnostics?.hasDesignElements && previewTemplate.canvasJSON ? (
                       <TemplatePreviewCanvas
                         canvasJSON={previewTemplate.canvasJSON}
@@ -2786,34 +2435,25 @@ export function ProjectDetail() {
                       <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
                         <Layers className="h-8 w-8 text-muted-foreground" />
                         <p className="text-sm text-muted-foreground">
-                          {selectedPreviewTemplateDiagnostics?.fallbackMessage || "No preview available for this template."}
+                          No preview available. Open in designer to add content.
                         </p>
                       </div>
                     )}
                   </div>
 
-                  {!missingProjectPreviewIds.includes(previewTemplate.id) && !selectedPreviewTemplateDiagnostics?.hasDesignElements && (
+                  {!selectedPreviewTemplateDiagnostics?.hasDesignElements
+                    && !previewTemplate.thumbnail
+                    && !bgGeneratedPreviews[previewTemplate.id]
+                    && !bgGeneratedPreviews[((previewTemplate as any).remoteId as string) ?? ""] && (
                     <p className="text-xs text-destructive bg-destructive/10 rounded px-2.5 py-2">
                       No preview available. Please configure the template.
                     </p>
                   )}
 
                   {Boolean(selectedPreviewTemplateDiagnostics?.missingFieldKeys.length) && (
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 flex items-start gap-2.5">
-                      <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5" />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-semibold text-amber-800">Some fields need mapping</p>
-                        <p className="text-xs text-amber-700 mt-0.5">
-                          {selectedPreviewTemplateDiagnostics!.missingFieldKeys.length} field{selectedPreviewTemplateDiagnostics!.missingFieldKeys.length > 1 ? "s" : ""} in this template are not connected to your data source yet.
-                        </p>
-                        <button
-                          className="text-xs font-medium text-amber-800 underline underline-offset-2 mt-1"
-                          onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
-                        >
-                          Set up field mapping →
-                        </button>
-                      </div>
-                    </div>
+                    <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2">
+                      Missing field mapping: {selectedPreviewTemplateDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
+                    </p>
                   )}
 
                   <div className="space-y-1 text-sm">
@@ -2827,56 +2467,16 @@ export function ProjectDetail() {
             </DialogContent>
           </Dialog>
 
-          {/* ── Remove-from-project confirmation dialog ── */}
-          <Dialog open={!!deleteConfirmTemplate} onOpenChange={(open) => { if (!open && !isDeletingTemplate) setDeleteConfirmTemplate(null); }}>
-            <DialogContent className="max-w-sm">
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-2 text-destructive">
-                  <Trash2 className="h-4 w-4" /> Remove Template
-                </DialogTitle>
-              </DialogHeader>
-              <p className="text-sm text-muted-foreground">
-                Remove{" "}
-                <strong className="font-medium text-foreground">"{deleteConfirmTemplate?.templateName}"</strong>{" "}
-                from this project? This only removes it from the project — it won't affect the Template Gallery.
-              </p>
-              <div className="flex justify-end gap-2 mt-2">
-                <Button variant="outline" size="sm" disabled={isDeletingTemplate} onClick={() => setDeleteConfirmTemplate(null)}>
-                  Cancel
-                </Button>
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  disabled={isDeletingTemplate}
-                  onClick={() => deleteConfirmTemplate && void handleDeleteTemplate(deleteConfirmTemplate)}
-                >
-                  {isDeletingTemplate ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />Removing…</> : "Remove"}
-                </Button>
-              </div>
-            </DialogContent>
-          </Dialog>
-
           <Card className="shadow-md">
             <CardHeader>
-              <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center justify-between">
                 <CardTitle>Project Templates</CardTitle>
-                <div className="flex gap-2 flex-wrap">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="gap-2"
-                    onClick={() => id && navigate(`/template-gallery?projectId=${id}`)}
-                  >
-                    <Globe className="h-4 w-4" />Open Template Gallery
+                <div className="flex gap-2">
+                  <Button size="sm" variant="outline" className="gap-2" onClick={() => previewTemplates.length > 0 && setPreviewTemplate(previewTemplates[0])} disabled={previewTemplates.length === 0}>
+                    <Download className="h-4 w-4" />Generate Preview
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="gap-2"
-                    onClick={handleOpenGeneratePreview}
-                    disabled={previewTemplateGroups.projectTemplates.length === 0}
-                  >
-                    <Settings2 className="h-4 w-4" />Generate Preview
+                  <Button size="sm" variant="outline" className="gap-2" onClick={() => navigate(`/template-gallery?projectId=${encodeURIComponent(id ?? "")}`)}>
+                    <LayoutGrid className="h-4 w-4" />Open Template Gallery
                   </Button>
                   <Button size="sm" className="gap-2" onClick={() => setIsCreateTemplateOpen(true)}>
                     <Plus className="h-4 w-4" />Create new template
@@ -2885,81 +2485,83 @@ export function ProjectDetail() {
               </div>
             </CardHeader>
             <CardContent>
-              {remoteTemplatesError && (
-                <div className="mb-3 flex items-center gap-2 rounded-md border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-800">
-                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                  <span>{remoteTemplatesError}</span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="ml-auto h-6 px-2 text-xs text-yellow-800 hover:bg-yellow-100"
-                    onClick={() => { setRemoteTemplatesError(""); refetchTemplates(); }}
-                  >
-                    Retry
-                  </Button>
+              {remoteTemplatesLoading && remoteTemplates.length === 0 && !remoteTemplatesError ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {[1, 2, 3].map((i) => (
+                    <div key={i} className="border rounded-lg p-4 space-y-3 animate-pulse">
+                      <div className="bg-muted/50 rounded h-28" />
+                      <div className="bg-muted/50 rounded h-4 w-2/3" />
+                      <div className="bg-muted/50 rounded h-3 w-1/2" />
+                      <div className="flex gap-2">
+                        <div className="bg-muted/50 rounded h-8 flex-1" />
+                        <div className="bg-muted/50 rounded h-8 flex-1" />
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              )}
-              {remoteTemplatesLoading && previewTemplates.length === 0 ? (
-                <div className="text-center py-12">
-                  <Loader2 className="h-8 w-8 mx-auto text-muted-foreground mb-3 animate-spin" />
-                  <p className="text-muted-foreground text-sm">Loading templates…</p>
-                </div>
-              ) : previewTemplateGroups.projectTemplates.length === 0 ? (
+              ) : previewTemplates.length === 0 ? (
                 <div className="text-center py-12">
                   <Layers className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
-                  <p className="text-muted-foreground mb-4">No templates attached to this project yet</p>
-                  <p className="text-sm text-muted-foreground mb-4">Use Template Gallery to browse and attach public templates.</p>
-                  <div className="flex gap-2 justify-center">
-                    <Button variant="outline" onClick={() => id && navigate(`/template-gallery?projectId=${id}`)}>Browse Template Gallery</Button>
-                    <Button variant="outline" onClick={() => setIsCreateTemplateOpen(true)}>
-                      <Plus className="h-4 w-4 mr-2" />Create new template
-                    </Button>
-                  </div>
+                  <p className="text-muted-foreground mb-4">No templates created yet</p>
+                  <Button variant="outline" onClick={() => setIsCreateTemplateOpen(true)}>
+                    <Plus className="h-4 w-4 mr-2" />Create new template
+                  </Button>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {previewTemplateGroups.projectTemplates.map((tmpl) => {
-                    const previewDiagnostics = templateDiagnosticsMap[tmpl.id];
-                    const showThumbnail = Boolean(tmpl.thumbnail && !brokenTemplatePreviewIds[tmpl.id]);
-                    // Is the hook currently generating a preview for this template?
-                    const isGeneratingPreview = !showThumbnail && activeGeneratingProject.has(tmpl.id);
-                    // Blank card shape SVG so cards always look like cards, not error states
-                    const w = tmpl.canvas.width || 54;
-                    const h = tmpl.canvas.height || 86;
-                    const blankPlaceholder = `data:image/svg+xml,${encodeURIComponent(
-                      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">` +
-                      `<rect width="${w}" height="${h}" rx="2" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>` +
-                      `<text x="${w/2}" y="${h * 0.45}" font-family="sans-serif" font-size="${Math.max(5, Math.min(w,h)*0.1)}" fill="#94a3b8" text-anchor="middle" dominant-baseline="middle">No Design Yet</text>` +
-                      `<text x="${w/2}" y="${h * 0.62}" font-family="sans-serif" font-size="${Math.max(4, Math.min(w,h)*0.08)}" fill="#cbd5e1" text-anchor="middle" dominant-baseline="middle">${w}\xd7${h}mm</text>` +
-                      `</svg>`
-                    )}`;
-                    // Own project's template (has edit/delete rights)
+                  {previewTemplates.map((tmpl) => {
+                    const previewDiagnostics = previewTemplateDiagnosticsMap[tmpl.id];
+                    const remoteIdForTmpl = (tmpl as any).remoteId as string | undefined;
+                    // When the primary thumbnail is broken, try bgGeneratedPreviews fallbacks.
+                    // Also allow the remote API thumbnail (from remoteTemplates) as a fallback
+                    // in case the local copy stored a relative/stale URL that 404s locally.
+                    const apiVersionThumbnail = remoteIdForTmpl
+                      ? (remoteTemplates.find(r => r.id === remoteIdForTmpl)?.thumbnail)
+                      : undefined;
+                    const isPrimaryBroken = brokenTemplatePreviewIds[tmpl.id];
+                    // Always prefer absolute SFTP URL from API — it's the most reliable source.
+                    // Only fall back to tmpl.thumbnail if it's also absolute (relative paths 404
+                    // in dev). Background-generated previews are used as a last resort.
+                    const effectiveThumbnail =
+                      (apiVersionThumbnail?.startsWith('http') ? apiVersionThumbnail : null)
+                      || (!isPrimaryBroken && tmpl.thumbnail?.startsWith('http') ? tmpl.thumbnail : null)
+                      || bgGeneratedPreviews[tmpl.id]
+                      || bgGeneratedPreviews[remoteIdForTmpl ?? ""]
+                      || (!isPrimaryBroken ? tmpl.thumbnail : null)
+                      || undefined;
+                    const canRenderCardImage = Boolean(effectiveThumbnail);
+                    const currentClientId = project?.clientId ?? "";
+                    // Own project's template
                     const isOwnTemplate = tmpl.projectId === id;
+                    // Same client but different project
+                    const isSameClientTemplate = !isOwnTemplate
+                      && Boolean(currentClientId)
+                      && (tmpl.clientId === currentClientId);
 
                     return (
                       <div key={tmpl.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow space-y-3">
                         <div className="bg-muted/30 rounded flex items-center justify-center h-28 relative overflow-hidden">
-                          {showThumbnail ? (
+                          {canRenderCardImage ? (
                             <img
-                              src={tmpl.thumbnail}
+                              src={effectiveThumbnail}
                               alt={tmpl.templateName}
-                              loading="lazy"
-                              decoding="async"
                               className="max-h-full max-w-full object-contain rounded shadow"
-                              onError={() => handleProjectTemplateImgError(tmpl.id)}
-                              onLoad={(e) => handleProjectTemplateImgLoad(e, tmpl.id)}
+                              onError={() => markTemplatePreviewBroken(tmpl.id)}
                             />
-                          ) : isGeneratingPreview ? (
-                            <div className="flex flex-col items-center gap-1 text-muted-foreground">
-                              <Loader2 className="h-6 w-6 animate-spin" />
-                              <span className="text-[10px]">Generating…</span>
-                            </div>
+                          ) : previewDiagnostics?.hasDesignElements && tmpl.canvasJSON ? (
+                            <TemplatePreviewCanvas
+                              canvasJSON={tmpl.canvasJSON}
+                              canvasConfig={tmpl.canvas}
+                              maxWidth={160}
+                              maxHeight={112}
+                            />
                           ) : (
-                            <img
-                              src={blankPlaceholder}
-                              alt={`${tmpl.templateName} — no design yet`}
-                              className="max-h-full max-w-full object-contain rounded"
-                            />
+                            <div className="h-full w-full bg-muted/20 flex flex-col items-center justify-center gap-1.5 px-3 text-center">
+                              <Layers className="h-5 w-5 text-muted-foreground" />
+                              <p className="text-[11px] text-muted-foreground leading-snug">
+                                No preview yet. Open in designer to add content.
+                              </p>
+                            </div>
                           )}
                         </div>
                         <div>
@@ -2967,16 +2569,26 @@ export function ProjectDetail() {
                           <div className="flex gap-1 mt-1 flex-wrap">
                             <Badge variant="secondary" className="text-[10px] capitalize">{tmpl.templateType.replace("_"," ")}</Badge>
                             <Badge variant="outline" className="text-[10px]">{tmpl.canvas.width}x{tmpl.canvas.height}mm</Badge>
+                            {isSameClientTemplate && (
+                              <Badge variant="outline" className="text-[10px] gap-0.5 text-emerald-700 border-emerald-300 bg-emerald-50">
+                                Client
+                              </Badge>
+                            )}
+                            {tmpl.isGlobal && (
+                              <Badge variant="outline" className="text-[10px] gap-0.5 text-primary border-primary/40 bg-primary/5">
+                                <Globe className="h-2.5 w-2.5" />Global
+                              </Badge>
+                            )}
                           </div>
-                          {!previewDiagnostics?.hasDesignElements && (
-                            <Badge variant="outline" className="text-[10px] mt-1 text-muted-foreground border-dashed">
-                              Draft
-                            </Badge>
+                          {!previewDiagnostics?.hasDesignElements && !effectiveThumbnail && (
+                            <p className="text-[11px] text-destructive mt-1">
+                              No preview available. Please configure the template.
+                            </p>
                           )}
                           {Boolean(previewDiagnostics?.missingFieldKeys.length) && (
-                            <Badge variant="outline" className="text-[10px] mt-1 text-amber-700 border-amber-300 bg-amber-50 gap-1">
-                              <AlertTriangle className="h-2.5 w-2.5" />Needs Setup
-                            </Badge>
+                            <p className="text-[11px] text-amber-700 mt-1">
+                              Missing field mapping: {previewDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
+                            </p>
                           )}
                           {tmpl.applicableFor && <p className="text-xs text-muted-foreground mt-1 truncate">For: {tmpl.applicableFor}</p>}
                           <p className="text-xs text-muted-foreground">{tmpl.createdAt}</p>
@@ -2985,85 +2597,128 @@ export function ProjectDetail() {
                           <Button size="sm" variant="outline" className="flex-1 text-xs gap-1" onClick={() => setPreviewTemplate(tmpl)}>
                             <Download className="h-3 w-3" />Preview
                           </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="flex-1 text-xs gap-1 text-primary hover:text-primary"
-                            onClick={() => {
-                              const rawMargin = (tmpl as any).margin ?? {};
-                              const normalizedMargin = {
-                                top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
-                                left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
-                                right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
-                                bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
-                              };
-                              const designerConfig = {
-                                templateName: tmpl.templateName,
-                                templateType: tmpl.templateType,
-                                canvas: tmpl.canvas,
-                                margin: normalizedMargin,
-                              };
-                              localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
-                              localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-                                projectId: project.id,
-                                templateId: tmpl.id,
-                                projectName: project.name,
-                                templateName: tmpl.templateName,
-                              }));
-                              navigate("/designer-studio");
-                            }}
-                          >
-                            <Pencil className="h-3 w-3" />Edit
-                          </Button>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button size="sm" variant="ghost" className="px-2">
-                                <MoreVertical className="h-3.5 w-3.5" />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="min-w-[170px]">
-                              <DropdownMenuItem
-                                className="gap-2 text-xs cursor-pointer"
-                                onClick={() => {
-                                  const rawMargin = (tmpl as any).margin ?? {};
-                                  const normalizedMargin = {
-                                    top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
-                                    left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
-                                    right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
-                                    bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
-                                  };
-                                  localStorage.setItem("vendor_designer_template_config", JSON.stringify({
-                                    templateName: tmpl.templateName,
-                                    templateType: tmpl.templateType,
-                                    canvas: tmpl.canvas,
-                                    margin: normalizedMargin,
-                                  }));
-                                  localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-                                    projectId: project.id,
-                                    templateId: tmpl.id,
-                                    projectName: project.name,
-                                    templateName: tmpl.templateName,
-                                  }));
-                                  navigate("/designer-studio");
+                          <>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="flex-1 text-xs gap-1 text-primary hover:text-primary"
+                                disabled={editingTemplateId === tmpl.id}
+                                onClick={async () => {
+                                  setEditingTemplateId(tmpl.id);
+                                  try {
+                                    const rawMargin = (tmpl as any).margin ?? {};
+                                    const normalizedMargin = {
+                                      top: Number(rawMargin.top ?? (tmpl as any).marginTop ?? 0) || 0,
+                                      left: Number(rawMargin.left ?? (tmpl as any).marginLeft ?? 0) || 0,
+                                      right: Number(rawMargin.right ?? (tmpl as any).marginRight ?? 0) || 0,
+                                      bottom: Number(rawMargin.bottom ?? (tmpl as any).marginBottom ?? 0) || 0,
+                                    };
+
+                                    // Determine the MongoDB ID to fetch full canvas data
+                                    const remoteIdForEdit = ((tmpl as any).remoteId as string | undefined) || tmpl.id;
+                                    const isMongoId = /^[0-9a-f]{24}$/i.test(remoteIdForEdit);
+
+                                    // Fetch full template (with canvasJSON) from API
+                                    // because the list response strips canvasJSON for performance.
+                                    let fullCanvasJSON = tmpl.canvasJSON || "";
+                                    let resolvedCanvas = tmpl.canvas;
+                                    if (isMongoId) {
+                                      try {
+                                        const full = await getTemplateById(remoteIdForEdit, { timeoutMs: 10000 });
+                                        const dd = (full.designData || {}) as Record<string, any>;
+                                        fullCanvasJSON =
+                                          typeof dd.canvasJSON === "string" ? dd.canvasJSON
+                                          : typeof dd.canvasJson === "string" ? dd.canvasJson
+                                          : fullCanvasJSON;
+                                        // Also refresh canvas dimensions from individual fetch
+                                        if (dd.canvas?.width && dd.canvas?.height) {
+                                          resolvedCanvas = { width: Number(dd.canvas.width), height: Number(dd.canvas.height) };
+                                        }
+                                      } catch {
+                                        // Non-fatal – proceed with whatever data we have
+                                      }
+                                    }
+
+                                    const designerConfig = {
+                                      templateName: tmpl.templateName,
+                                      templateType: tmpl.templateType,
+                                      canvas: resolvedCanvas,
+                                      margin: normalizedMargin,
+                                    };
+
+                                    // Build the synthetic template id for this session.
+                                    // We use the remoteId so DesignerStudio's auto-save can
+                                    // write back to the right localStorage entry later.
+                                    const sessionTemplateId = `TMPL-edit-${remoteIdForEdit}`;
+
+                                    // Try storing a lightweight entry in localStorage (no canvasJSON
+                                    // to avoid QuotaExceededError on large base64 image templates).
+                                    // DesignerStudio will read the full canvasJSON from sessionStorage.
+                                    const existsLocally = loadAllProjectTemplates().some(
+                                      (t) => t.id === sessionTemplateId
+                                    );
+                                    if (!existsLocally) {
+                                      try {
+                                        addProjectTemplate({
+                                          projectId: id ?? "",
+                                          clientId: project?.clientId ?? "",
+                                          templateName: tmpl.templateName,
+                                          templateType: tmpl.templateType,
+                                          canvas: resolvedCanvas,
+                                          margin: normalizedMargin,
+                                          applicableFor: tmpl.applicableFor,
+                                          // Omit canvasJSON — stored in sessionStorage below
+                                          thumbnail: tmpl.thumbnail,
+                                          isPublic: tmpl.isPublic ?? false,
+                                          remoteId: remoteIdForEdit,
+                                        } as any);
+                                      } catch {
+                                        // Quota exceeded for metadata too — skip, sessionStorage path handles it
+                                      }
+                                    } else {
+                                      try {
+                                        updateProjectTemplate(sessionTemplateId, {
+                                          canvas: resolvedCanvas,
+                                        });
+                                      } catch { /* quota — skip */ }
+                                    }
+
+                                    // Pass heavy canvasJSON via sessionStorage to avoid quota errors.
+                                    // DesignerStudio reads DESIGNER_PRELOAD_KEY on mount and clears it.
+                                    if (fullCanvasJSON) {
+                                      try {
+                                        sessionStorage.setItem("vendor_designer_preload", JSON.stringify({
+                                          templateId: sessionTemplateId,
+                                          canvasJSON: fullCanvasJSON,
+                                          config: designerConfig,
+                                        }));
+                                      } catch {
+                                        // sessionStorage also full — DesignerStudio API fallback handles it
+                                      }
+                                    }
+
+                                    localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
+                                    localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+                                      projectId: project.id,
+                                      templateId: sessionTemplateId,
+                                      projectName: project.name,
+                                      templateName: tmpl.templateName,
+                                    }));
+                                    navigate("/designer-studio");
+                                  } finally {
+                                    setEditingTemplateId(null);
+                                  }
                                 }}
                               >
-                                <Pencil className="h-3.5 w-3.5" /> Edit in Designer
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                className="gap-2 text-xs cursor-pointer"
-                                onClick={() => setPreviewTemplate(tmpl)}
-                              >
-                                <Download className="h-3.5 w-3.5" /> Preview
-                              </DropdownMenuItem>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuItem
-                                className="gap-2 text-xs text-destructive focus:text-destructive focus:bg-destructive/10 cursor-pointer"
-                                onClick={() => setDeleteConfirmTemplate(tmpl)}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" /> Remove from Project
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
+                                <Pencil className="h-3 w-3" />
+                                {editingTemplateId === tmpl.id ? "Loading…" : "Edit"}
+                              </Button>
+                              {isOwnTemplate && (
+                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
+                                  <Trash2 className="h-3 w-3" />
+                                </Button>
+                              )}
+                            </>
                         </div>
                       </div>
                     );
@@ -3473,8 +3128,6 @@ export function ProjectDetail() {
                       setDataFields(fields);
                       setDataRecords(records);
                       setShowImportWizard(false);
-                      // Persist imported records to backend for cross-device / post-refresh access
-                      void saveProjectRecords(id, dataCategory, toDbSafeRecords(records));
                     }}
                     onCancel={dataRecords.length > 0 ? () => setShowImportWizard(false) : undefined}
                   />
@@ -3905,357 +3558,308 @@ export function ProjectDetail() {
 
           {/* ── Generate Preview Dialog ── */}
           <Dialog open={isGeneratePreviewOpen} onOpenChange={(open) => {
-            if (!open && isGeneratingPreview) {
-              // User closed dialog mid-generation — abort any in-progress work.
-              abortRef.current?.abort();
-              return;
-            }
+            if (isGeneratingPreview) return;
             setIsGeneratePreviewOpen(open);
-            if (!open) {
-              setPreviewError("");
-              setPreviewProgressText("");
-              setPreviewDialogStep(1);
-            }
+            if (!open) setPreviewError("");
           }}>
             <DialogContent className="sm:max-w-[620px]">
               <DialogHeader>
                 <DialogTitle>Generate Preview</DialogTitle>
               </DialogHeader>
+              <div className="space-y-4 py-1">
+                <p className="text-sm text-muted-foreground">
+                  Generate preview for {selectedRecords.length} selected record(s).
+                </p>
 
-              {/* ── STEP 1: Select Template ── */}
-              {previewDialogStep === 1 && (
-                <div className="space-y-4 py-1">
-                  <p className="text-sm text-muted-foreground">
-                    Select a template attached to this project to use for generating the preview PDF.
-                  </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div className="space-y-1.5">
-                    <Label>Select template</Label>
-                    {previewTemplateGroups.projectTemplates.length === 0 ? (
-                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                        No templates attached to this project yet.{" "}
-                        <button
-                          className="font-medium underline underline-offset-2"
-                          onClick={() => { setIsGeneratePreviewOpen(false); id && navigate(`/template-gallery?projectId=${id}`); }}
-                        >
-                          Open Template Gallery →
-                        </button>
-                      </div>
-                    ) : (
-                      <Select
-                        value={previewForm.templateId || "__none__"}
-                        onValueChange={(value) => {
-                          const sel = previewTemplates.find((t) => t.id === value);
-                          setPreviewForm((prev) => ({
+                    <Label>Page size</Label>
+                    <Select
+                      value={previewForm.pageSize}
+                      onValueChange={(value) => {
+                        const size = value as PreviewPageSize;
+                        setPreviewForm((prev) => {
+                          if (size === "Custom") {
+                            return { ...prev, pageSize: size };
+                          }
+                          const dims = PAGE_SIZE_DIMENSIONS[size];
+                          return {
                             ...prev,
-                            templateId: value === "__none__" ? "" : value,
-                            templateType: sel?.templateType || prev.templateType,
-                            orientation: sel?.canvas?.width && sel?.canvas?.height
-                              ? (sel.canvas.width > sel.canvas.height ? "landscape" : "portrait")
-                              : prev.orientation,
-                          }));
-                        }}
-                      >
-                        <SelectTrigger className="h-9">
-                          <SelectValue placeholder="Choose an attached template…" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="__none__">Choose a template…</SelectItem>
-                          {previewTemplateGroups.projectTemplates.map((template) => (
-                            <SelectItem key={template.id} value={template.id}>
-                              {template.templateName}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    )}
-                  </div>
-                  {previewForm.templateId && (
-                    <div className="sm:col-span-2 space-y-1.5">
-                      <Label>Template preview</Label>
-                      <IdCardGrid students={selectedRecords.slice(0, 3)} template={previewTemplates.find((t) => t.id === previewForm.templateId) ?? null} />
-                    </div>
-                  )}
-                  {previewError && <p className="text-sm text-destructive">{previewError}</p>}
-                  <div className="flex gap-3 pt-1">
-                    <Button variant="outline" className="flex-1" onClick={() => setIsGeneratePreviewOpen(false)}>Cancel</Button>
-                    <Button
-                      className="flex-1 gap-1.5"
-                      disabled={!previewForm.templateId}
-                      onClick={() => {
-                        if (!selectedRecords.length) {
-                          setPreviewError("No records selected. Go to Project Data tab and select records first.");
-                          return;
-                        }
-                        setPreviewError("");
-                        setPreviewDialogStep(2);
+                            pageSize: size,
+                            sheetWidthMm: String(dims.width),
+                            sheetHeightMm: String(dims.height),
+                          };
+                        });
                       }}
                     >
-                      Configure &amp; Generate →
-                    </Button>
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select page size" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="A4">A4</SelectItem>
+                        <SelectItem value="A3">A3</SelectItem>
+                        <SelectItem value="Letter">Letter</SelectItem>
+                        <SelectItem value="Legal">Legal</SelectItem>
+                        <SelectItem value="Custom">Custom</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
-                </div>
-              )}
 
-              {/* ── STEP 2: Full generation form ── */}
-              {previewDialogStep === 2 && (
-                <div className="space-y-4 py-1">
-                  <div className="flex items-center gap-3 text-sm flex-wrap">
-                    <button
-                      className="text-xs text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
-                      onClick={() => { setPreviewError(""); setPreviewDialogStep(1); }}
+                  <div className="space-y-1.5">
+                    <Label>Select template</Label>
+                    <Select
+                      value={previewForm.templateId || "__none__"}
+                      onValueChange={(value) => {
+                        const selectedTemplate = previewTemplates.find((template) => template.id === value);
+                        setPreviewForm((prev) => ({
+                          ...prev,
+                          templateId: value === "__none__" ? "" : value,
+                          templateType: selectedTemplate?.templateType || prev.templateType,
+                        }));
+                      }}
                     >
-                      ← Change template
-                    </button>
-                    <span className="text-muted-foreground">·</span>
-                    <span className="text-muted-foreground">
-                      Generating for <strong className="text-foreground">{selectedRecords.length}</strong> selected record(s)
-                    </span>
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select a template" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">Select a template</SelectItem>
+                        {remoteTemplatesLoading ? (
+                          <div className="px-2 py-1 text-xs text-muted-foreground">Loading templates...</div>
+                        ) : previewTemplates.length === 0 ? (
+                          <div className="px-2 py-1 text-xs text-muted-foreground">No templates available.</div>
+                        ) : (
+                          <>
+                            {previewTemplateGroups.projectTemplates.length > 0 && (
+                              <div className="px-2 py-1 text-xs text-muted-foreground">Project Templates</div>
+                            )}
+                            {previewTemplateGroups.projectTemplates.map((template) => (
+                              <SelectItem key={template.id} value={template.id}>
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="truncate">{template.templateName}</span>
+                                  <Badge variant="outline" className="text-[10px]">Project</Badge>
+                                </div>
+                              </SelectItem>
+                            ))}
+                            {previewTemplateGroups.globalTemplates.length > 0 && (
+                              <div className="px-2 py-1 text-xs text-muted-foreground">Public Templates</div>
+                            )}
+                            {previewTemplateGroups.globalTemplates.map((template) => (
+                              <SelectItem key={template.id} value={template.id}>
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="truncate">{template.templateName}</span>
+                                  <Badge variant="secondary" className="text-[10px]">Global</Badge>
+                                </div>
+                              </SelectItem>
+                            ))}
+                          </>
+                        )}
+                      </SelectContent>
+                    </Select>
+                    {remoteTemplatesError ? (
+                      <p className="text-xs text-destructive">{remoteTemplatesError}</p>
+                    ) : null}
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <Label>Page size</Label>
-                      <Select
-                        value={previewForm.pageSize}
-                        onValueChange={(value) => {
-                          const size = value as PreviewPageSize;
-                          setPreviewForm((prev) => {
-                            if (size === "Custom") {
-                              return { ...prev, pageSize: size };
-                            }
-                            const dims = PAGE_SIZE_DIMENSIONS[size];
-                            return {
-                              ...prev,
-                              pageSize: size,
-                              sheetWidthMm: String(dims.width),
-                              sheetHeightMm: String(dims.height),
-                            };
-                          });
+                  <div className="sm:col-span-2 space-y-1.5">
+                    <Label>Rendered template preview</Label>
+                    <IdCardGrid students={selectedRecords.slice(0, 1)} template={selectedGenerateTemplate} />
+                    {selectedRecords.length > 1 && (
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Showing 1 of {selectedRecords.length} student(s). PDF will include all.
+                      </p>
+                    )}
+                  </div>
+
+                  <div aria-hidden className="pointer-events-none fixed -left-[10000px] top-0 opacity-0">
+                    {previewPrintPages.map((pageRecords, pageIndex) => (
+                      <div
+                        key={`print-page-${pageIndex}`}
+                        ref={(el) => {
+                          previewCapturePagesRef.current[pageIndex] = el;
                         }}
                       >
-                        <SelectTrigger className="h-9">
-                          <SelectValue placeholder="Select page size" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="A4">A4</SelectItem>
-                          <SelectItem value="A3">A3</SelectItem>
-                          <SelectItem value="Letter">Letter</SelectItem>
-                          <SelectItem value="Legal">Legal</SelectItem>
-                          <SelectItem value="Custom">Custom</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <Label>Selected template</Label>
-                      <div className="h-9 flex items-center px-3 rounded-md border border-input bg-muted/40 text-sm">
-                        {previewTemplates.find((t) => t.id === previewForm.templateId)?.templateName || "—"}
+                        <div
+                          className="id-print-page id-print-page-grid"
+                          style={{
+                            width: `${printLayout.sheetWidthPx}px`,
+                            height: `${printLayout.sheetHeightPx}px`,
+                            padding: `${printLayout.marginTopPx}px ${printLayout.marginLeftPx}px`,
+                            gridTemplateColumns: `repeat(${printLayout.columns}, ${PREVIEW_CARD_WIDTH_PX}px)`,
+                            columnGap: `${printLayout.columnGapPx}px`,
+                            rowGap: `${printLayout.rowGapPx}px`,
+                          }}
+                        >
+                          {pageRecords.map((student, studentIndex) => (
+                            <IdCard
+                              key={`print-card-${student.id}-${pageIndex}-${studentIndex}`}
+                              student={student}
+                              template={selectedGenerateTemplate}
+                            />
+                          ))}
+                        </div>
                       </div>
-                    </div>
+                    ))}
+                  </div>
 
-                    <div className="sm:col-span-2 space-y-1.5">
-                      <Label>Rendered template preview</Label>
-                      <IdCardGrid students={selectedRecords} template={selectedGenerateTemplate} />
-                      {selectedRecords.length > 1 && (
-                        <p className="text-xs text-muted-foreground mt-1">
-                          Showing first 10 of {selectedRecords.length} student(s). PDF will include all.
+                  {selectedGenerateTemplateDiagnostics && (
+                    <div className="sm:col-span-2 space-y-1">
+                      {!selectedGenerateTemplateDiagnostics.hasDesignElements && (
+                        <p className="text-xs text-destructive">
+                          No preview available. Please configure the template.
+                        </p>
+                      )}
+                      {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
+                        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                          Missing field mapping: {selectedGenerateTemplateDiagnostics.missingFieldKeys.map(formatFieldLabel).join(", ")}
                         </p>
                       )}
                     </div>
+                  )}
 
-                    {/* Missing images warning */}
-                    {missingPhotosCount > 0 && (
-                      <div className="sm:col-span-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
-                        <p className="text-xs font-medium text-amber-800">
-                          ⚠ {missingPhotosCount} of {selectedRecords.length} student{missingPhotosCount !== 1 ? "s" : ""} {missingPhotosCount !== 1 ? "have" : "has"} no photo.
-                          Upload a ZIP to map images, or "No Image" placeholders will appear in the PDF.
-                        </p>
-                      </div>
-                    )}
-
-                    {selectedGenerateTemplateDiagnostics && (
-                      <div className="sm:col-span-2 space-y-1">
-                        {!selectedGenerateTemplateDiagnostics.hasDesignElements && (
-                          <p className="text-xs text-destructive">
-                            No preview available. Please configure the template.
-                          </p>
-                        )}
-                        {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
-                          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 flex items-start gap-2.5">
-                            <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5" />
-                            <div className="flex-1 min-w-0">
-                              <p className="text-xs font-semibold text-amber-800">
-                                {selectedGenerateTemplateDiagnostics.missingFieldKeys.length} field{selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 1 ? "s" : ""} not mapped
-                              </p>
-                              <p className="text-xs text-amber-700 mt-0.5">
-                                The preview may show placeholder text for unmapped fields. You can still generate.
-                              </p>
-                              <button
-                                className="text-xs font-medium text-amber-800 underline underline-offset-2 mt-1"
-                                onClick={() => id && navigate(`/projects/${id}/rule-builder`)}
-                              >
-                                Fix in Rule Builder →
-                              </button>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    <div className="space-y-1.5">
-                      <Label>Orientation</Label>
-                      <div className="flex items-center gap-2">
-                        <Button
-                          type="button"
-                          variant={previewForm.orientation === "portrait" ? "default" : "outline"}
-                          className="h-9 flex-1"
-                          onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
-                        >
-                          Portrait
-                        </Button>
-                        <Button
-                          type="button"
-                          variant={previewForm.orientation === "landscape" ? "default" : "outline"}
-                          className="h-9 flex-1"
-                          onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
-                        >
-                          Landscape
-                        </Button>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <Label>Template type</Label>
-                      <Select
-                        value={previewForm.templateType}
-                        onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, templateType: value as ProjectTemplate["templateType"] }))}
+                  <div className="space-y-1.5">
+                    <Label>Orientation</Label>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        variant={previewForm.orientation === "portrait" ? "default" : "outline"}
+                        className="h-9 flex-1"
+                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
                       >
-                        <SelectTrigger className="h-9">
-                          <SelectValue placeholder="Select template type" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="id_card">ID Card</SelectItem>
-                          <SelectItem value="certificate">Certificate</SelectItem>
-                          <SelectItem value="poster">Poster</SelectItem>
-                          <SelectItem value="custom">Custom</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <Label>Is sample</Label>
-                      <Select value={previewForm.isSample} onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, isSample: value as "yes" | "no" }))}>
-                        <SelectTrigger className="h-9">
-                          <SelectValue placeholder="Select" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="yes">Yes</SelectItem>
-                          <SelectItem value="no">No</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-
-                    <div className="space-y-1.5 sm:col-span-2">
-                      <Label>File name</Label>
-                      <Input
-                        value={previewForm.fileName}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, fileName: event.target.value }))}
-                        placeholder="Enter file name"
-                        className="h-9"
-                      />
+                        Portrait
+                      </Button>
+                      <Button
+                        type="button"
+                        variant={previewForm.orientation === "landscape" ? "default" : "outline"}
+                        className="h-9 flex-1"
+                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
+                      >
+                        Landscape
+                      </Button>
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    <div className="space-y-1.5">
-                      <Label>Sheet width (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.sheetWidthMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Sheet height (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.sheetHeightMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Page margin top</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.pageMarginTopMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Page margin left</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.pageMarginLeftMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <Label>Row margin (optional)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.rowMarginMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Column margin (optional)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.columnMarginMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                  </div>
-
-                  {previewError && (
-                    <p className="text-sm text-destructive">{previewError}</p>
-                  )}
-                  {isGeneratingPreview && previewProgressText && (
-                    <p className="text-sm text-muted-foreground">{previewProgressText}</p>
-                  )}
-
-                  <div className="flex gap-3 pt-1">
-                    <Button
-                      variant="outline"
-                      className="flex-1"
-                      onClick={() => {
-                        if (isGeneratingPreview) {
-                          abortRef.current?.abort();
-                        } else {
-                          setPreviewDialogStep(1);
-                        }
-                      }}
+                  <div className="space-y-1.5">
+                    <Label>Template type</Label>
+                    <Select
+                      value={previewForm.templateType}
+                      onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, templateType: value as ProjectTemplate["templateType"] }))}
                     >
-                      {isGeneratingPreview ? "Stop" : "← Back"}
-                    </Button>
-                    <Button className="flex-1 gap-1.5" disabled={isGeneratingPreview} onClick={() => void handleGeneratePreviewPdf()}>
-                      {isGeneratingPreview
-                        ? <Loader2 className="h-4 w-4 animate-spin" />
-                        : <Download className="h-4 w-4" />}
-                      Generate preview
-                    </Button>
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select template type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="id_card">ID Card</SelectItem>
+                        <SelectItem value="certificate">Certificate</SelectItem>
+                        <SelectItem value="poster">Poster</SelectItem>
+                        <SelectItem value="custom">Custom</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label>Is sample</Label>
+                    <Select value={previewForm.isSample} onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, isSample: value as "yes" | "no" }))}>
+                      <SelectTrigger className="h-9">
+                        <SelectValue placeholder="Select" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="yes">Yes</SelectItem>
+                        <SelectItem value="no">No</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-1.5 sm:col-span-2">
+                    <Label>File name</Label>
+                    <Input
+                      value={previewForm.fileName}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, fileName: event.target.value }))}
+                      placeholder="Enter file name"
+                      className="h-9"
+                    />
                   </div>
                 </div>
-              )}
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="space-y-1.5">
+                    <Label>Sheet width (mm)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.sheetWidthMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Sheet height (mm)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.sheetHeightMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Page margin top</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.pageMarginTopMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Page margin left</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.pageMarginLeftMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label>Row margin (optional)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.rowMarginMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Column margin (optional)</Label>
+                    <Input
+                      type="number"
+                      value={previewForm.columnMarginMm}
+                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
+                      className="h-9"
+                    />
+                  </div>
+                </div>
+
+                {previewError && (
+                  <p className="text-sm text-destructive">{previewError}</p>
+                )}
+              </div>
+              <div className="flex gap-3 pt-1">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  disabled={isGeneratingPreview}
+                  onClick={() => setIsGeneratePreviewOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button className="flex-1 gap-1.5" disabled={isGeneratingPreview} onClick={() => void handleGeneratePreviewPdf()}>
+                  {isGeneratingPreview
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Download className="h-4 w-4" />}
+                  Generate preview
+                </Button>
+              </div>
             </DialogContent>
           </Dialog>
 
@@ -4294,7 +3898,7 @@ export function ProjectDetail() {
           </Dialog>
 
           {/* ── Bulk Image Upload Dialog ── */}
-          <Dialog open={isBulkImageUploadOpen} onOpenChange={(o) => { setIsBulkImageUploadOpen(o); if (!o) { setBulkImageResults(null); setManualAssign({}); } }}>
+          <Dialog open={isBulkImageUploadOpen} onOpenChange={(o) => { setIsBulkImageUploadOpen(o); if (!o) setBulkImageResults(null); }}>
             <DialogContent className="sm:max-w-[500px] max-h-[85vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle className="flex items-center gap-2">
@@ -4346,19 +3950,45 @@ export function ProjectDetail() {
                         <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
                       </summary>
                       {bulkImageResults.matched.length > 0 && (
-                        <ul className="text-xs text-green-700 space-y-1 max-h-48 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
+                        <ul className="text-xs text-green-700 space-y-0.5 max-h-36 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
                           {bulkImageResults.matched.map((m) => (
-                            <li key={m.userId + m.filename} className="flex gap-1.5 items-center rounded px-1 py-0.5">
+                            <li key={m.userId} className="flex gap-1.5 items-center">
                               <img src={m.dataUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
-                              <span className="truncate flex-1">{m.filename} → <strong>{m.name}</strong></span>
-                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 bg-green-200 text-green-800">
-                                Matched
-                              </span>
+                              <span className="truncate">{m.filename} → <strong>{m.name}</strong></span>
                             </li>
                           ))}
                         </ul>
                       )}
                     </details>
+
+                    {/* ── DUPLICATES ── */}
+                    {bulkImageResults.duplicates.length > 0 && (
+                      <details className="rounded-lg border border-amber-200 bg-amber-50 overflow-hidden">
+                        <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-amber-800 [list-style:none] [&::-webkit-details-marker]:hidden">
+                          <AlertTriangle className="h-4 w-4 shrink-0" />
+                          <span>{bulkImageResults.duplicates.length} duplicate match{bulkImageResults.duplicates.length !== 1 ? 'es' : ''}</span>
+                          <span className="text-xs font-normal ml-1 opacity-60">(applied to first)</span>
+                          <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
+                        </summary>
+                        <ul className="text-xs space-y-3 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-amber-200">
+                          {bulkImageResults.duplicates.map((d, i) => (
+                            <li key={i}>
+                              <p className="font-semibold text-amber-900 truncate mb-1">📄 {d.filename}</p>
+                              <ul className="pl-3 space-y-0.5">
+                                {d.allMatchNames.map((name, ni) => (
+                                  <li key={ni} className="flex items-center gap-1.5 text-amber-800">
+                                    <span className={ni === 0 ? 'font-semibold' : 'opacity-60'}>{ni + 1}. {name}</span>
+                                    {ni === 0 && (
+                                      <span className="text-[10px] font-bold bg-amber-300 text-amber-900 px-1.5 py-0.5 rounded">APPLIED</span>
+                                    )}
+                                  </li>
+                                ))}
+                              </ul>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
 
                     {/* ── UNMATCHED ── */}
                     {bulkImageResults.unmatched.length > 0 && (
@@ -4370,26 +4000,9 @@ export function ProjectDetail() {
                         </summary>
                         <ul className="text-xs space-y-2 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-muted">
                           {bulkImageResults.unmatched.map((u, i) => (
-                            <li key={i} className="space-y-1">
+                            <li key={i}>
                               <p className="font-medium text-foreground/80 truncate">📄 {u.filename}</p>
                               <p className="text-[11px] pl-3 text-muted-foreground mt-0.5">↳ {u.reason}</p>
-                              <div className="pl-3">
-                                <Select
-                                  value={manualAssign[u.filename] ?? ''}
-                                  onValueChange={(v) => setManualAssign((prev) => ({ ...prev, [u.filename]: v }))}
-                                >
-                                  <SelectTrigger className="h-6 text-[11px] w-full border-dashed">
-                                    <SelectValue placeholder="Manually assign to student…" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    {dataRecords.map((rec) => (
-                                      <SelectItem key={rec.id} value={rec.id} className="text-xs">
-                                        {String(rec['Name'] ?? rec['name'] ?? rec['full_name'] ?? rec['Full Name'] ?? rec.id)}
-                                      </SelectItem>
-                                    ))}
-                                  </SelectContent>
-                                </Select>
-                              </div>
                             </li>
                           ))}
                         </ul>
@@ -4401,15 +4014,15 @@ export function ProjectDetail() {
               </div>
 
               <div className="flex gap-3 pt-2">
-                <Button variant="outline" className="flex-1" onClick={() => { setIsBulkImageUploadOpen(false); setBulkImageResults(null); setManualAssign({}); }}>
+                <Button variant="outline" className="flex-1" onClick={() => { setIsBulkImageUploadOpen(false); setBulkImageResults(null); }}>
                   Cancel
                 </Button>
                 <Button
                   className="flex-1"
-                  disabled={!bulkImageResults || (bulkImageResults.matched.length === 0 && Object.keys(manualAssign).length === 0) || bulkImageProcessing}
+                  disabled={!bulkImageResults || bulkImageResults.matched.length === 0 || bulkImageProcessing}
                   onClick={handleApplyBulkImages}
                 >
-                  Apply {bulkImageResults ? `(${bulkImageResults.matched.length + Object.values(manualAssign).filter(Boolean).length})` : ""} Images
+                  Apply {bulkImageResults?.matched.length ? `(${bulkImageResults.matched.length})` : ""} Images
                 </Button>
               </div>
             </DialogContent>
@@ -4590,11 +4203,11 @@ export function ProjectDetail() {
                   <Label>Template</Label>
                   <Select value={newGroupTemplateId || "__none__"} onValueChange={(val) => setNewGroupTemplateId(val === "__none__" ? "" : val)}>
                     <SelectTrigger className="h-9">
-                      <SelectValue placeholder={templates.length === 0 ? "No templates available" : "Select a template"} />
+                      <SelectValue placeholder={previewTemplates.length === 0 ? "No templates available" : "Select a template"} />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="__none__">No template</SelectItem>
-                      {templates.map((t) => (
+                      {previewTemplates.map((t) => (
                         <SelectItem key={t.id} value={t.id}>
                           <span className="flex items-center gap-2">
                             <Layers className="h-3.5 w-3.5 text-muted-foreground" />
@@ -4605,7 +4218,7 @@ export function ProjectDetail() {
                       ))}
                     </SelectContent>
                   </Select>
-                  {templates.length === 0 && (
+                  {previewTemplates.length === 0 && (
                     <p className="text-xs text-muted-foreground">Create templates in the Templates tab first.</p>
                   )}
                 </div>

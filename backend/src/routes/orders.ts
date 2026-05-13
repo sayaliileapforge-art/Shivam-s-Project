@@ -18,10 +18,10 @@ router.get('/', async (req: Request, res: Response) => {
     if (productId) filter.productId = productId;
     if (status) filter.status = status;
 
-    const orders = await TemplateOrder.find(filter)
+    const orders = (await TemplateOrder.find(filter)
       .populate('productId', 'name')
-      .populate('templateId', 'templateName previewImageUrl preview_image category')
-      .sort({ createdAt: -1 });
+      .populate('templateId', 'templateName previewImageUrl preview_image category'))
+      .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
     res.json({ success: true, data: orders });
   } catch (error) {

@@ -68,15 +68,7 @@ ProductTemplateSchema.set('toJSON', {
 
 ProductTemplateSchema.index(
   { productId: 1, templateName: 1 },
-  { unique: true, partialFilterExpression: { productId: { $type: 'objectId' } } }
+  { unique: true, partialFilterExpression: { productId: { $exists: true, $ne: null } } }
 );
-
-// Compound indexes allow MongoDB to use an index-covered sort, which avoids the 32 MB
-// in-memory sort limit on Atlas M0 free tier. The leading key (isGlobal / projectId)
-// covers the filter; the trailing updatedAt covers the sort so no documents need to be
-// loaded into memory just to sort them.
-ProductTemplateSchema.index({ isGlobal: 1, updatedAt: -1 });
-ProductTemplateSchema.index({ projectId: 1, isGlobal: 1, updatedAt: -1 });
-ProductTemplateSchema.index({ projectId: 1, updatedAt: -1 });
 
 export default mongoose.model<IProductTemplate>('ProductTemplate', ProductTemplateSchema);

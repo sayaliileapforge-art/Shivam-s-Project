@@ -183,15 +183,7 @@ export function getRecordField(record: ProjectDataRecord, fieldName: TemplateFie
 
 export function resolveStudentPhotoUrl(record: ProjectDataRecord): string {
   const photoRaw = getRecordField(record, "photo");
-  const trimmed = photoRaw.trim();
-  // Only resolve confirmed upload URLs — not bare filenames from a CSV Photo column.
-  // After a real ZIP/folder upload the backend stores the full http:// URL here.
-  if (!trimmed || !(
-    /^(data:image\/|blob:|https?:\/\/)/i.test(trimmed) ||
-    trimmed.startsWith('/uploads/') ||
-    trimmed.startsWith('uploads/')
-  )) return FALLBACK_AVATAR;
-  const resolved = resolveProfileImageUrl(trimmed);
+  const resolved = resolveProfileImageUrl(photoRaw);
   if (!resolved) return FALLBACK_AVATAR;
   // Convert absolute URLs to relative proxy paths so html2canvas never makes
   // cross-origin requests and the Vite proxy routes to the correct server.
@@ -203,14 +195,8 @@ export function resolveStudentPhotoUrl(record: ProjectDataRecord): string {
 /** Returns true if the record has a real (non-fallback) photo URL. */
 export function studentHasPhoto(record: ProjectDataRecord): boolean {
   const photoRaw = getRecordField(record, "photo");
-  const trimmed = photoRaw.trim();
-  if (!trimmed) return false;
-  // Bare filenames (CSV Photo column values) are not confirmed uploaded URLs
-  return (
-    /^(data:image\/|blob:|https?:\/\/)/i.test(trimmed) ||
-    trimmed.startsWith('/uploads/') ||
-    trimmed.startsWith('uploads/')
-  );
+  const normalized = resolveProfileImageUrl(photoRaw);
+  return Boolean(normalized && /^(data:image\/|blob:|https?:\/\/|\/uploads\/|uploads\/|\/)/i.test(normalized));
 }
 
 /**

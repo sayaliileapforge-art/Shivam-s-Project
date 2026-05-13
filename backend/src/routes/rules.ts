@@ -18,10 +18,13 @@ router.get('/', async (req: Request, res: Response) => {
       return;
     }
 
-    const rules = await PrintRule.find({
+    const rules = (await PrintRule.find({
       projectId: new mongoose.Types.ObjectId(String(projectId)),
       isActive: true,
-    }).sort({ priority: 1, createdAt: 1 });
+    })).sort((a: any, b: any) => {
+      if (a.priority !== b.priority) return a.priority - b.priority;
+      return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+    });
 
     res.setHeader('Cache-Control', 'no-store');
     res.json({ success: true, data: rules });
