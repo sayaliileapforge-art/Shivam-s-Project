@@ -10,6 +10,7 @@ import Product from '../models/Product';
 import Project from '../models/Project';
 import TemplateSelection from '../models/TemplateSelection';
 import TemplateGalleryMeta from '../models/TemplateGalleryMeta';
+import { emitRealtimeEvent } from '../realtime';
 
 const router = Router();
 
@@ -198,8 +199,17 @@ function isValidObjectId(id: string): boolean {
   return mongoose.Types.ObjectId.isValid(id);
 }
 
+function sanitizePreviewValue(value: string): string {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^data:/i.test(raw) && !/^data:image\//i.test(raw)) {
+    return '';
+  }
+  return raw;
+}
+
 function resolvePreviewImage(payload: Record<string, any>): string {
-  return String(payload.preview_image || payload.previewImageUrl || payload.imageUrl || '').trim();
+  return sanitizePreviewValue(String(payload.preview_image || payload.previewImageUrl || payload.imageUrl || '').trim());
 }
 
 function parseJsonField<T>(value: unknown, fallback: T): T {
@@ -378,7 +388,12 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    res.json({ success: true, data: template });
+    const data = template.toJSON() as Record<string, any>;
+    const normalizedPreview = sanitizePreviewValue(String(data.preview_image || data.previewImageUrl || ''));
+    data.preview_image = normalizedPreview || null;
+    data.previewImageUrl = normalizedPreview || null;
+
+    res.json({ success: true, data });
   } catch (error) {
     const err = error as Error;
     console.error('[templates] GET /api/templates/:id failed', {
@@ -479,6 +494,14 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       createdAt: savedTemplate.createdAt,
     });
 
+    emitRealtimeEvent({
+      type: 'template:created',
+      templateId: String(savedTemplate._id),
+      projectId: savedTemplate.projectId,
+      productId: savedTemplate.productId ? String(savedTemplate.productId) : undefined,
+      isGlobal: savedTemplate.isGlobal === true,
+    });
+
     res.status(201).json({ success: true, data: savedTemplate });
   } catch (error) {
     const err = error as Error & { code?: number };
@@ -552,6 +575,16 @@ router.put('/:id', async (req: Request, res: Response) => {
       updatedAt: template?.updatedAt,
     });
 
+    if (template) {
+      emitRealtimeEvent({
+        type: 'template:updated',
+        templateId: String(template._id),
+        projectId: template.projectId,
+        productId: template.productId ? String(template.productId) : undefined,
+        isGlobal: template.isGlobal === true,
+      });
+    }
+
     res.json({ success: true, data: template });
   } catch (error) {
     const err = error as Error;
@@ -560,6 +593,42 @@ router.put('/:id', async (req: Request, res: Response) => {
       stack: err.stack,
     });
     res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.delete('/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      res.status(400).json({ success: false, error: 'Invalid template id' });
+      return;
+    }
+
+    const existing = await ProductTemplate.findById(id).lean<Record<string, any>>();
+    if (!existing) {
+      res.status(404).json({ success: false, error: 'Template not found' });
+      return;
+    }
+
+    await ProductTemplate.deleteOne({ _id: id });
+    await TemplateGalleryMeta.deleteOne({ templateId: existing._id }).catch(() => {});
+
+    emitRealtimeEvent({
+      type: 'template:deleted',
+      templateId: String(existing._id),
+      projectId: existing.projectId ? String(existing.projectId) : undefined,
+      productId: existing.productId ? String(existing.productId) : undefined,
+      isGlobal: existing.isGlobal === true,
+    });
+
+    res.json({ success: true, data: { _id: id } });
+  } catch (error) {
+    const err = error as Error;
+    console.error('[templates] Template delete failed', {
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

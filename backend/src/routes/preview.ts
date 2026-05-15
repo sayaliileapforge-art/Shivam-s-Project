@@ -69,7 +69,18 @@ interface PreviewRequestBody {
     };
     rowMarginMm?: number;
     columnMarginMm?: number;
+    cardSize?: {
+      widthMm?: number;
+      heightMm?: number;
+    };
     fileName?: string;
+    useFieldBasedMapping?: boolean;
+    fallbackTemplateId?: string;
+    templateMappings?: Array<{
+      fieldName?: string;
+      fieldValue?: string;
+      templateId?: string;
+    }>;
   };
   template?: TemplatePayload;
 }
@@ -169,7 +180,7 @@ function normalizeTemplateSlug(raw: string): TemplateSlug | '' {
   if (value === 'template_2' || value === 'template2') return 'template_2';
   if (value === 'template_3' || value === 'template3') return 'template_3';
 
-  if (/template[\s_-]*1|id[\s_-]*card|classic/.test(value)) return 'template_1';
+  if (/template[\s_-]*1|id[\s_-]*card|classic|pvc/.test(value)) return 'template_1';
   if (/template[\s_-]*2|certificate|minimal/.test(value)) return 'template_2';
   if (/template[\s_-]*3|copy|poster|modern/.test(value)) return 'template_3';
 
@@ -364,6 +375,8 @@ interface StudentCardData {
 }
 
 function getRecordValueByAliases(record: Record<string, unknown>, aliases: string[]): string {
+  const normalizeKey = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+
   for (const alias of aliases) {
     const direct = String(record[alias] ?? '').trim();
     if (direct) return direct;
@@ -371,14 +384,28 @@ function getRecordValueByAliases(record: Record<string, unknown>, aliases: strin
     const caseInsensitive = Object.entries(record).find(([key]) => key.toLowerCase() === alias.toLowerCase());
     const fromEntry = String(caseInsensitive?.[1] ?? '').trim();
     if (fromEntry) return fromEntry;
+
+    const normalizedAlias = normalizeKey(alias);
+    const normalizedMatch = Object.entries(record).find(([key]) => normalizeKey(key) === normalizedAlias);
+    const normalizedValue = String(normalizedMatch?.[1] ?? '').trim();
+    if (normalizedValue) return normalizedValue;
   }
   return '';
+}
+
+/** Encode each path segment to handle spaces, commas, and other special chars in filenames. */
+function encodePathSegments(rawPath: string): string {
+  return rawPath.split('/').map((seg) => {
+    if (!seg) return seg;
+    try { return encodeURIComponent(decodeURIComponent(seg)); } catch { return encodeURIComponent(seg); }
+  }).join('/');
 }
 
 function toAbsoluteAssetUrl(rawValue: string, req: Request): string {
   const raw = String(rawValue || '').trim();
   if (!raw) return '';
 
+  // Already an absolute URL or data/blob URI — keep as-is
   if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) {
     return raw;
   }
@@ -386,16 +413,46 @@ function toAbsoluteAssetUrl(rawValue: string, req: Request): string {
   const host = req.get('host') || 'localhost:5000';
   const base = `${req.protocol}://${host}`;
 
-  if (raw.startsWith('/')) return `${base}${raw}`;
-  if (/^(uploads|student-photos)\//i.test(raw)) return `${base}/${raw}`;
+  if (raw.startsWith('/')) return `${base}${encodePathSegments(raw)}`;
+  if (/^(uploads|student-photos)\//i.test(raw)) return `${base}/${encodePathSegments(raw)}`;
 
-  return raw;
+  // Bare filename (no directory separator) — assume it lives under /uploads/
+  if (!raw.includes('/')) return `${base}/uploads/${encodeURIComponent(raw)}`;
+
+  // Relative path with directories not matched above — try as a sub-path of base
+  return `${base}/${encodePathSegments(raw)}`;
 }
 
 async function loadStudentPhotoBuffer(rawSource: string, req: Request): Promise<Buffer | null> {
   const source = toAbsoluteAssetUrl(rawSource, req);
   if (!source) return null;
-  return loadTemplatePreviewBuffer(source);
+
+  const primary = await loadTemplatePreviewBuffer(source);
+  if (primary) return primary;
+
+  // If the raw value is a bare filename and the /uploads/ attempt failed,
+  // try common upload sub-folder candidates (some projects store photos in sub-dirs).
+  const raw = String(rawSource || '').trim();
+  if (raw && !raw.includes('/') && !/^(data:|blob:|https?:)/i.test(raw)) {
+    const host = req.get('host') || 'localhost:5000';
+    const base = `${req.protocol}://${host}`;
+    const encoded = encodeURIComponent(raw);
+    const candidates = [
+      `${base}/uploads/students/${encoded}`,
+      `${base}/uploads/photos/${encoded}`,
+      `${base}/uploads/images/${encoded}`,
+      `${base}/uploads/products/images/${encoded}`,
+    ];
+    for (const candidate of candidates) {
+      const buf = await loadTemplatePreviewBuffer(candidate);
+      if (buf) {
+        console.debug(`[PhotoResolve] Found photo at fallback candidate: ${candidate}`);
+        return buf;
+      }
+    }
+  }
+
+  return null;
 }
 
 function resolveStudentCardData(record: Record<string, unknown>, req: Request): StudentCardData {
@@ -407,13 +464,27 @@ function resolveStudentCardData(record: Record<string, unknown>, req: Request): 
     'Photo',
     'profilePic',
     'profilepic',
+    'profile_pic',
+    'profilePhoto',
+    'profile_photo',
     'photoUrl',
     'photo_url',
+    'photoURL',
+    'studentPhoto',
+    'student_photo',
+    'passportPhoto',
+    'passport_photo',
+    'pic',
+    'Pic',
     'image',
     'Image',
     'imageUrl',
     'image_url',
+    'imageURL',
     'avatar',
+    'Avatar',
+    'picture',
+    'Picture',
   ]);
 
   return {
@@ -661,10 +732,17 @@ router.post('/generate', async (req: Request, res: Response) => {
     const configuration = body.configuration || {};
     const template = body.template || {};
     const requestedTemplateId = String(configuration.templateId || '').trim();
+    const useFieldBasedMapping = Boolean(configuration.useFieldBasedMapping);
+    const fallbackTemplateId = String(configuration.fallbackTemplateId || '').trim();
+    const templateMappings = Array.isArray(configuration.templateMappings) ? configuration.templateMappings : [];
 
     console.debug('[PreviewAPI] incoming request', {
       templateId: requestedTemplateId,
       selectedRecordCount: selectedRecords.length,
+      useFieldBasedMapping,
+      fallbackTemplateId,
+      templateMappingsCount: templateMappings.length,
+      templateMappings: templateMappings.slice(0, 3), // Log first 3 mappings
     });
 
     if (!selectedRecordIds.length) {
@@ -688,24 +766,43 @@ router.post('/generate', async (req: Request, res: Response) => {
       return;
     }
 
-    const resolvedTemplate = await resolveTemplateForPreview(requestedTemplateId, template, configuration);
-    if (!resolvedTemplate) {
-      res.status(404).json({ success: false, error: 'Template not found for preview generation' });
-      return;
+    const templateIdsToResolve = new Set<string>();
+    templateIdsToResolve.add(requestedTemplateId);
+    if (useFieldBasedMapping) {
+      if (fallbackTemplateId) {
+        templateIdsToResolve.add(fallbackTemplateId);
+      }
+      for (const mapping of templateMappings) {
+        const mappingTemplateId = String(mapping?.templateId || '').trim();
+        if (mappingTemplateId) {
+          templateIdsToResolve.add(mappingTemplateId);
+        }
+      }
     }
 
-    if (!resolvedTemplate.templateSlug) {
-      res.status(400).json({
-        success: false,
-        error: `Template slug could not be resolved for "${resolvedTemplate.templateName}".`,
-      });
-      return;
+    const resolvedTemplateById = new Map<string, ResolvedTemplate>();
+    for (const templateId of templateIdsToResolve) {
+      const payloadForResolve = templateId === requestedTemplateId ? template : {};
+      const resolved = await resolveTemplateForPreview(templateId, payloadForResolve, configuration);
+      if (!resolved) {
+        res.status(404).json({ success: false, error: `Template not found for preview generation (${templateId})` });
+        return;
+      }
+      if (!resolved.templateSlug) {
+        res.status(400).json({
+          success: false,
+          error: `Template slug could not be resolved for "${resolved.templateName}".`,
+        });
+        return;
+      }
+      if (!resolved.hasValidLayout && !resolved.previewImageUrl && !resolved.thumbnail) {
+        res.status(400).json({ success: false, error: `No preview available for template "${resolved.templateName}".` });
+        return;
+      }
+      resolvedTemplateById.set(templateId, resolved);
     }
 
-    if (!resolvedTemplate.hasValidLayout && !resolvedTemplate.previewImageUrl && !resolvedTemplate.thumbnail) {
-      res.status(400).json({ success: false, error: 'No preview available. Please configure the template.' });
-      return;
-    }
+    const resolvedTemplate = resolvedTemplateById.get(requestedTemplateId)!;
 
     console.debug('[PreviewAPI] Generating preview', {
       templateId: requestedTemplateId,
@@ -716,12 +813,38 @@ router.post('/generate', async (req: Request, res: Response) => {
       layoutElementCount: resolvedTemplate.elementCount,
     });
 
+    // Log all resolved templates for debugging
+    if (useFieldBasedMapping) {
+      console.log('[TEMPLATE RESOLUTION] Resolved templates for mapping:', {
+        requestedTemplateId,
+        requestedTemplateName: resolvedTemplate.templateName,
+        fallbackTemplateId,
+        fallbackTemplateName: fallbackTemplateId ? resolvedTemplateById.get(fallbackTemplateId)?.templateName : 'N/A',
+        mappingTemplateCount: templateMappings.length,
+        allResolvedTemplates: Array.from(resolvedTemplateById.entries()).map(([id, tmpl]) => ({
+          templateId: id,
+          templateName: tmpl.templateName,
+        })),
+      });
+    }
+
     const studentCardData = selectedRecords.map((record) => resolveStudentCardData(record, req));
     console.debug('[PreviewAPI] mapped first student data', studentCardData[0] || null);
+
+    const recordsWithoutPhoto = studentCardData.filter((s) => !s.photoUrl);
+    if (recordsWithoutPhoto.length > 0) {
+      console.warn(`[PhotoResolve] ${recordsWithoutPhoto.length} record(s) have no resolvable photo field.`);
+      // Log up to 5 raw records so missing field keys can be identified
+      selectedRecords.slice(0, 5).forEach((rec, i) => {
+        const keys = Object.keys(rec).filter((k) => /photo|image|pic|avatar|picture/i.test(k));
+        console.warn(`[PhotoResolve] Record ${i} photo-related keys:`, keys, '→ values:', keys.map((k) => rec[k]));
+      });
+    }
 
     const uniquePhotoSources = Array.from(
       new Set(studentCardData.map((item) => item.photoUrl).filter((value) => Boolean(value)))
     );
+    console.debug(`[PhotoResolve] ${uniquePhotoSources.length} unique photo URLs to fetch (out of ${studentCardData.length} records)`);
 
     const studentPhotoBufferByUrl = new Map<string, Buffer>();
     await Promise.all(
@@ -729,9 +852,12 @@ router.post('/generate', async (req: Request, res: Response) => {
         const buffer = await loadStudentPhotoBuffer(photoSource, req);
         if (buffer) {
           studentPhotoBufferByUrl.set(photoSource, buffer);
+        } else {
+          console.warn(`[PhotoResolve] Failed to load photo buffer for: ${photoSource}`);
         }
       })
     );
+    console.debug(`[PhotoResolve] Successfully loaded ${studentPhotoBufferByUrl.size} / ${uniquePhotoSources.length} photo buffers`);
 
     const orientation = configuration.orientation === 'landscape' ? 'landscape' : 'portrait';
     let sheetWidthMm = clampNumber(configuration.sheetSize?.widthMm, 210, 10, 2000);
@@ -752,8 +878,12 @@ router.post('/generate', async (req: Request, res: Response) => {
       ? configuration.templateType
       : resolvedTemplate.templateType;
 
-    const cardWidthMm = clampNumber(resolvedTemplate.canvas.width, templateType === 'id_card' ? 86 : 140, 10, 1000);
-    const cardHeightMm = clampNumber(resolvedTemplate.canvas.height, templateType === 'id_card' ? 54 : 90, 10, 1000);
+    const cardWidthMm = configuration.cardSize?.widthMm
+      ? clampNumber(configuration.cardSize.widthMm, templateType === 'id_card' ? 86 : 140, 10, 1000)
+      : clampNumber(resolvedTemplate.canvas.width, templateType === 'id_card' ? 86 : 140, 10, 1000);
+    const cardHeightMm = configuration.cardSize?.heightMm
+      ? clampNumber(configuration.cardSize.heightMm, templateType === 'id_card' ? 54 : 90, 10, 1000)
+      : clampNumber(resolvedTemplate.canvas.height, templateType === 'id_card' ? 54 : 90, 10, 1000);
 
     const marginTopMm = clampNumber(configuration.pageMargin?.topMm, 8, 0, 100);
     const marginLeftMm = clampNumber(configuration.pageMargin?.leftMm, 8, 0, 100);
@@ -772,10 +902,12 @@ router.post('/generate', async (req: Request, res: Response) => {
     const rows = Math.max(1, Math.floor((availableHeightMm + rowMarginMm) / (cardHeightMm + rowMarginMm)));
     const pageCapacity = columns * rows;
 
-    // Fetch thumbnail buffer before creating the PDFDocument so we can
-    // call doc.openImage() immediately after construction.
-    const previewSource = resolvedTemplate.thumbnail || resolvedTemplate.previewImageUrl;
-    const previewImageBuffer = await loadTemplatePreviewBuffer(previewSource);
+    const previewImageBufferByTemplateId = new Map<string, Buffer | null>();
+    for (const [templateId, resolved] of resolvedTemplateById.entries()) {
+      const previewSource = resolved.thumbnail || resolved.previewImageUrl;
+      const previewImageBuffer = await loadTemplatePreviewBuffer(previewSource);
+      previewImageBufferByTemplateId.set(templateId, previewImageBuffer);
+    }
 
     const safeName = sanitizeFileName(configuration.fileName);
 
@@ -786,9 +918,18 @@ router.post('/generate', async (req: Request, res: Response) => {
       size: [mmToPt(sheetWidthMm), mmToPt(sheetHeightMm)],
     });
 
-    // Register the thumbnail image once. PDFKit reuses the same PDF image
-    // object for every card — no re-encoding per card.
-    const previewImage = previewImageBuffer ? (doc as any).openImage(previewImageBuffer) : null;
+    const previewImageByTemplateId = new Map<string, any>();
+    previewImageBufferByTemplateId.forEach((buffer, templateId) => {
+      if (!buffer) return;
+      try {
+        const image = (doc as any).openImage(buffer);
+        if (image) {
+          previewImageByTemplateId.set(templateId, image);
+        }
+      } catch {
+        // Ignore preview image decoding errors per template.
+      }
+    });
 
     // Stream PDF bytes directly to the response — no in-memory buffering.
     // Browser starts receiving data immediately instead of waiting for all
@@ -815,6 +956,68 @@ router.post('/generate', async (req: Request, res: Response) => {
       }
     });
 
+    const resolveTemplateIdForRecord = (record: Record<string, unknown>): string => {
+      if (!useFieldBasedMapping || templateMappings.length === 0) {
+        return requestedTemplateId;
+      }
+
+      const resolveValueForMappingField = (fieldName: string): string => {
+        const normalized = fieldName.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+        const direct = getRecordValueByAliases(record, [fieldName]);
+        if (direct) return direct;
+
+        // Semantic fallbacks for common student-data fields.
+        if (normalized.includes('admission') || normalized.includes('roll')) {
+          return getRecordValueByAliases(record, [
+            'Admission Number',
+            'Admission No',
+            'Admission No.',
+            'admissionNo',
+            'admission_no',
+            'admissionno',
+            'rollNo',
+            'roll_no',
+            'roll',
+          ]);
+        }
+        if (normalized.includes('school') && normalized.includes('code')) {
+          return getRecordValueByAliases(record, ['School Code', 'schoolCode', 'school_code', 'schoolcode', 'code', 'schoolId']);
+        }
+        if (normalized.includes('name') || normalized.includes('student')) {
+          return getRecordValueByAliases(record, ['Name', 'name', 'studentName', 'Student Name', 'fullName']);
+        }
+
+        return '';
+      };
+
+      for (const mapping of templateMappings) {
+        const fieldName = String(mapping?.fieldName || '').trim();
+        const fieldValue = String(mapping?.fieldValue || '').trim();
+        const templateId = String(mapping?.templateId || '').trim();
+        if (!fieldName || !fieldValue || !templateId) continue;
+
+        const recordValue = resolveValueForMappingField(fieldName);
+
+        const recordNumeric = Number(recordValue);
+        const mappingNumeric = Number(fieldValue);
+        const numericMatch = Number.isFinite(recordNumeric) && Number.isFinite(mappingNumeric) && recordNumeric === mappingNumeric;
+
+        const matched = recordValue === fieldValue || numericMatch;
+        if (matched) {
+          console.log(`[TEMPLATE MAPPING] MATCH field="${fieldName}" recordValue="${recordValue}" fieldValue="${fieldValue}" templateId="${templateId}"`);
+          return templateId;
+        } else {
+          console.log(`[TEMPLATE MAPPING] NO_MATCH field="${fieldName}" recordValue="${recordValue}" fieldValue="${fieldValue}"`);
+        }
+      }
+
+      // Use the requested template as the canonical default for all non-matching records.
+      // This guarantees mapped templates only apply to records that actually match.
+      console.log(`[TEMPLATE MAPPING] DEFAULT templateId="${requestedTemplateId}"`);
+      return requestedTemplateId;
+    };
+
     const addPage = (records: Array<Record<string, unknown>>, pageIndex: number) => {
       doc.addPage({
         size: [mmToPt(sheetWidthMm), mmToPt(sheetHeightMm)],
@@ -839,17 +1042,25 @@ router.post('/generate', async (req: Request, res: Response) => {
         const yMm = marginTopMm + row * (cardHeightMm + rowMarginMm);
         const student = studentCardData[globalRecordIndex] || resolveStudentCardData(record, req);
         const studentPhotoImage = student.photoUrl ? studentPhotoImageByUrl.get(student.photoUrl) || null : null;
+        const recordTemplateId = resolveTemplateIdForRecord(record);
+        const recordTemplate = resolvedTemplateById.get(recordTemplateId) || resolvedTemplate;
+        const recordPreviewImage = previewImageByTemplateId.get(recordTemplateId) || previewImageByTemplateId.get(requestedTemplateId) || null;
 
-        renderTemplateCard(resolvedTemplate.templateSlug as TemplateSlug, {
+        if (globalRecordIndex < 3 || useFieldBasedMapping) {
+          // Log first 3 records or all records if using field-based mapping
+          console.log(`[RECORD ${globalRecordIndex}] name="${student.name}", admissionNo="${student.admissionNo}", selectedTemplateId="${recordTemplateId}", selectedTemplateName="${recordTemplate.templateName}"`);
+        }
+
+        renderTemplateCard(recordTemplate.templateSlug as TemplateSlug, {
           doc,
           xMm,
           yMm,
           cardWidthMm,
           cardHeightMm,
-          templateLabel: resolvedTemplate.templateName,
+          templateLabel: recordTemplate.templateName,
           student,
           studentPhotoImage,
-          previewImage,
+          previewImage: recordPreviewImage,
         });
       });
     };

@@ -1,8 +1,6 @@
 ﻿import { useParams, Link, useNavigate, useLocation, useSearchParams } from "react-router";
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import * as fabric from "fabric";
-import html2canvas from "html2canvas";
-import jsPDF from "jspdf";
 import {
   ArrowLeft, Plus, Trash2, Edit, Upload, FileText,
   CheckCircle2, Circle, Clock, MoreVertical, Download,
@@ -48,6 +46,9 @@ import {
   updateProject as apiUpdateProject,
   deleteProject as apiDeleteProject,
   resolveProfileImageUrl,
+  uploadImages,
+  fetchProjectRecords,
+  saveProjectRecords,
   API_BASE,
 } from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
@@ -55,6 +56,7 @@ import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
 import { createTemplate, getTemplateById, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
+import { subscribeToTemplateUpdates } from "../../lib/realtime";
 
 // ─── Template dialog types ───────────────────────────────────────────────────
 type PageFormat = "a4" | "13x19" | "custom";
@@ -71,6 +73,14 @@ const TEMPLATE_TYPES: { value: ProjectTemplate["templateType"]; label: string }[
 ];
 
 type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean };
+const MONGODB_OBJECT_ID_RE = /^[0-9a-f]{24}$/i;
+
+function resolveTemplateLookupId(template: PreviewTemplateOption | null | undefined): string {
+  if (!template) return "";
+  const remoteId = String((template as any).remoteId || "").trim();
+  if (MONGODB_OBJECT_ID_RE.test(remoteId)) return remoteId;
+  return String(template.id || "").trim();
+}
 
 function mapApiTemplateToProjectTemplate(template: TemplateRecord): PreviewTemplateOption {
   const designData = (template.designData || {}) as Record<string, any>;
@@ -104,7 +114,7 @@ function mapApiTemplateToProjectTemplate(template: TemplateRecord): PreviewTempl
     applicableFor,
     createdAt: template.createdAt,
     canvasJSON: canvasJSON || undefined,
-    thumbnail: resolveProfileImageUrl(template.preview_image || template.previewImageUrl || "") || undefined,
+    thumbnail: resolveTemplatePreview(template, { fallbackToPlaceholder: false }) || undefined,
     isPublic: template.isGlobal === true,
     isGlobal: template.isGlobal === true,
   };
@@ -140,6 +150,15 @@ const emptyFileForm = { name: "", category: "other" as ProjectFile["category"] }
 
 type PreviewPageSize = "A4" | "A3" | "Letter" | "Legal" | "Custom";
 
+// ─── Template Mapping for Field-Based Selection ────────────────────────────
+
+interface TemplateMappingRule {
+  id: string;
+  fieldName: string;
+  fieldValue: string;
+  templateId: string;
+}
+
 interface PreviewGenerationForm {
   pageSize: PreviewPageSize;
   templateId: string;
@@ -152,7 +171,13 @@ interface PreviewGenerationForm {
   pageMarginLeftMm: string;
   rowMarginMm: string;
   columnMarginMm: string;
+  cardWidthMm: string;
+  cardHeightMm: string;
   fileName: string;
+  // Field-based template assignment
+  useFieldBasedMapping: boolean;
+  templateMappings: TemplateMappingRule[];
+  fallbackTemplateId: string;
 }
 
 const PAGE_SIZE_DIMENSIONS: Record<Exclude<PreviewPageSize, "Custom">, { width: number; height: number }> = {
@@ -174,8 +199,32 @@ const emptyPreviewForm: PreviewGenerationForm = {
   pageMarginLeftMm: "8",
   rowMarginMm: "4",
   columnMarginMm: "4",
+  cardWidthMm: "54",
+  cardHeightMm: "86",
   fileName: "preview",
+  useFieldBasedMapping: false,
+  templateMappings: [],
+  fallbackTemplateId: "",
 };
+
+const previewMappingStorageKey = (projectId: string, category: DataCategory) =>
+  `project-preview-mapping:${projectId}:${category}`;
+
+function sanitizeTemplateMappings(input: unknown): TemplateMappingRule[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item, idx) => {
+      const obj = (item && typeof item === "object") ? (item as Record<string, unknown>) : null;
+      if (!obj) return null;
+      return {
+        id: String(obj.id ?? `mapping-${idx}`),
+        fieldName: String(obj.fieldName ?? ""),
+        fieldValue: String(obj.fieldValue ?? ""),
+        templateId: String(obj.templateId ?? ""),
+      };
+    })
+    .filter((mapping): mapping is TemplateMappingRule => Boolean(mapping));
+}
 
 const GROUP_FILTER_ALL = "__all__";
 
@@ -442,16 +491,17 @@ function inspectTemplatePreview(
   const hasThumbnail = typeof template.thumbnail === "string" && template.thumbnail.trim().length > 0;
   const requiredFieldKeys = collectTemplateRequiredFields(template, layoutObjects);
   const missingFieldKeys = requiredFieldKeys.filter((fieldKey) => !availableFieldKeys.has(fieldKey));
+  const hasRenderablePreview = hasDesignElements || hasThumbnail;
 
   return {
     hasValidLayoutJson,
     elementCount,
     hasDesignElements,
     hasThumbnail,
-    hasRenderablePreview: hasDesignElements && hasThumbnail,
+    hasRenderablePreview,
     requiredFieldKeys,
     missingFieldKeys,
-    fallbackMessage: hasDesignElements ? "" : "No preview available. Please configure the template.",
+    fallbackMessage: hasRenderablePreview ? "" : "No preview available. Please configure the template.",
   };
 }
 
@@ -595,7 +645,7 @@ export function ProjectDetail() {
 
   const [bulkImageProcessing, setBulkImageProcessing] = useState(false);
   const [bulkImageResults, setBulkImageResults] = useState<{
-    matched: { userId: string; name: string; filename: string; dataUrl: string }[];
+    matched: { userId: string; name: string; filename: string; imageUrl: string }[];
     unmatched: { filename: string; reason: string }[];
     duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[];
   } | null>(null);
@@ -627,6 +677,9 @@ export function ProjectDetail() {
   const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(false);
   const [remoteTemplatesError, setRemoteTemplatesError] = useState("");
   const [remoteTemplatesVersion, setRemoteTemplatesVersion] = useState(0);
+  const [selectedFullTemplate, setSelectedFullTemplate] = useState<TemplateRecord | null>(null);
+  const [selectedFullTemplateLoading, setSelectedFullTemplateLoading] = useState(false);
+  const [fullTemplatesCache, setFullTemplatesCache] = useState<Record<string, TemplateRecord>>({}); // Cache for multiple templates
 
   const updateTemplateMargin = (key: keyof typeof emptyTemplateForm.margin, val: number) =>
     setTemplateForm((f) => ({ ...f, margin: { ...f.margin, [key]: val } }));
@@ -720,6 +773,116 @@ export function ProjectDetail() {
     };
   }, [id, remoteTemplatesVersion]);
 
+  useEffect(() => {
+    if (!id) return;
+    const unsubscribe = subscribeToTemplateUpdates(id, () => {
+      setRemoteTemplatesVersion((v) => v + 1);
+    });
+    return unsubscribe;
+  }, [id]);
+
+  // Fetch full template data (with canvasJSON) when a template is selected in preview form
+  useEffect(() => {
+    if (!previewForm.templateId || !isGeneratePreviewOpen) {
+      setSelectedFullTemplate(null);
+      return;
+    }
+
+    const lookupId = String(previewForm.templateId || "").trim();
+    if (!lookupId) {
+      setSelectedFullTemplate(null);
+      return;
+    }
+
+    let mounted = true;
+    setSelectedFullTemplateLoading(true);
+
+    // Check cache first (by local id or remote MongoDB id alias)
+    const cached = fullTemplatesCache[previewForm.templateId] || fullTemplatesCache[lookupId];
+    if (cached) {
+      if (mounted) {
+        setSelectedFullTemplate(cached);
+        setSelectedFullTemplateLoading(false);
+      }
+      return;
+    }
+
+    if (!MONGODB_OBJECT_ID_RE.test(lookupId)) {
+      setSelectedFullTemplateLoading(false);
+      return;
+    }
+
+    // Fetch from API
+    const fetchFullTemplate = async () => {
+      try {
+        const template = await getTemplateById(lookupId, { timeoutMs: 30000 });
+        if (mounted) {
+          setSelectedFullTemplate(template);
+          setFullTemplatesCache((prev) => ({
+            ...prev,
+            [lookupId]: template,
+            [previewForm.templateId]: template,
+          }));
+          setSelectedFullTemplateLoading(false);
+        }
+      } catch (error) {
+        console.warn("[preview] Failed to fetch full template data:", error);
+        if (mounted) {
+          setSelectedFullTemplateLoading(false);
+        }
+      }
+    };
+
+    fetchFullTemplate();
+
+    return () => {
+      mounted = false;
+    };
+  }, [previewForm.templateId, isGeneratePreviewOpen, fullTemplatesCache]);
+
+  // Fetch full template data for field-based mapping templates
+  useEffect(() => {
+    if (!previewForm.useFieldBasedMapping || !isGeneratePreviewOpen) return;
+
+    const templateIds = new Set<string>();
+    const resolveMappedId = (templateId: string): string => String(templateId || "").trim();
+    
+    // Collect all template IDs from mappings
+    previewForm.templateMappings.forEach((mapping) => {
+      if (mapping.templateId) templateIds.add(resolveMappedId(mapping.templateId));
+    });
+    if (previewForm.fallbackTemplateId) templateIds.add(resolveMappedId(previewForm.fallbackTemplateId));
+
+    // Fetch any missing templates
+    const toFetch = Array.from(templateIds).filter((templateId) => {
+      if (!templateId) return false;
+      if (!MONGODB_OBJECT_ID_RE.test(templateId)) return false;
+      return !fullTemplatesCache[templateId];
+    });
+    if (toFetch.length === 0) return;
+
+    let mounted = true;
+
+    const fetchTemplates = async () => {
+      for (const templateId of toFetch) {
+        try {
+          const template = await getTemplateById(templateId, { timeoutMs: 15000 });
+          if (mounted) {
+            setFullTemplatesCache((prev) => ({ ...prev, [templateId]: template }));
+          }
+        } catch (error) {
+          console.warn(`[preview] Failed to fetch template ${templateId}:`, error);
+        }
+      }
+    };
+
+    fetchTemplates();
+
+    return () => {
+      mounted = false;
+    };
+  }, [previewForm.useFieldBasedMapping, previewForm.templateMappings, previewForm.fallbackTemplateId, isGeneratePreviewOpen, fullTemplatesCache]);
+
   // Load data
   const products = id ? loadProjectProducts(id) : [];
   const tasks = id ? loadProjectTasks(id) : [];
@@ -777,9 +940,17 @@ export function ProjectDetail() {
       if (!existing) {
         dedupedByName.set(t.templateName, t);
       } else {
+        const tGlobal = Boolean(t.isGlobal);
+        const exGlobal = Boolean(existing.isGlobal);
+        const tMongo = MONGODB_OBJECT_ID_RE.test(String(t.id || ""));
+        const exMongo = MONGODB_OBJECT_ID_RE.test(String(existing.id || ""));
         const tAbsolute = Boolean(t.thumbnail?.startsWith('http'));
         const exAbsolute = Boolean(existing.thumbnail?.startsWith('http'));
-        if (tAbsolute && !exAbsolute) {
+        if (tGlobal && !exGlobal) {
+          dedupedByName.set(t.templateName, t);
+        } else if (tMongo && !exMongo) {
+          dedupedByName.set(t.templateName, t);
+        } else if (tAbsolute && !exAbsolute) {
           dedupedByName.set(t.templateName, t);
         } else if (tAbsolute === exAbsolute && t.id > existing.id) {
           dedupedByName.set(t.templateName, t);
@@ -790,14 +961,23 @@ export function ProjectDetail() {
     return Array.from(dedupedByName.values());
   }, [remoteTemplates, templates]);
 
-  const previewTemplateGroups = useMemo(() => {
-    const projectTemplates = previewTemplates.filter((template) => !template.isGlobal);
-    const globalTemplates = previewTemplates.filter((template) => template.isGlobal);
-    return {
-      projectTemplates: projectTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
-      globalTemplates: globalTemplates.sort((a, b) => a.templateName.localeCompare(b.templateName)),
-    };
-  }, [previewTemplates]);
+  // Single source for preview dropdowns: live Template Gallery + project templates from API.
+  // This intentionally avoids local-only template copies and grouped sections.
+  const galleryTemplateOptions = useMemo(() => {
+    const seenByName = new Set<string>();
+    const deduped: PreviewTemplateOption[] = [];
+
+    remoteTemplates.forEach((template) => {
+      const key = String(template.templateName || "").trim().toLowerCase();
+      if (!key || seenByName.has(key)) return;
+      seenByName.add(key);
+      deduped.push(template);
+    });
+
+    return deduped.sort((a, b) =>
+      a.templateName.localeCompare(b.templateName, undefined, { sensitivity: "base" })
+    );
+  }, [remoteTemplates]);
 
   const availableTemplateFieldKeys = useMemo(() => {
     const keys = new Set<string>();
@@ -839,16 +1019,10 @@ export function ProjectDetail() {
     ? templateDiagnosticsMap[previewTemplate.id]
     : undefined;
 
-  const selectedGenerateTemplate = previewForm.templateId
-    ? (previewTemplates.find((template) => template.id === previewForm.templateId) || null)
-    : null;
-  const selectedGenerateTemplateSlug = selectedGenerateTemplate
-    ? getTemplateSlugForRender(selectedGenerateTemplate)
-    : "";
-
-  const selectedGenerateTemplateDiagnostics = previewForm.templateId
-    ? previewTemplateDiagnosticsMap[previewForm.templateId]
-    : undefined;
+  // These will be properly defined after selectedRecords, but stub here for dependency ordering
+  let selectedGenerateTemplate: PreviewTemplateOption | null = null;
+  let selectedGenerateTemplateSlug = "";
+  let selectedGenerateTemplateDiagnostics: TemplatePreviewDiagnostics | undefined;
 
   const canRenderSelectedTemplateImage = Boolean(
     previewTemplate
@@ -890,17 +1064,90 @@ export function ProjectDetail() {
 
   useGenerateMissingPreviews(missingPreviewTemplateIds, brokenUrlIdsSet, handleBgPreviewGenerated);
 
-  useEffect(() => {
-    if (!previewForm.templateId) return;
-
-    console.debug("[PreviewUI] selectedTemplate", {
-      selectedTemplateId: previewForm.templateId,
-      selectedTemplateName: selectedGenerateTemplate?.templateName,
-      selectedTemplateSlug: selectedGenerateTemplateSlug,
-    });
-  }, [previewForm.templateId, selectedGenerateTemplate?.templateName, selectedGenerateTemplateSlug]);
-
   const refresh = () => setVersion((v) => v + 1);
+
+  // Keep data records durable in both local storage and backend.
+  const persistDataRecords = useCallback((records: ProjectDataRecord[]) => {
+    if (!id) return;
+    saveDataRecords(id, dataCategory, records);
+    setDataRecords(records);
+    void saveProjectRecords(id, dataCategory, records).then((ok) => {
+      if (!ok) {
+        console.warn("[ProjectDetail] Failed to sync records to backend; local copy is kept.");
+      }
+    });
+  }, [id, dataCategory]);
+
+  // Hydrate records from backend when available so refresh/navigation restores server state.
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+
+    const hydrateFromBackend = async () => {
+      const remote = await fetchProjectRecords(id, dataCategory);
+      if (cancelled || !remote) return;
+
+      const local = loadDataRecords(id, dataCategory);
+      if (remote.length === 0 && local.length > 0) return;
+
+      const normalized: ProjectDataRecord[] = remote.map((record, idx) => {
+        const rawId = String((record as Record<string, unknown>).id ?? "").trim();
+        const safeId = rawId || `REC-${Date.now()}-${idx}`;
+        return {
+          ...record,
+          id: safeId,
+          projectId: id,
+          category: dataCategory,
+        } as ProjectDataRecord;
+      });
+
+      saveDataRecords(id, dataCategory, normalized);
+      setDataRecords(normalized);
+    };
+
+    void hydrateFromBackend();
+    return () => {
+      cancelled = true;
+    };
+  }, [id, dataCategory]);
+
+  // Persist field-based template mapping draft so it survives refresh/navigation.
+  useEffect(() => {
+    if (!id) return;
+    try {
+      const raw = localStorage.getItem(previewMappingStorageKey(id, dataCategory));
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      setPreviewForm((prev) => ({
+        ...prev,
+        useFieldBasedMapping: Boolean(parsed.useFieldBasedMapping),
+        templateMappings: sanitizeTemplateMappings(parsed.templateMappings),
+        fallbackTemplateId: String(parsed.fallbackTemplateId ?? ""),
+      }));
+    } catch {
+      // Ignore malformed storage and continue with defaults.
+    }
+  }, [id, dataCategory]);
+
+  useEffect(() => {
+    if (!id) return;
+    const draft = {
+      useFieldBasedMapping: previewForm.useFieldBasedMapping,
+      templateMappings: previewForm.templateMappings,
+      fallbackTemplateId: previewForm.fallbackTemplateId,
+    };
+    try {
+      localStorage.setItem(previewMappingStorageKey(id, dataCategory), JSON.stringify(draft));
+    } catch {
+      // Ignore localStorage write failures.
+    }
+  }, [
+    id,
+    dataCategory,
+    previewForm.useFieldBasedMapping,
+    previewForm.templateMappings,
+    previewForm.fallbackTemplateId,
+  ]);
 
   // Handle returning from Template Gallery: switch to templates tab and refresh
   useEffect(() => {
@@ -988,6 +1235,13 @@ export function ProjectDetail() {
       });
 
       updateProjectTemplate(localTemplate.id, { remoteId: remoteTemplate._id });
+      const mappedRemote = mapApiTemplateToProjectTemplate(remoteTemplate);
+      setRemoteTemplates((prev) => {
+        const next = new Map(prev.map((item) => [item.id, item]));
+        next.set(mappedRemote.id, mappedRemote);
+        return Array.from(next.values());
+      });
+      setRemoteTemplatesVersion((v) => v + 1);
     } catch (error) {
       console.warn("[templates] Failed to persist project template to MongoDB", error);
     } finally {
@@ -1137,9 +1391,8 @@ export function ProjectDetail() {
         return rec;
       });
       saveDataFields(projectId, category, newFields);
-      saveDataRecords(projectId, category, records);
+      persistDataRecords(records);
       setDataFields(newFields);
-      setDataRecords(records);
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -1524,186 +1777,223 @@ export function ProjectDetail() {
     setBulkImageProcessing(true);
     setBulkImageResults(null);
 
-    // Read all images as data URLs
-    const loaded = await Promise.all(
-      imageFiles.map(
-        (file) =>
-          new Promise<{ file: File; dataUrl: string }>((resolve) => {
-            const r = new FileReader();
-            r.onload = (ev) => resolve({ file, dataUrl: ev.target!.result as string });
-            r.readAsDataURL(file);
-          })
-      )
-    );
+    try {
+      // Upload images to the server
+      const imageUrls = await uploadImages(imageFiles);
+      const loaded = imageFiles.map((file, idx) => ({
+        file,
+        imageUrl: imageUrls[idx] || '/uploads/assets/default.jpg'
+      }));
 
-    // Normalize a value: lowercase, trim, strip trailing Excel ".0" artifacts (e.g. "145.0" → "145")
-    const normVal = (s: unknown) =>
-      String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "");
+      // ── Normalisation helpers ──────────────────────────────────────────────
 
-    // Normalize a field key for comparison: lowercase, trim, collapse ALL
-    // separators (underscore, dot, multiple spaces) into a single space.
-    // Effect: "school_code" → "school code", "School Code" → "school code"  ← they now match!
-    const normKey = (k: string) =>
-      k.toLowerCase().trim().replace(/[_.\s]+/g, " ");
+      // Generic value normalisation: lowercase, trim, strip trailing ".0" float artifact
+      const normVal = (s: unknown) =>
+        String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "");
 
-    // Find a record field value by trying multiple key spellings.
-    // Matching strategy per key k:
-    //   1. Exact key match (rec[k])
-    //   2. normKey-equal match (unifies underscore/space/case differences)
-    const getField = (rec: ProjectDataRecord, ...keys: string[]): string => {
-      for (const k of keys) {
-        if (rec[k] !== undefined && rec[k] !== null) return normVal(rec[k]);
-        const nk = normKey(k);
-        const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
-        if (entry && entry[1] !== undefined && entry[1] !== null) return normVal(entry[1]);
-      }
-      return "";
-    };
+      // Admission/roll number normalisation: additionally strip leading AND trailing
+      // dots so that "..", "...", "...3" → "", "", "3".  This cleans up common
+      // CSV export artefacts where early serial numbers appear as pure dots.
+      const normAdm = (s: unknown): string =>
+        String(s ?? "").trim().replace(/^\.+|\.+$/g, "").replace(/\.0+$/, "").toLowerCase().trim();
 
-    const getName = (rec: ProjectDataRecord) =>
-      String(rec["Name"] ?? rec["name"] ?? rec["full_name"] ?? rec["Full Name"] ?? rec["Student Name"] ?? rec.id);
+      // Name normalisation: lowercase, keep only alphanumeric chars so spaces,
+      // dots, hyphens and underscores are all stripped before comparison.
+      const normName = (s: unknown): string =>
+        String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 
-    const matched: { userId: string; name: string; filename: string; dataUrl: string }[] = [];
-    const unmatched: { filename: string; reason: string }[] = [];
-    const duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[] = [];
-    const usedUserIds = new Set<string>();
+      // Normalise a field key: lowercase, collapse separators to a single space
+      const normKey = (k: string) =>
+        k.toLowerCase().trim().replace(/[_.\s]+/g, " ");
 
-    // Internal fields that are never data-column values
-    const META_KEYS = new Set(["id", "projectId", "category", "photo"]);
+      // Read a field from a record trying multiple key spellings
+      const getField = (rec: ProjectDataRecord, ...keys: string[]): string => {
+        for (const k of keys) {
+          if (rec[k] !== undefined && rec[k] !== null) return normVal(rec[k]);
+          const nk = normKey(k);
+          const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
+          if (entry && entry[1] !== undefined && entry[1] !== null) return normVal(entry[1]);
+        }
+        return "";
+      };
 
-    /**
-     * Find matching records using TWO strategies (in order):
-     *
-     * 1. Named-field strategy — looks for well-known school-code and
-     *    roll/admission-number column names. Fast and precise.
-     *
-     * 2. Value-scan fallback — if strategy 1 returns nothing, scan every
-     *    field of every record looking for a record that has BOTH
-     *    fileSchoolCode and fileRollNumber as values in separate columns.
-     *    This is column-name-agnostic and handles any CSV format.
-     */
-    const findMatches = (fileSchoolCode: string, fileRollNumber: string): ProjectDataRecord[] => {
-      // ── Strategy 1: named fields ──────────────────────────────────────────
-      const byName = dataRecords.filter((rec) => {
-        const recSchoolCode = getField(
-          rec,
-          "school_code", "School Code", "schoolCode", "school_id", "School Id",
-          "Sch Code", "sch_code",
-        );
-        const recRoll = getField(
-          rec,
-          "roll_number", "Roll Number", "roll_no", "Roll No",
-          "rollNumber", "rollNo", "Roll_No", "Roll_Number",
-        );
-        const recAdm = getField(
+      // Read the admission/roll number for a record (using normAdm so dots are stripped)
+      const getAdmField = (rec: ProjectDataRecord): string =>
+        normAdm(getField(
           rec,
           "admission_number", "Admission Number", "admission_no", "Admission No",
           "adm_no", "Adm No", "adm_number", "Adm Number", "Adm. No",
           "admNo", "admissionNumber", "admissionNo",
+          "roll_number", "Roll Number", "roll_no", "Roll No",
+          "rollNumber", "rollNo", "Roll_No", "Roll_Number",
+        ));
+
+      // Read the school code for a record
+      const getSchoolField = (rec: ProjectDataRecord): string =>
+        getField(
+          rec,
+          "school_code", "School Code", "schoolCode", "school_id", "School Id",
+          "Sch Code", "sch_code",
         );
-        const schoolMatch = recSchoolCode === fileSchoolCode;
-        const idMatch =
-          (recRoll !== "" && recRoll === fileRollNumber) ||
-          (recAdm  !== "" && recAdm  === fileRollNumber);
-        return schoolMatch && idMatch;
-      });
 
-      if (byName.length > 0) return byName;
+      // Best display name for a record
+      const getName = (rec: ProjectDataRecord) =>
+        String(
+          rec["Name"] ?? rec["name"] ?? rec["full_name"] ?? rec["Full Name"] ??
+          rec["Student Name"] ?? rec["student_name"] ?? rec.id
+        );
 
-      // ── Strategy 2: value-scan (column-name-agnostic) ────────────────────
-      // For each record, collect data-column values (skip meta keys + long text
-      // like addresses).  A record matches if it has BOTH fileSchoolCode and
-      // fileRollNumber as values in DIFFERENT columns.
-      return dataRecords.filter((rec) => {
-        const values = Object.entries(rec)
-          .filter(([k]) => !META_KEYS.has(k))
-          .map(([, v]) => normVal(v))
-          .filter((v) => v.length > 0 && v.length <= 20); // ignore long text fields
-        const hasSchool = values.includes(fileSchoolCode);
-        const hasRoll   = values.includes(fileRollNumber);
-        return hasSchool && hasRoll && fileSchoolCode !== fileRollNumber;
-      });
-    };
+      const matched: { userId: string; name: string; filename: string; imageUrl: string }[] = [];
+      const unmatched: { filename: string; reason: string }[] = [];
+      const duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[] = [];
+      const usedUserIds = new Set<string>();
 
-    loaded.forEach(({ file: f, dataUrl }) => {
-      // Strip extension
-      const basename = f.name.replace(/\.[^.]+$/, "");
-      const parts = basename.split("_");
+      // Internal fields that are never data-column values
+      const META_KEYS = new Set(["id", "projectId", "category", "photo"]);
 
-      // Filenames with at least 2 underscore-separated parts are matched using
-      // the format:  <school_code>_<roll_number>_[...rest]
-      // e.g.  145_3_Yash_katiyar.jpg  →  school_code=145, roll_number=3
-      if (parts.length < 2) {
-        unmatched.push({
-          filename: f.name,
-          reason: 'Invalid filename format — must contain underscore separator (e.g. 145_3_Name.jpg)',
-        });
-        return;
-      }
+      /**
+       * 3-tier matching strategy
+       *
+       * Tier 1 — school + admission number (exact, normalised)
+       *   If exactly one match → return it.
+       *   If multiple matches → use name from filename to disambiguate (Tier 1b).
+       *
+       * Tier 2 — school + name only (when admission is blank/all-dots after normalisation)
+       *   Used when the admission segment of the filename normalises to "".
+       *
+       * Tier 3 — value-scan (column-name-agnostic fallback)
+       *   Scans every column value; a record matches if it contains both the
+       *   school code and the admission number as values in different columns.
+       */
+      type TierMatch =
+        | { kind: 'exact';     record: ProjectDataRecord; method: string }
+        | { kind: 'duplicate'; records: ProjectDataRecord[]; method: string }
+        | { kind: 'none' };
 
-      const fileSchoolCode = normVal(parts[0]);
-      const fileRollNumber = normVal(parts[1]);
+      const resolveMatch = (
+        fileSchoolCode: string,
+        fileAdmNorm: string,
+        fileNameNorm: string,
+      ): TierMatch => {
 
-      // Both parts must be non-empty to attempt matching
-      if (!fileSchoolCode || !fileRollNumber) {
-        unmatched.push({
-          filename: f.name,
-          reason: 'Could not extract school code or roll number from filename',
-        });
-        return;
-      }
-
-      const hits = findMatches(fileSchoolCode, fileRollNumber);
-
-      if (hits.length === 0) {
-        // Build a debug hint showing the actual field keys in the first record
-        const sampleKeys = dataRecords.length > 0
-          ? Object.keys(dataRecords[0])
-              .filter((k) => !META_KEYS.has(k))
-              .slice(0, 6)
-              .join(", ")
-          : "no records loaded";
-        unmatched.push({
-          filename: f.name,
-          reason: `No match for school_code="${fileSchoolCode}" + id="${fileRollNumber}". ` +
-                  `Available columns: [${sampleKeys}]`,
-        });
-      } else if (hits.length > 1) {
-        const allMatchNames = hits.map(getName);
-        const rec = hits[0];
-        duplicates.push({ filename: f.name, allMatchNames, appliedName: getName(rec) });
-        // Still apply to first match
-        if (!usedUserIds.has(rec.id)) {
-          usedUserIds.add(rec.id);
-          matched.push({
-            userId: rec.id,
-            name: getName(rec),
-            filename: f.name,
-            dataUrl,
+        // ── Tier 1: school + admission ────────────────────────────────────
+        if (fileAdmNorm) {
+          const hits = dataRecords.filter((rec) => {
+            const recSchool = getSchoolField(rec);
+            const recAdm    = getAdmField(rec);
+            return recSchool === fileSchoolCode && recAdm !== "" && recAdm === fileAdmNorm;
           });
+
+          if (hits.length === 1) return { kind: 'exact', record: hits[0], method: 'school+admission' };
+
+          if (hits.length > 1) {
+            // Tier 1b: disambiguate by name from filename
+            if (fileNameNorm) {
+              const nameHits = hits.filter((rec) => normName(getName(rec)) === fileNameNorm);
+              if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+admission+name' };
+              if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'admission+name-ambiguous' };
+            }
+            // Name didn't narrow it down — report all admission hits as duplicates
+            return { kind: 'duplicate', records: hits, method: 'admission-duplicate' };
+          }
         }
-      } else {
-        const rec = hits[0];
-        if (usedUserIds.has(rec.id)) {
-          duplicates.push({
-            filename: f.name,
-            allMatchNames: [getName(rec)],
-            appliedName: '(already assigned to another file)',
+
+        // ── Tier 2: school + name (when admission is blank or no admission hit) ──
+        if (fileNameNorm) {
+          const nameHits = dataRecords.filter((rec) => {
+            const recSchool = getSchoolField(rec);
+            return recSchool === fileSchoolCode && normName(getName(rec)) === fileNameNorm;
           });
+          if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+name' };
+          if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'name-duplicate' };
+        }
+
+        // ── Tier 3: value-scan fallback ────────────────────────────────────
+        if (fileAdmNorm) {
+          const scanHits = dataRecords.filter((rec) => {
+            const values = Object.entries(rec)
+              .filter(([k]) => !META_KEYS.has(k))
+              .map(([, v]) => normAdm(v))
+              .filter((v) => v.length > 0 && v.length <= 20);
+            return values.includes(fileSchoolCode) && values.includes(fileAdmNorm) && fileSchoolCode !== fileAdmNorm;
+          });
+          if (scanHits.length === 1) return { kind: 'exact', record: scanHits[0], method: 'value-scan' };
+          if (scanHits.length > 1)  return { kind: 'duplicate', records: scanHits, method: 'value-scan-duplicate' };
+        }
+
+        return { kind: 'none' };
+      };
+
+      loaded.forEach(({ file: f, imageUrl }) => {
+        // Strip extension, split on underscore
+        const basename = f.name.replace(/\.[^.]+$/, "");
+        const parts = basename.split("_");
+
+        if (parts.length < 2) {
+          unmatched.push({
+            filename: f.name,
+            reason: 'Invalid filename format — must be <SchoolCode>_<AdmNo>_<Name>.jpg',
+          });
+          return;
+        }
+
+        const fileSchoolCode = normVal(parts[0]);
+
+        // Admission number: normalised (strips leading/trailing dots)
+        const fileAdmRaw  = parts[1];
+        const fileAdmNorm = normAdm(fileAdmRaw);
+
+        // Student name: parts[2..] joined, normalised for comparison
+        const fileNameRaw  = parts.slice(2).join(" ");
+        const fileNameNorm = normName(fileNameRaw);
+
+        if (!fileSchoolCode) {
+          unmatched.push({ filename: f.name, reason: 'Could not extract school code from filename' });
+          return;
+        }
+
+        const result = resolveMatch(fileSchoolCode, fileAdmNorm, fileNameNorm);
+
+        if (result.kind === 'exact') {
+          const rec = result.record;
+          if (usedUserIds.has(rec.id)) {
+            // A different file was already assigned to this record
+            duplicates.push({
+              filename: f.name,
+              allMatchNames: [getName(rec)],
+              appliedName: '(record already assigned by another file)',
+            });
+          } else {
+            usedUserIds.add(rec.id);
+            matched.push({ userId: rec.id, name: getName(rec), filename: f.name, imageUrl });
+          }
+        } else if (result.kind === 'duplicate') {
+          const allMatchNames = result.records.map(getName);
+          // Do NOT auto-assign to an arbitrary record — list as duplicate for review
+          duplicates.push({ filename: f.name, allMatchNames, appliedName: '(not applied — ambiguous)' });
         } else {
-          usedUserIds.add(rec.id);
-          matched.push({
-            userId: rec.id,
-            name: getName(rec),
+          const sampleKeys = dataRecords.length > 0
+            ? Object.keys(dataRecords[0]).filter((k) => !META_KEYS.has(k)).slice(0, 6).join(", ")
+            : "no records";
+          unmatched.push({
             filename: f.name,
-            dataUrl,
+            reason: `No match for school="${fileSchoolCode}" adm="${fileAdmRaw}" name="${fileNameRaw}". ` +
+                    `Columns: [${sampleKeys}]`,
           });
         }
-      }
-    });
+      });
 
-    setBulkImageResults({ matched, unmatched, duplicates });
-    setBulkImageProcessing(false);
+      setBulkImageResults({ matched, unmatched, duplicates });
+    } catch (err) {
+      console.error('[Bulk Images] Upload error:', err);
+      setBulkImageResults({
+        matched: [],
+        unmatched: [{ filename: 'Upload failed', reason: (err as Error).message }],
+        duplicates: [],
+      });
+    } finally {
+      setBulkImageProcessing(false);
+    }
   };
 
   const handleBulkImageFolderChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1742,12 +2032,11 @@ export function ProjectDetail() {
   const handleApplyBulkImages = () => {
     if (!id || !bulkImageResults) return;
     const updated = [...dataRecords];
-    bulkImageResults.matched.forEach(({ userId, dataUrl }) => {
+    bulkImageResults.matched.forEach(({ userId, imageUrl }) => {
       const i = updated.findIndex((r) => r.id === userId);
-      if (i >= 0) updated[i] = { ...updated[i], photo: dataUrl };
+      if (i >= 0) updated[i] = { ...updated[i], photo: imageUrl };
     });
-    saveDataRecords(id, dataCategory, updated);
-    setDataRecords(updated);
+    persistDataRecords(updated);
     setIsBulkImageUploadOpen(false);
     setBulkImageResults(null);
   };
@@ -1793,7 +2082,160 @@ export function ProjectDetail() {
   };
 
   const selectedRecords = dataRecords.filter((record) => dataSelectedIds.has(record.id));
-  const previewCapturePagesRef = useRef<Array<HTMLDivElement | null>>([]);
+
+  // Helper to enrich a template with full canvas data from cache if available
+  const enrichTemplateWithCanvas = (template: PreviewTemplateOption | null): PreviewTemplateOption | null => {
+    if (!template) return template;
+    const lookupId = resolveTemplateLookupId(template);
+    const fullTemplate = fullTemplatesCache[template.id] || fullTemplatesCache[lookupId];
+    if (!fullTemplate) return template;
+    // Extract canvasJSON from designData if it exists there
+    const designDataAsRecord = fullTemplate.designData as any;
+    const canvasJSON = designDataAsRecord?.canvasJSON || designDataAsRecord?.canvasJson;
+    const thumbnail = resolveTemplatePreview(fullTemplate, { fallbackToPlaceholder: false }) || template.thumbnail;
+    return {
+      ...template,
+      ...(canvasJSON ? { canvasJSON } : {}),
+      ...(thumbnail ? { thumbnail } : {}),
+    };
+  };
+
+  const findPreviewTemplateByLookupId = (lookupId: string): PreviewTemplateOption | null => {
+    const id = String(lookupId || "").trim();
+    if (!id) return null;
+    return (
+      previewTemplates.find((t) => t.id === id)
+      || previewTemplates.find((t) => String((t as any).remoteId || "").trim() === id)
+      || null
+    );
+  };
+
+  const getRecordValueForField = (record: ProjectDataRecord, fieldName: string): string => {
+    const name = String(fieldName || "").trim();
+    if (!name) return "";
+
+    const direct = String(record[name] ?? "").trim();
+    if (direct) return direct;
+
+    const caseInsensitiveKey = Object.keys(record).find((key) => key.toLowerCase() === name.toLowerCase());
+    if (caseInsensitiveKey) {
+      const caseInsensitiveValue = String(record[caseInsensitiveKey] ?? "").trim();
+      if (caseInsensitiveValue) return caseInsensitiveValue;
+    }
+
+    const normalizeKey = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const normalizedName = normalizeKey(name);
+    const normalizedKey = Object.keys(record).find((key) => normalizeKey(key) === normalizedName);
+    if (normalizedKey) {
+      return String(record[normalizedKey] ?? "").trim();
+    }
+
+    // Semantic fallbacks for common student-data fields.
+    if (normalizedName.includes("admission") || normalizedName.includes("roll")) {
+      const admissionKey = Object.keys(record).find((key) => {
+        const nk = normalizeKey(key);
+        return nk.includes("admission") || nk.includes("roll");
+      });
+      if (admissionKey) {
+        return String(record[admissionKey] ?? "").trim();
+      }
+    }
+
+    if (normalizedName.includes("school") && normalizedName.includes("code")) {
+      const schoolCodeKey = Object.keys(record).find((key) => {
+        const nk = normalizeKey(key);
+        return nk.includes("school") && nk.includes("code");
+      });
+      if (schoolCodeKey) {
+        return String(record[schoolCodeKey] ?? "").trim();
+      }
+    }
+
+    if (normalizedName.includes("name") || normalizedName.includes("student")) {
+      const nameKey = Object.keys(record).find((key) => {
+        const nk = normalizeKey(key);
+        return nk.includes("name") || nk.includes("student");
+      });
+      if (nameKey) {
+        return String(record[nameKey] ?? "").trim();
+      }
+    }
+
+    return "";
+  };
+
+  // Helper function to get the appropriate template for a record based on field-based mappings
+  const getTemplateForRecord = (record: ProjectDataRecord): PreviewTemplateOption | null => {
+    if (!previewForm.useFieldBasedMapping || previewForm.templateMappings.length === 0) {
+      // No field-based mapping enabled, use the single template
+      return findPreviewTemplateByLookupId(previewForm.templateId);
+    }
+
+    // Try to find a matching mapping rule
+    for (const mapping of previewForm.templateMappings) {
+      if (mapping.fieldName && mapping.fieldValue && mapping.templateId) {
+        const recordValue = getRecordValueForField(record, mapping.fieldName);
+        const mappingValue = mapping.fieldValue.trim();
+        const recordNumeric = Number(recordValue);
+        const mappingNumeric = Number(mappingValue);
+        const numericMatch = Number.isFinite(recordNumeric) && Number.isFinite(mappingNumeric) && recordNumeric === mappingNumeric;
+        if (recordValue === mappingValue || numericMatch) {
+          return findPreviewTemplateByLookupId(mapping.templateId);
+        }
+      }
+    }
+
+    // No matching rule found, use the main selected template as default.
+    // This prevents mapped templates from becoming global defaults.
+    return findPreviewTemplateByLookupId(previewForm.templateId)
+      || findPreviewTemplateByLookupId(previewForm.fallbackTemplateId);
+  };
+
+  // Now compute the actual values for selectedGenerateTemplate, etc.
+  selectedGenerateTemplate = previewForm.useFieldBasedMapping && selectedRecords.length > 0
+    ? getTemplateForRecord(selectedRecords[0])
+    : (previewForm.templateId
+      ? (findPreviewTemplateByLookupId(previewForm.templateId))
+      : null);
+
+  // Merge full template data (with canvasJSON and thumbnail) if available
+  if (selectedGenerateTemplate && selectedFullTemplate) {
+    const designDataAsRecord = selectedFullTemplate.designData as any;
+    const canvasJSON = designDataAsRecord?.canvasJSON || designDataAsRecord?.canvasJson;
+    const thumbnail = resolveTemplatePreview(selectedFullTemplate, { fallbackToPlaceholder: false }) || selectedGenerateTemplate.thumbnail;
+    if (canvasJSON || thumbnail) {
+      selectedGenerateTemplate = {
+        ...selectedGenerateTemplate,
+        ...(canvasJSON ? { canvasJSON } : {}),
+        ...(thumbnail ? { thumbnail } : {}),
+      };
+    }
+  }
+
+  if (selectedGenerateTemplate) {
+    const selectedLookupId = resolveTemplateLookupId(selectedGenerateTemplate);
+    const generatedThumb =
+      bgGeneratedPreviews[selectedGenerateTemplate.id]
+      || bgGeneratedPreviews[selectedLookupId]
+      || "";
+    if (generatedThumb && !selectedGenerateTemplate.thumbnail) {
+      selectedGenerateTemplate = {
+        ...selectedGenerateTemplate,
+        thumbnail: generatedThumb,
+      };
+    }
+  }
+
+  selectedGenerateTemplateSlug = selectedGenerateTemplate
+    ? getTemplateSlugForRender(selectedGenerateTemplate)
+    : "";
+
+  // Recompute diagnostics for the merged template (which now has canvasJSON)
+  if (selectedGenerateTemplate) {
+    selectedGenerateTemplateDiagnostics = inspectTemplatePreview(selectedGenerateTemplate, availableTemplateFieldKeys);
+  } else {
+    selectedGenerateTemplateDiagnostics = undefined;
+  }
 
   const printLayout = useMemo(() => {
     const sheetWidthMm = Number(previewForm.sheetWidthMm);
@@ -1812,8 +2254,10 @@ export function ProjectDetail() {
 
     const usableWidth = Math.max(1, sheetWidthPx - marginLeftPx * 2);
     const usableHeight = Math.max(1, sheetHeightPx - marginTopPx * 2);
-    const columns = Math.max(1, Math.floor((usableWidth + columnGapPx) / (PREVIEW_CARD_WIDTH_PX + columnGapPx)));
-    const rows = Math.max(1, Math.floor((usableHeight + rowGapPx) / (PREVIEW_CARD_HEIGHT_PX + rowGapPx)));
+    const cardWidthPx = Math.max(1, Math.round(Math.max(Number(previewForm.cardWidthMm) || 54, 1) * MM_TO_PX));
+    const cardHeightPx = Math.max(1, Math.round(Math.max(Number(previewForm.cardHeightMm) || 86, 1) * MM_TO_PX));
+    const columns = Math.max(1, Math.floor((usableWidth + columnGapPx) / (cardWidthPx + columnGapPx)));
+    const rows = Math.max(1, Math.floor((usableHeight + rowGapPx) / (cardHeightPx + rowGapPx)));
     const cardsPerPage = Math.max(1, columns * rows);
 
     return {
@@ -1836,35 +2280,9 @@ export function ProjectDetail() {
     previewForm.pageMarginLeftMm,
     previewForm.rowMarginMm,
     previewForm.columnMarginMm,
+    previewForm.cardWidthMm,
+    previewForm.cardHeightMm,
   ]);
-
-  const previewPrintPages = useMemo(() => {
-    if (!selectedRecords.length) return [] as ProjectDataRecord[][];
-    const pages: ProjectDataRecord[][] = [];
-    for (let i = 0; i < selectedRecords.length; i += printLayout.cardsPerPage) {
-      pages.push(selectedRecords.slice(i, i + printLayout.cardsPerPage));
-    }
-    return pages;
-  }, [selectedRecords, printLayout.cardsPerPage]);
-
-  useEffect(() => {
-    previewCapturePagesRef.current = previewCapturePagesRef.current.slice(0, previewPrintPages.length);
-  }, [previewPrintPages.length]);
-
-  const waitForImagesToLoad = async (element: HTMLElement) => {
-    const images = Array.from(element.querySelectorAll("img"));
-    await Promise.all(
-      images.map((image) => new Promise<void>((resolve) => {
-        if (image.complete && image.naturalWidth > 0) {
-          resolve();
-          return;
-        }
-        const done = () => resolve();
-        image.addEventListener("load", done, { once: true });
-        image.addEventListener("error", done, { once: true });
-      }))
-    );
-  };
 
   const handleOpenGeneratePreview = () => {
     if (!selectedRecords.length) return;
@@ -1872,14 +2290,15 @@ export function ProjectDetail() {
     const templateFromGroup = dataGroups
       .find((group) => selectedRecords.some((record) => record.groupId === group.id) && Boolean(group.templateId))
       ?.templateId;
-    const defaultTemplate = previewTemplates.find((template) => template.id === templateFromGroup)
+    const defaultTemplate = findPreviewTemplateByLookupId(templateFromGroup || "")
+      || galleryTemplateOptions[0]
       || previewTemplates[0]
       || null;
 
     setPreviewForm((prev) => ({
       ...prev,
       pageSize: "A4",
-      templateId: defaultTemplate?.id || "",
+      templateId: defaultTemplate ? resolveTemplateLookupId(defaultTemplate) : "",
       templateType: defaultTemplate?.templateType || prev.templateType,
       orientation: defaultTemplate?.canvas?.width && defaultTemplate?.canvas?.height
         ? (defaultTemplate.canvas.width > defaultTemplate.canvas.height ? "landscape" : "portrait")
@@ -1892,12 +2311,10 @@ export function ProjectDetail() {
     setIsGeneratePreviewOpen(true);
   };
 
+
   const handleGeneratePreviewPdf = async () => {
     if (!id) return;
 
-    const selectedTemplate = previewTemplates.find((template) => template.id === previewForm.templateId);
-    const selectedTemplateSlug = selectedTemplate ? getTemplateSlugForRender(selectedTemplate) : "";
-    const selectedTemplateDiagnostics = selectedTemplate ? previewTemplateDiagnosticsMap[selectedTemplate.id] : undefined;
     const sheetWidthMm = printLayout.sheetWidthMm;
     const sheetHeightMm = printLayout.sheetHeightMm;
     const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
@@ -1909,18 +2326,50 @@ export function ProjectDetail() {
       setPreviewError("Please select at least one record.");
       return;
     }
-    if (!previewForm.templateId || !selectedTemplate) {
-      setPreviewError("Please select a template.");
-      return;
+
+    // Validate template selection based on mode
+    if (previewForm.useFieldBasedMapping) {
+      if (!previewForm.templateId) {
+        setPreviewError("Please select the default template.");
+        return;
+      }
+      if (previewForm.templateMappings.length === 0) {
+        setPreviewError("Please add at least one template mapping.");
+        return;
+      }
+      // Validate that all mapping templates exist
+      for (const mapping of previewForm.templateMappings) {
+        if (!mapping.fieldName || !mapping.fieldValue || !mapping.templateId) {
+          setPreviewError("All mapping fields must be filled in.");
+          return;
+        }
+        const tmpl = findPreviewTemplateByLookupId(mapping.templateId);
+        if (!tmpl) {
+          setPreviewError(`Template for mapping "${mapping.fieldValue}" not found.`);
+          return;
+        }
+      }
+      // Validate fallback template only if explicitly provided.
+      if (previewForm.fallbackTemplateId) {
+        const fallbackTemplate = findPreviewTemplateByLookupId(previewForm.fallbackTemplateId);
+        if (!fallbackTemplate) {
+          setPreviewError("Selected fallback template not found.");
+          return;
+        }
+      }
+    } else {
+      // Single template mode
+      if (!previewForm.templateId) {
+        setPreviewError("Please select a template.");
+        return;
+      }
+      const selectedTemplate = findPreviewTemplateByLookupId(previewForm.templateId);
+      if (!selectedTemplate) {
+        setPreviewError("Selected template not found.");
+        return;
+      }
     }
-    if (!selectedTemplateSlug) {
-      setPreviewError("Selected template could not be mapped to a render layout.");
-      return;
-    }
-    if (!selectedTemplateDiagnostics?.hasDesignElements) {
-      setPreviewError("No preview available. Please configure the template.");
-      return;
-    }
+
     if (!previewForm.fileName.trim()) {
       setPreviewError("File name is required.");
       return;
@@ -1941,42 +2390,110 @@ export function ProjectDetail() {
     setPreviewError("");
     setIsGeneratingPreview(true);
     try {
-      if (!previewPrintPages.length) {
-        throw new Error("No preview pages generated.");
+      const requestTemplateId = previewForm.templateId;
+
+      if (!requestTemplateId) {
+        setPreviewError("Please select a template.");
+        return;
       }
 
-      const orientation = sheetWidthMm > sheetHeightMm ? "landscape" : "portrait";
-      const doc = new jsPDF({
-        orientation,
-        unit: "mm",
-        format: [sheetWidthMm, sheetHeightMm],
-        compress: true,
+      const requestTemplate = findPreviewTemplateByLookupId(requestTemplateId);
+      const templatePayload = requestTemplate
+        ? {
+            id: resolveTemplateLookupId(requestTemplate),
+            templateName: requestTemplate.templateName,
+            templateType: requestTemplate.templateType,
+            templateSlug: getTemplateSlugForRender(requestTemplate),
+            canvas: requestTemplate.canvas,
+            thumbnail: requestTemplate.thumbnail,
+            previewImageUrl: requestTemplate.thumbnail,
+          }
+        : { id: requestTemplateId };
+
+      const body = {
+        selectedRecordIds: selectedRecords.map((record) => String(record.id || "")).filter(Boolean),
+        selectedRecords,
+        configuration: {
+          pageSize: previewForm.pageSize,
+          templateId: requestTemplateId,
+          orientation: previewForm.orientation,
+          templateType: previewForm.templateType,
+          isSample: previewForm.isSample === "yes",
+          sheetSize: {
+            widthMm: sheetWidthMm,
+            heightMm: sheetHeightMm,
+          },
+          pageMargin: {
+            topMm: pageMarginTopMm,
+            leftMm: pageMarginLeftMm,
+          },
+          cardSize: {
+            widthMm: Number(previewForm.cardWidthMm) || 54,
+            heightMm: Number(previewForm.cardHeightMm) || 86,
+          },
+          rowMarginMm,
+          columnMarginMm,
+          fileName: previewForm.fileName.trim(),
+          useFieldBasedMapping: previewForm.useFieldBasedMapping,
+          fallbackTemplateId: previewForm.fallbackTemplateId || previewForm.templateId,
+          templateMappings: previewForm.templateMappings.map((mapping) => ({
+            fieldName: mapping.fieldName,
+            fieldValue: mapping.fieldValue,
+            templateId: mapping.templateId,
+          })),
+        },
+        template: templatePayload,
+      };
+
+      console.log('[PDF Generation] Request body:', {
+        useFieldBasedMapping: body.configuration.useFieldBasedMapping,
+        templateMappings: body.configuration.templateMappings,
+        fallbackTemplateId: body.configuration.fallbackTemplateId,
+        selectedRecordCount: body.selectedRecords.length,
+        sampleRecords: body.selectedRecords.slice(0, 3),
       });
 
-      for (let pageIndex = 0; pageIndex < previewPrintPages.length; pageIndex += 1) {
-        const pageElement = previewCapturePagesRef.current[pageIndex];
-        if (!pageElement) {
-          throw new Error(`Unable to render preview page ${pageIndex + 1}.`);
-        }
+      const response = await fetch(`${API_BASE}/preview/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
 
-        await waitForImagesToLoad(pageElement);
-        const canvas = await html2canvas(pageElement, {
-          useCORS: true,
-          scale: 2,
-          backgroundColor: "#ffffff",
-        });
-        const imageData = canvas.toDataURL("image/png", 1);
-
-        if (pageIndex > 0) {
-          doc.addPage([sheetWidthMm, sheetHeightMm], orientation);
+      if (!response.ok) {
+        let errorMessage = `Failed to generate preview PDF (HTTP ${response.status})`;
+        try {
+          const errorJson = await response.json();
+          const parsedMessage = String((errorJson as any)?.error || "").trim();
+          if (parsedMessage) {
+            errorMessage = parsedMessage;
+          }
+        } catch {
+          // Ignore parse failures and use default message.
         }
-        doc.addImage(imageData, "PNG", 0, 0, sheetWidthMm, sheetHeightMm, undefined, "FAST");
+        throw new Error(errorMessage);
       }
 
-      doc.save(`${previewForm.fileName.trim()}.pdf`);
+      const blob = await response.blob();
+      if (!blob || blob.size === 0) {
+        throw new Error("Empty PDF response received.");
+      }
+
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `${previewForm.fileName.trim()}.pdf`;
+      anchor.rel = "noopener";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+
       setIsGeneratePreviewOpen(false);
     } catch (error) {
-      setPreviewError((error as Error).message || "Failed to generate preview PDF.");
+      const errorMsg = (error as Error).message || "Failed to generate preview PDF.";
+      setPreviewError(errorMsg);
     } finally {
       setIsGeneratingPreview(false);
     }
@@ -3124,9 +3641,8 @@ export function ProjectDetail() {
                     onComplete={(fields, records) => {
                       if (!id) return;
                       saveDataFields(id, dataCategory, fields);
-                      saveDataRecords(id, dataCategory, records);
+                      persistDataRecords(records);
                       setDataFields(fields);
-                      setDataRecords(records);
                       setShowImportWizard(false);
                     }}
                     onCancel={dataRecords.length > 0 ? () => setShowImportWizard(false) : undefined}
@@ -3610,10 +4126,13 @@ export function ProjectDetail() {
                     <Select
                       value={previewForm.templateId || "__none__"}
                       onValueChange={(value) => {
-                        const selectedTemplate = previewTemplates.find((template) => template.id === value);
+                        const selectedTemplate = galleryTemplateOptions.find(
+                          (template) => resolveTemplateLookupId(template) === value || template.id === value
+                        );
+                        const selectedLookupId = selectedTemplate ? resolveTemplateLookupId(selectedTemplate) : value;
                         setPreviewForm((prev) => ({
                           ...prev,
-                          templateId: value === "__none__" ? "" : value,
+                          templateId: value === "__none__" ? "" : selectedLookupId,
                           templateType: selectedTemplate?.templateType || prev.templateType,
                         }));
                       }}
@@ -3621,91 +4140,248 @@ export function ProjectDetail() {
                       <SelectTrigger className="h-9">
                         <SelectValue placeholder="Select a template" />
                       </SelectTrigger>
-                      <SelectContent>
+                      <SelectContent className="max-h-[300px]">
                         <SelectItem value="__none__">Select a template</SelectItem>
                         {remoteTemplatesLoading ? (
-                          <div className="px-2 py-1 text-xs text-muted-foreground">Loading templates...</div>
-                        ) : previewTemplates.length === 0 ? (
-                          <div className="px-2 py-1 text-xs text-muted-foreground">No templates available.</div>
+                          <SelectItem value="__loading__" disabled>
+                            Loading templates...
+                          </SelectItem>
+                        ) : galleryTemplateOptions.length === 0 ? (
+                          <SelectItem value="__empty__" disabled>
+                            No templates available
+                          </SelectItem>
                         ) : (
-                          <>
-                            {previewTemplateGroups.projectTemplates.length > 0 && (
-                              <div className="px-2 py-1 text-xs text-muted-foreground">Project Templates</div>
-                            )}
-                            {previewTemplateGroups.projectTemplates.map((template) => (
-                              <SelectItem key={template.id} value={template.id}>
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="truncate">{template.templateName}</span>
-                                  <Badge variant="outline" className="text-[10px]">Project</Badge>
-                                </div>
-                              </SelectItem>
-                            ))}
-                            {previewTemplateGroups.globalTemplates.length > 0 && (
-                              <div className="px-2 py-1 text-xs text-muted-foreground">Public Templates</div>
-                            )}
-                            {previewTemplateGroups.globalTemplates.map((template) => (
-                              <SelectItem key={template.id} value={template.id}>
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="truncate">{template.templateName}</span>
-                                  <Badge variant="secondary" className="text-[10px]">Global</Badge>
-                                </div>
-                              </SelectItem>
-                            ))}
-                          </>
+                          galleryTemplateOptions.map((template) => (
+                            <SelectItem key={template.id} value={resolveTemplateLookupId(template)}>
+                              {template.templateName}
+                            </SelectItem>
+                          ))
                         )}
                       </SelectContent>
                     </Select>
                     {remoteTemplatesError ? (
-                      <p className="text-xs text-destructive">{remoteTemplatesError}</p>
+                      <p className="text-xs text-destructive mt-1">{remoteTemplatesError}</p>
                     ) : null}
-                  </div>
-
-                  <div className="sm:col-span-2 space-y-1.5">
-                    <Label>Rendered template preview</Label>
-                    <IdCardGrid students={selectedRecords.slice(0, 1)} template={selectedGenerateTemplate} />
-                    {selectedRecords.length > 1 && (
+                    {!remoteTemplatesLoading && galleryTemplateOptions.length > 0 && (
                       <p className="text-xs text-muted-foreground mt-1">
-                        Showing 1 of {selectedRecords.length} student(s). PDF will include all.
+                        {galleryTemplateOptions.length} templates available
                       </p>
                     )}
                   </div>
 
-                  <div aria-hidden className="pointer-events-none fixed -left-[10000px] top-0 opacity-0">
-                    {previewPrintPages.map((pageRecords, pageIndex) => (
-                      <div
-                        key={`print-page-${pageIndex}`}
-                        ref={(el) => {
-                          previewCapturePagesRef.current[pageIndex] = el;
-                        }}
-                      >
-                        <div
-                          className="id-print-page id-print-page-grid"
-                          style={{
-                            width: `${printLayout.sheetWidthPx}px`,
-                            height: `${printLayout.sheetHeightPx}px`,
-                            padding: `${printLayout.marginTopPx}px ${printLayout.marginLeftPx}px`,
-                            gridTemplateColumns: `repeat(${printLayout.columns}, ${PREVIEW_CARD_WIDTH_PX}px)`,
-                            columnGap: `${printLayout.columnGapPx}px`,
-                            rowGap: `${printLayout.rowGapPx}px`,
+                  {/* Field-based Template Mapping Toggle */}
+                  <div className="sm:col-span-2 space-y-2 p-3 border rounded-lg bg-muted/30">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Label className="text-sm font-medium cursor-pointer">Use Field-Based Template Assignment</Label>
+                        <Switch
+                          checked={previewForm.useFieldBasedMapping}
+                          onCheckedChange={(checked) =>
+                            setPreviewForm((prev) => ({
+                              ...prev,
+                              useFieldBasedMapping: checked,
+                            }))
+                          }
+                        />
+                      </div>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Assign different templates based on data field values (e.g., Section A → Template 1, Section B → Template 2).
+                      <span className="block mt-1">
+                        Non-matching records use the main selected template by default.
+                      </span>
+                    </p>
+                  </div>
+
+                  {/* Field-based Mapping Configuration */}
+                  {previewForm.useFieldBasedMapping && (
+                    <div className="sm:col-span-2 space-y-3 p-3 border rounded-lg">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-sm font-medium">Template Mappings</Label>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs gap-1"
+                          onClick={() => {
+                            const newMapping: TemplateMappingRule = {
+                              id: `mapping-${Date.now()}`,
+                              fieldName: "",
+                              fieldValue: "",
+                              templateId: "",
+                            };
+                            setPreviewForm((prev) => ({
+                              ...prev,
+                              templateMappings: [...prev.templateMappings, newMapping],
+                            }));
                           }}
                         >
-                          {pageRecords.map((student, studentIndex) => (
-                            <IdCard
-                              key={`print-card-${student.id}-${pageIndex}-${studentIndex}`}
-                              student={student}
-                              template={selectedGenerateTemplate}
-                            />
+                          <Plus className="h-3 w-3" /> Add Mapping
+                        </Button>
+                      </div>
+
+                      {previewForm.templateMappings.length === 0 ? (
+                        <p className="text-xs text-muted-foreground italic">No mappings added yet. Click "Add Mapping" to start.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {previewForm.templateMappings.map((mapping, idx) => (
+                            <div key={mapping.id} className="flex items-end gap-2 p-2 border rounded bg-background">
+                              <div className="flex-1 space-y-1">
+                                <Label className="text-xs">Field</Label>
+                                <Select
+                                  value={mapping.fieldName}
+                                  onValueChange={(value) => {
+                                    setPreviewForm((prev) => ({
+                                      ...prev,
+                                      templateMappings: prev.templateMappings.map((m) =>
+                                        m.id === mapping.id ? { ...m, fieldName: value } : m
+                                      ),
+                                    }));
+                                  }}
+                                >
+                                  <SelectTrigger className="h-8 text-xs">
+                                    <SelectValue placeholder="Select field" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {dataFields.map((field) => (
+                                      <SelectItem key={field.key} value={field.key}>
+                                        {field.label}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
+
+                              <div className="flex-1 space-y-1">
+                                <Label className="text-xs">Value</Label>
+                                <Input
+                                  type="text"
+                                  value={mapping.fieldValue}
+                                  onChange={(e) => {
+                                    setPreviewForm((prev) => ({
+                                      ...prev,
+                                      templateMappings: prev.templateMappings.map((m) =>
+                                        m.id === mapping.id ? { ...m, fieldValue: e.target.value } : m
+                                      ),
+                                    }));
+                                  }}
+                                  placeholder="e.g., 'A' or 'Class 10A'"
+                                  className="h-8 text-xs"
+                                />
+                              </div>
+
+                              <div className="flex-1 space-y-1">
+                                <Label className="text-xs">Template</Label>
+                                <Select
+                                  value={mapping.templateId}
+                                  onValueChange={(value) => {
+                                    const selectedTemplate = galleryTemplateOptions.find((template) => resolveTemplateLookupId(template) === value || template.id === value);
+                                    const selectedLookupId = selectedTemplate ? resolveTemplateLookupId(selectedTemplate) : value;
+                                    setPreviewForm((prev) => ({
+                                      ...prev,
+                                      templateMappings: prev.templateMappings.map((m) =>
+                                        m.id === mapping.id ? { ...m, templateId: selectedLookupId } : m
+                                      ),
+                                    }));
+                                  }}
+                                >
+                                  <SelectTrigger className="h-8 text-xs">
+                                    <SelectValue placeholder="Select template" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {galleryTemplateOptions.map((template) => (
+                                      <SelectItem key={template.id} value={resolveTemplateLookupId(template)}>
+                                        <span className="truncate text-xs">{template.templateName}</span>
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
+
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-destructive hover:text-destructive"
+                                onClick={() => {
+                                  setPreviewForm((prev) => ({
+                                    ...prev,
+                                    templateMappings: prev.templateMappings.filter((m) => m.id !== mapping.id),
+                                  }));
+                                }}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
                           ))}
                         </div>
+                      )}
+
+                      <div className="pt-2 border-t space-y-1.5">
+                        <Label className="text-xs font-medium">Fallback Template</Label>
+                        <p className="text-xs text-muted-foreground">
+                          Used for records that don't match any mapping rules
+                        </p>
+                        <Select
+                          value={previewForm.fallbackTemplateId || "__none__"}
+                          onValueChange={(value) => {
+                            const selectedTemplate = galleryTemplateOptions.find((template) => resolveTemplateLookupId(template) === value || template.id === value);
+                            const selectedLookupId = selectedTemplate ? resolveTemplateLookupId(selectedTemplate) : value;
+                            setPreviewForm((prev) => ({
+                              ...prev,
+                              fallbackTemplateId: value === "__none__" ? "" : selectedLookupId,
+                            }));
+                          }}
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue placeholder="Select fallback template" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__">Select a template</SelectItem>
+                            {galleryTemplateOptions.map((template) => (
+                              <SelectItem key={template.id} value={resolveTemplateLookupId(template)}>
+                                <span className="truncate text-xs">{template.templateName}</span>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
-                    ))}
+                    </div>
+                  )}
+
+                  <div className="sm:col-span-2 space-y-1.5">
+                    <Label>Rendered template preview</Label>
+                    {selectedFullTemplateLoading ? (
+                      <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
+                        <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                        Loading template design...
+                      </div>
+                    ) : previewForm.useFieldBasedMapping && selectedRecords.length > 0 ? (
+                      <div className="space-y-2">
+                        <IdCardGrid students={selectedRecords.slice(0, 1)} template={enrichTemplateWithCanvas(getTemplateForRecord(selectedRecords[0]))} />
+                        <p className="text-xs text-muted-foreground">
+                          Showing first record with its mapped template. PDF will apply field-based templates to all {selectedRecords.length} record(s).
+                        </p>
+                      </div>
+                    ) : !selectedGenerateTemplate ? (
+                      <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
+                        Select a template to see preview
+                      </div>
+                    ) : (
+                      <>
+                        <IdCardGrid students={selectedRecords.slice(0, 1)} template={selectedGenerateTemplate} />
+                        {selectedRecords.length > 1 && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            Showing 1 of {selectedRecords.length} student(s). PDF will include all.
+                          </p>
+                        )}
+                      </>
+                    )}
                   </div>
 
                   {selectedGenerateTemplateDiagnostics && (
                     <div className="sm:col-span-2 space-y-1">
-                      {!selectedGenerateTemplateDiagnostics.hasDesignElements && (
+                      {selectedGenerateTemplateDiagnostics.fallbackMessage && (
                         <p className="text-xs text-destructive">
-                          No preview available. Please configure the template.
+                          {selectedGenerateTemplateDiagnostics.fallbackMessage}
                         </p>
                       )}
                       {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
@@ -3780,63 +4456,87 @@ export function ProjectDetail() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="space-y-1.5">
-                    <Label>Sheet width (mm)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.sheetWidthMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Sheet height (mm)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.sheetHeightMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Page margin top</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.pageMarginTopMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Page margin left</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.pageMarginLeftMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
-                      className="h-9"
-                    />
+                <div className="space-y-1 pt-1">
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Page Size</p>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="space-y-1.5">
+                      <Label>Page width (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.sheetWidthMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Page height (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.sheetHeightMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Page margin horizontal (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.pageMarginLeftMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Page margin vertical (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.pageMarginTopMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label>Row margin (optional)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.rowMarginMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
-                      className="h-9"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>Column margin (optional)</Label>
-                    <Input
-                      type="number"
-                      value={previewForm.columnMarginMm}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
-                      className="h-9"
-                    />
+                <div className="space-y-1 pt-1">
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Card Size</p>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="space-y-1.5">
+                      <Label>Card width (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.cardWidthMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, cardWidthMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Card height (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.cardHeightMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, cardHeightMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Card margin horizontal (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.columnMarginMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Card margin vertical (mm)</Label>
+                      <Input
+                        type="number"
+                        value={previewForm.rowMarginMm}
+                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
+                        className="h-9"
+                      />
+                    </div>
                   </div>
                 </div>
 
@@ -3953,7 +4653,7 @@ export function ProjectDetail() {
                         <ul className="text-xs text-green-700 space-y-0.5 max-h-36 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
                           {bulkImageResults.matched.map((m) => (
                             <li key={m.userId} className="flex gap-1.5 items-center">
-                              <img src={m.dataUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
+                              <img src={m.imageUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
                               <span className="truncate">{m.filename} → <strong>{m.name}</strong></span>
                             </li>
                           ))}
@@ -3966,22 +4666,18 @@ export function ProjectDetail() {
                       <details className="rounded-lg border border-amber-200 bg-amber-50 overflow-hidden">
                         <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-amber-800 [list-style:none] [&::-webkit-details-marker]:hidden">
                           <AlertTriangle className="h-4 w-4 shrink-0" />
-                          <span>{bulkImageResults.duplicates.length} duplicate match{bulkImageResults.duplicates.length !== 1 ? 'es' : ''}</span>
-                          <span className="text-xs font-normal ml-1 opacity-60">(applied to first)</span>
+                          <span>{bulkImageResults.duplicates.length} ambiguous match{bulkImageResults.duplicates.length !== 1 ? 'es' : ''}</span>
+                          <span className="text-xs font-normal ml-1 opacity-60">(not applied — review manually)</span>
                           <ChevronDown className="h-3.5 w-3.5 ml-auto opacity-50" />
                         </summary>
                         <ul className="text-xs space-y-3 max-h-52 overflow-y-auto px-3 pb-3 pt-2 border-t border-amber-200">
                           {bulkImageResults.duplicates.map((d, i) => (
                             <li key={i}>
                               <p className="font-semibold text-amber-900 truncate mb-1">📄 {d.filename}</p>
+                              <p className="text-amber-700 mb-1 italic">{d.appliedName}</p>
                               <ul className="pl-3 space-y-0.5">
                                 {d.allMatchNames.map((name, ni) => (
-                                  <li key={ni} className="flex items-center gap-1.5 text-amber-800">
-                                    <span className={ni === 0 ? 'font-semibold' : 'opacity-60'}>{ni + 1}. {name}</span>
-                                    {ni === 0 && (
-                                      <span className="text-[10px] font-bold bg-amber-300 text-amber-900 px-1.5 py-0.5 rounded">APPLIED</span>
-                                    )}
-                                  </li>
+                                  <li key={ni} className="text-amber-800">{ni + 1}. {name}</li>
                                 ))}
                               </ul>
                             </li>

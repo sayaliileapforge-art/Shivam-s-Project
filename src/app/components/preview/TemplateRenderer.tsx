@@ -10,9 +10,12 @@ import "./id-card.css";
  */
 function normalizeUploadUrl(url: string): string {
   if (!url) return url;
-  // Strip any absolute origin from upload paths → relative /uploads/ proxy
-  if (/^https?:\/\/[^\/]+\/uploads\//i.test(url)) {
-    return url.replace(/^https?:\/\/[^\/]+\/uploads\//i, '/uploads/');
+  const isLocalDev = typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
+  if (!isLocalDev) return url;
+  // In local dev, strip only localhost absolute origins so Vite proxy can handle them.
+  // Keep external hosts (e.g. Hostinger) unchanged.
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/uploads\//i.test(url)) {
+    return url.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/uploads\//i, '/uploads/');
   }
   return url;
 }
@@ -134,7 +137,7 @@ function normalizeTemplateSlug(raw: string): SupportedTemplateSlug | "" {
   if (value === "template_1" || value === "template1") return "template_1";
   if (value === "template_2" || value === "template2") return "template_2";
   if (value === "template_3" || value === "template3") return "template_3";
-  if (/template[\s_-]*1|id[\s_-]*card|classic/.test(value)) return "template_1";
+  if (/template[\s_-]*1|id[\s_-]*card|classic|pvc/.test(value)) return "template_1";
   if (/template[\s_-]*2|certificate|minimal/.test(value)) return "template_2";
   if (/template[\s_-]*3|copy|poster|modern/.test(value)) return "template_3";
   return "";
@@ -333,7 +336,8 @@ function extractTemplateObjects(template: ProjectTemplate): Array<Record<string,
 
 function getTemplateBackground(template: ProjectTemplate, slug: SupportedTemplateSlug): string {
   if (template.thumbnail && template.thumbnail.trim()) {
-    return resolveProfileImageUrl(template.thumbnail.trim()) || template.thumbnail.trim();
+    const resolved = resolveProfileImageUrl(template.thumbnail.trim()) || template.thumbnail.trim();
+    return normalizeUploadUrl(resolved);
   }
   if (template.canvasJSON) {
     try {
@@ -344,7 +348,10 @@ function getTemplateBackground(template: ProjectTemplate, slug: SupportedTemplat
       const rootCanvas = (parsed.canvas as Record<string, unknown> | undefined) || pageCanvas || {};
       const bgObject = (rootCanvas.backgroundImage as Record<string, unknown> | undefined) || {};
       const bgSrc = String(bgObject.src || "").trim();
-      if (bgSrc) return resolveProfileImageUrl(bgSrc) || bgSrc;
+      if (bgSrc) {
+        const resolved = resolveProfileImageUrl(bgSrc) || bgSrc;
+        return normalizeUploadUrl(resolved);
+      }
     } catch {
       // ignore malformed JSON
     }
@@ -525,7 +532,6 @@ export function IdCard({
         className="bg"
         src={config.background}
         alt=""
-        crossOrigin="anonymous"
         draggable={false}
         loading="lazy"
         style={{ zIndex: 0 }}
@@ -545,7 +551,6 @@ export function IdCard({
           className="photo"
           src={photoUrl}
           alt={name}
-          crossOrigin="anonymous"
           loading="lazy"
           style={photoStyle}
           onError={(e) => {

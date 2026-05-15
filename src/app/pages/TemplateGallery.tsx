@@ -553,7 +553,7 @@ export function TemplateGallery() {
   // Collect IDs that need thumbnails after every templates update.
   useEffect(() => {
     const ids = activeTemplates
-      .filter((t) => !resolveTemplatePreview(t))
+      .filter((t) => !resolveTemplatePreview(t, { fallbackToPlaceholder: false }))
       .map((t) => t._id);
     setMissingPreviewIds((prev) => {
       const prevSet = new Set(prev);
@@ -636,9 +636,8 @@ export function TemplateGallery() {
         }
         const result = await createTemplate({
           productId: projectId,
-          projectId: projectId,
           templateName: t.templateName,
-          preview_image: resolveTemplatePreview(t),
+          preview_image: resolveTemplatePreview(t, { fallbackToPlaceholder: false }),
           category: (t.category as any) || "Other",
           designData: fullDesignData,
           isGlobal: false,
@@ -691,7 +690,7 @@ export function TemplateGallery() {
       const copy = await createTemplate({
         productId: t.productId ?? "",
         templateName: `${t.templateName} (Copy)`,
-        preview_image: resolveTemplatePreview(t),
+        preview_image: resolveTemplatePreview(t, { fallbackToPlaceholder: false }),
         category: (t.category as any) || "Other",
         designData: t.designData ?? {},
         isGlobal: t.isGlobal ?? false,

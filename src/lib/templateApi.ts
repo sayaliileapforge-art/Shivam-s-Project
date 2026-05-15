@@ -27,13 +27,34 @@ export function generatePreview(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL('image/png');
 }
 
-export function resolveTemplatePreview(template: Pick<TemplateRecord, 'preview_image' | 'previewImageUrl'> | null | undefined): string {
-  const raw = template?.preview_image || template?.previewImageUrl || '';
-  if (!raw) return '/placeholder.png';
+type ResolveTemplatePreviewOptions = {
+  fallbackToPlaceholder?: boolean;
+};
+
+export function resolveTemplatePreview(
+  template: Pick<TemplateRecord, 'preview_image' | 'previewImageUrl'> | null | undefined,
+  options: ResolveTemplatePreviewOptions = {}
+): string {
+  const fallbackToPlaceholder = options.fallbackToPlaceholder ?? true;
+  const raw = String(template?.preview_image || template?.previewImageUrl || '').trim();
+
+  if (!raw) {
+    return fallbackToPlaceholder ? '/placeholder.png' : '';
+  }
+
+  // Reject corrupt data URIs like "data:," or "data:J,1".
+  if (/^data:/i.test(raw) && !/^data:image\//i.test(raw)) {
+    return fallbackToPlaceholder ? '/placeholder.png' : '';
+  }
+
   if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) {
     return raw;
   }
-  return resolveProfileImageUrl(raw);
+
+  const resolved = resolveProfileImageUrl(raw);
+  if (resolved) return resolved;
+
+  return fallbackToPlaceholder ? '/placeholder.png' : '';
 }
 
 type TemplateSaveInput = {
@@ -177,6 +198,13 @@ export async function updateTemplate(templateId: string, input: Partial<Template
   });
 
   return handleResponse<TemplateRecord>(response);
+}
+
+export async function deleteTemplate(templateId: string): Promise<void> {
+  const response = await fetch(`${TEMPLATE_API_BASE}/${templateId}`, {
+    method: 'DELETE',
+  });
+  await handleResponse<unknown>(response);
 }
 
 export async function saveSelectedTemplate(input: {
