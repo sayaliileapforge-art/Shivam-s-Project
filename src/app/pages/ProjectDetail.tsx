@@ -1820,6 +1820,17 @@ export function ProjectDetail() {
         return "";
       };
 
+      // Read a raw field preserving original casing/content for display or name parsing.
+      const getFieldRaw = (rec: ProjectDataRecord, ...keys: string[]): string => {
+        for (const k of keys) {
+          if (rec[k] !== undefined && rec[k] !== null) return String(rec[k] ?? "").trim();
+          const nk = normKey(k);
+          const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
+          if (entry && entry[1] !== undefined && entry[1] !== null) return String(entry[1] ?? "").trim();
+        }
+        return "";
+      };
+
       // Read the admission/roll number for a record (using normAdm so dots are stripped)
       const getAdmField = (rec: ProjectDataRecord): string =>
         normAdm(getField(
@@ -1841,10 +1852,21 @@ export function ProjectDetail() {
 
       // Best display name for a record
       const getName = (rec: ProjectDataRecord) =>
-        String(
-          rec["Name"] ?? rec["name"] ?? rec["full_name"] ?? rec["Full Name"] ??
-          rec["Student Name"] ?? rec["student_name"] ?? rec.id
-        );
+        getFieldRaw(
+          rec,
+          "Name", "name",
+          "student_name", "Student Name", "studentName",
+          "full_name", "Full Name", "fullName",
+        ) || String(rec.id);
+
+      const getNameNorm = (rec: ProjectDataRecord): string => normName(getName(rec));
+
+      const schoolEq = (a: string, b: string): boolean => {
+        const aa = normSchool(a).replace(/^0+/, "");
+        const bb = normSchool(b).replace(/^0+/, "");
+        if (!aa || !bb) return false;
+        return aa === bb;
+      };
 
       const matched: { userId: string; name: string; filename: string; imageUrl: string }[] = [];
       const unmatched: { filename: string; reason: string }[] = [];
@@ -1860,8 +1882,9 @@ export function ProjectDetail() {
       const isLikelyAdmissionToken = (token: string): boolean => {
         if (!token) return false;
         if (/\d/.test(token)) return true;
-        // Short alpha tokens are often section/admission markers like A, B, AB.
-        if (token.length <= 4) return true;
+        // Very short alpha tokens can be section/admission markers like A, B, AB.
+        // Do not treat longer pure-alpha tokens as admission to avoid swallowing names.
+        if (/^[a-z]{1,2}$/.test(token)) return true;
         return false;
       };
 
@@ -1895,7 +1918,7 @@ export function ProjectDetail() {
           const hits = dataRecords.filter((rec) => {
             const recSchool = getSchoolField(rec);
             const recAdm    = getAdmField(rec);
-            return recSchool === fileSchoolCode && recAdm !== "" && recAdm === fileAdmNorm;
+            return schoolEq(recSchool, fileSchoolCode) && recAdm !== "" && recAdm === fileAdmNorm;
           });
 
           if (hits.length === 1) return { kind: 'exact', record: hits[0], method: 'school+admission' };
@@ -1903,7 +1926,7 @@ export function ProjectDetail() {
           if (hits.length > 1) {
             // Tier 1b: disambiguate by name from filename
             if (fileNameNorm) {
-              const nameHits = hits.filter((rec) => normName(getName(rec)) === fileNameNorm);
+              const nameHits = hits.filter((rec) => getNameNorm(rec) === fileNameNorm);
               if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+admission+name' };
               if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'admission+name-ambiguous' };
             }
@@ -1916,7 +1939,7 @@ export function ProjectDetail() {
         if (fileNameNorm) {
           const nameHits = dataRecords.filter((rec) => {
             const recSchool = getSchoolField(rec);
-            return recSchool === fileSchoolCode && normName(getName(rec)) === fileNameNorm;
+            return schoolEq(recSchool, fileSchoolCode) && getNameNorm(rec) === fileNameNorm;
           });
           if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+name' };
           if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'name-duplicate' };
@@ -1939,11 +1962,12 @@ export function ProjectDetail() {
       };
 
       loaded.forEach(({ file: f, imageUrl }) => {
-        // Strip extension and split by underscore (both ZIP and folder upload use this same parser).
+        // Strip extension, then tokenize alphanumeric chunks so punctuation style
+        // (underscore/comma/hyphen/space) does not affect parsing.
         const basename = f.name.replace(/\.[^.]+$/, "");
-        const rawParts = basename.split("_").map((part) => part.trim());
+        const rawTokens = (basename.toLowerCase().match(/[a-z0-9]+/g) ?? []).map((t) => t.trim()).filter(Boolean);
 
-        if (rawParts.length < 1) {
+        if (rawTokens.length < 1) {
           unmatched.push({
             filename: f.name,
             reason: 'Invalid filename format — must be <SchoolCode>_<AdmNo>_<Name>.jpg',
@@ -1951,22 +1975,21 @@ export function ProjectDetail() {
           return;
         }
 
-        const fileSchoolCode = normSchool(rawParts[0]);
-        const tailParts = rawParts.slice(1);
-        const cleanedTail = tailParts
-          .map(sanitizeFilenamePart)
-          .filter(Boolean);
+        const fileSchoolCode = normSchool(rawTokens[0]);
+        const cleanedTail = rawTokens.slice(1).map(sanitizeFilenamePart).filter(Boolean);
 
         // Heuristic parse:
         // - if first token after school code looks like admission, treat it as admission
         // - otherwise treat whole tail as student name (handles 145_,_Vanshika_Katiyar.jpg)
-        let fileAdmRaw = tailParts[0] ?? "";
+        let fileAdmRaw = cleanedTail[0] ?? "";
         let fileAdmNorm = "";
         let nameTokens: string[] = [];
 
         if (cleanedTail.length > 0) {
-          if (isLikelyAdmissionToken(cleanedTail[0])) {
-            fileAdmRaw = tailParts[0] ?? cleanedTail[0];
+          // Only consume first token as admission when there is at least one
+          // remaining token for the student name.
+          if (cleanedTail.length > 1 && isLikelyAdmissionToken(cleanedTail[0])) {
+            fileAdmRaw = cleanedTail[0];
             fileAdmNorm = normAdm(cleanedTail[0]);
             nameTokens = cleanedTail.slice(1);
           } else {
