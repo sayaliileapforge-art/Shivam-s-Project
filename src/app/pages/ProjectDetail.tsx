@@ -1791,11 +1791,14 @@ export function ProjectDetail() {
       const normVal = (s: unknown) =>
         String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "");
 
-      // Admission/roll number normalisation: additionally strip leading AND trailing
-      // dots so that "..", "...", "...3" → "", "", "3".  This cleans up common
-      // CSV export artefacts where early serial numbers appear as pure dots.
+      // School code normalisation: keep only alphanumeric characters and lowercase.
+      const normSchool = (s: unknown): string =>
+        String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "").replace(/[^a-z0-9]/g, "");
+
+      // Admission/roll number normalisation: keep only alphanumeric chars so
+      // values like ".", ",", "...1", "-1" are treated consistently.
       const normAdm = (s: unknown): string =>
-        String(s ?? "").trim().replace(/^\.+|\.+$/g, "").replace(/\.0+$/, "").toLowerCase().trim();
+        String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "").replace(/[^a-z0-9]/g, "");
 
       // Name normalisation: lowercase, keep only alphanumeric chars so spaces,
       // dots, hyphens and underscores are all stripped before comparison.
@@ -1830,11 +1833,11 @@ export function ProjectDetail() {
 
       // Read the school code for a record
       const getSchoolField = (rec: ProjectDataRecord): string =>
-        getField(
+        normSchool(getField(
           rec,
           "school_code", "School Code", "schoolCode", "school_id", "School Id",
           "Sch Code", "sch_code",
-        );
+        ));
 
       // Best display name for a record
       const getName = (rec: ProjectDataRecord) =>
@@ -1850,6 +1853,17 @@ export function ProjectDetail() {
 
       // Internal fields that are never data-column values
       const META_KEYS = new Set(["id", "projectId", "category", "photo"]);
+
+      const sanitizeFilenamePart = (s: string): string =>
+        s.toLowerCase().trim().replace(/[^a-z0-9]/g, "");
+
+      const isLikelyAdmissionToken = (token: string): boolean => {
+        if (!token) return false;
+        if (/\d/.test(token)) return true;
+        // Short alpha tokens are often section/admission markers like A, B, AB.
+        if (token.length <= 4) return true;
+        return false;
+      };
 
       /**
        * 3-tier matching strategy
@@ -1925,11 +1939,11 @@ export function ProjectDetail() {
       };
 
       loaded.forEach(({ file: f, imageUrl }) => {
-        // Strip extension, split on underscore
+        // Strip extension and split by underscore (both ZIP and folder upload use this same parser).
         const basename = f.name.replace(/\.[^.]+$/, "");
-        const parts = basename.split("_");
+        const rawParts = basename.split("_").map((part) => part.trim());
 
-        if (parts.length < 2) {
+        if (rawParts.length < 1) {
           unmatched.push({
             filename: f.name,
             reason: 'Invalid filename format — must be <SchoolCode>_<AdmNo>_<Name>.jpg',
@@ -1937,18 +1951,44 @@ export function ProjectDetail() {
           return;
         }
 
-        const fileSchoolCode = normVal(parts[0]);
+        const fileSchoolCode = normSchool(rawParts[0]);
+        const tailParts = rawParts.slice(1);
+        const cleanedTail = tailParts
+          .map(sanitizeFilenamePart)
+          .filter(Boolean);
 
-        // Admission number: normalised (strips leading/trailing dots)
-        const fileAdmRaw  = parts[1];
-        const fileAdmNorm = normAdm(fileAdmRaw);
+        // Heuristic parse:
+        // - if first token after school code looks like admission, treat it as admission
+        // - otherwise treat whole tail as student name (handles 145_,_Vanshika_Katiyar.jpg)
+        let fileAdmRaw = tailParts[0] ?? "";
+        let fileAdmNorm = "";
+        let nameTokens: string[] = [];
 
-        // Student name: parts[2..] joined, normalised for comparison
-        const fileNameRaw  = parts.slice(2).join(" ");
+        if (cleanedTail.length > 0) {
+          if (isLikelyAdmissionToken(cleanedTail[0])) {
+            fileAdmRaw = tailParts[0] ?? cleanedTail[0];
+            fileAdmNorm = normAdm(cleanedTail[0]);
+            nameTokens = cleanedTail.slice(1);
+          } else {
+            fileAdmRaw = "";
+            fileAdmNorm = "";
+            nameTokens = cleanedTail;
+          }
+        }
+
+        const fileNameRaw = nameTokens.join(" ");
         const fileNameNorm = normName(fileNameRaw);
 
         if (!fileSchoolCode) {
           unmatched.push({ filename: f.name, reason: 'Could not extract school code from filename' });
+          return;
+        }
+
+        if (!fileNameNorm) {
+          unmatched.push({
+            filename: f.name,
+            reason: 'Could not extract student name from filename',
+          });
           return;
         }
 
