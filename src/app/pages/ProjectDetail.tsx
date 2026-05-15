@@ -1861,6 +1861,44 @@ export function ProjectDetail() {
 
       const getNameNorm = (rec: ProjectDataRecord): string => normName(getName(rec));
 
+      const getNameTokens = (rec: ProjectDataRecord): string[] => {
+        const rawTokens: string[] = [];
+        const pushTokens = (value: string) => {
+          const parts = String(value || "").toLowerCase().match(/[a-z0-9]+/g) ?? [];
+          parts.forEach((p) => { if (p) rawTokens.push(p); });
+        };
+
+        pushTokens(getName(rec));
+        pushTokens(getFieldRaw(rec, "firstName", "first_name", "First Name"));
+        pushTokens(getFieldRaw(rec, "lastName", "last_name", "Last Name"));
+
+        return Array.from(new Set(rawTokens.map((t) => sanitizeFilenamePart(t)).filter(Boolean)));
+      };
+
+      const recordNameMatches = (rec: ProjectDataRecord, fileNameNorm: string, fileNameTokens: string[]): boolean => {
+        const recNorm = getNameNorm(rec);
+        if (recNorm && (recNorm === fileNameNorm || fileNameNorm.startsWith(recNorm) || recNorm.startsWith(fileNameNorm))) {
+          return true;
+        }
+
+        const recTokens = getNameTokens(rec);
+        if (recTokens.length > 0 && fileNameTokens.length > 0) {
+          // If all tokens available in record name are present in filename, treat as match.
+          if (recTokens.every((token) => fileNameTokens.includes(token))) return true;
+        }
+
+        return false;
+      };
+
+      const normalizePhotoReference = (value: string): string => {
+        const raw = String(value || "").trim();
+        if (!raw) return "";
+        const withoutQuery = raw.split("?")[0].split("#")[0];
+        const basename = withoutQuery.split("/").pop() ?? withoutQuery;
+        const noExt = basename.replace(/\.[^.]+$/, "");
+        return sanitizeFilenamePart(noExt);
+      };
+
       const schoolEq = (a: string, b: string): boolean => {
         const aa = normSchool(a).replace(/^0+/, "");
         const bb = normSchool(b).replace(/^0+/, "");
@@ -1911,7 +1949,23 @@ export function ProjectDetail() {
         fileSchoolCode: string,
         fileAdmNorm: string,
         fileNameNorm: string,
+        fileNameTokens: string[],
+        fileBaseNorm: string,
       ): TierMatch => {
+
+        // CSV photo path/filename fallback (same data source used by CSV import mapping).
+        // If records already contain photo/profilePic filename refs from CSV import,
+        // prefer this deterministic match first.
+        if (fileBaseNorm) {
+          const photoHits = dataRecords.filter((rec) => {
+            const recPhotoRaw = getRecordPhoto(rec);
+            if (!recPhotoRaw) return false;
+            const recPhotoNorm = normalizePhotoReference(recPhotoRaw);
+            return recPhotoNorm.length > 0 && recPhotoNorm === fileBaseNorm;
+          });
+          if (photoHits.length === 1) return { kind: 'exact', record: photoHits[0], method: 'csv-photo-reference' };
+          if (photoHits.length > 1)  return { kind: 'duplicate', records: photoHits, method: 'csv-photo-reference-duplicate' };
+        }
 
         // ── Tier 1: school + admission ────────────────────────────────────
         if (fileAdmNorm) {
@@ -1926,7 +1980,7 @@ export function ProjectDetail() {
           if (hits.length > 1) {
             // Tier 1b: disambiguate by name from filename
             if (fileNameNorm) {
-              const nameHits = hits.filter((rec) => getNameNorm(rec) === fileNameNorm);
+              const nameHits = hits.filter((rec) => recordNameMatches(rec, fileNameNorm, fileNameTokens));
               if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+admission+name' };
               if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'admission+name-ambiguous' };
             }
@@ -1939,7 +1993,7 @@ export function ProjectDetail() {
         if (fileNameNorm) {
           const nameHits = dataRecords.filter((rec) => {
             const recSchool = getSchoolField(rec);
-            return schoolEq(recSchool, fileSchoolCode) && getNameNorm(rec) === fileNameNorm;
+            return schoolEq(recSchool, fileSchoolCode) && recordNameMatches(rec, fileNameNorm, fileNameTokens);
           });
           if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+name' };
           if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'name-duplicate' };
@@ -2001,6 +2055,7 @@ export function ProjectDetail() {
 
         const fileNameRaw = nameTokens.join(" ");
         const fileNameNorm = normName(fileNameRaw);
+        const fileBaseNorm = sanitizeFilenamePart(basename.replace(/\.[^.]+$/, ""));
 
         if (!fileSchoolCode) {
           unmatched.push({ filename: f.name, reason: 'Could not extract school code from filename' });
@@ -2015,7 +2070,7 @@ export function ProjectDetail() {
           return;
         }
 
-        const result = resolveMatch(fileSchoolCode, fileAdmNorm, fileNameNorm);
+        const result = resolveMatch(fileSchoolCode, fileAdmNorm, fileNameNorm, nameTokens, fileBaseNorm);
 
         if (result.kind === 'exact') {
           const rec = result.record;
