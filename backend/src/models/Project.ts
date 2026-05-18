@@ -16,6 +16,7 @@ export interface IProject extends Document {
   workflowType?: 'variable_data' | 'direct_print';
   pages: number;
   canvasData: Record<string, any>[];
+  dataFieldsByCategory?: Record<string, Array<{ key: string; label: string }>>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -49,6 +50,7 @@ const ProjectSchema = new Schema<IProject>(
     },
     pages: { type: Number, default: 1 },
     canvasData: [Schema.Types.Mixed],
+    dataFieldsByCategory: { type: Schema.Types.Mixed, default: {} },
   },
   { timestamps: true }
 );

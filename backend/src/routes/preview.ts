@@ -344,11 +344,27 @@ async function resolveTemplateForPreview(
 ): Promise<ResolvedTemplate | null> {
   const dbTemplate = await resolveTemplateFromDatabase(requestedTemplateId);
   if (dbTemplate) {
+    // If DB template lacks layoutJSON (e.g. template was auto-saved to localStorage
+    // only, not yet explicitly saved to MongoDB), use the payload's layoutJSON.
+    if (!dbTemplate.layoutJSON) {
+      const payloadLayout = String(payload.layoutJSON || '').trim();
+      if (payloadLayout) {
+        dbTemplate.layoutJSON = payloadLayout;
+        const { hasValidLayout, elementCount } = parseLayoutAndCountElements(payloadLayout);
+        dbTemplate.hasValidLayout = hasValidLayout;
+        dbTemplate.elementCount = elementCount;
+        console.debug('[PreviewAPI] DB template missing layoutJSON — using payload fallback', {
+          templateId: requestedTemplateId,
+          layoutLen: payloadLayout.length,
+        });
+      }
+    }
     console.debug('[PreviewAPI] fetched template from DB', {
       templateId: requestedTemplateId,
       templateName: dbTemplate.templateName,
       templateType: dbTemplate.templateType,
       templateSlug: dbTemplate.templateSlug,
+      hasLayoutJSON: Boolean(dbTemplate.layoutJSON),
     });
     return dbTemplate;
   }
@@ -392,6 +408,70 @@ function getRecordValueByAliases(record: Record<string, unknown>, aliases: strin
   }
   return '';
 }
+
+// ─── Variable substitution engine (mirrors frontend TEMPLATE_VAR_ALIASES / mapData) ────
+const BACKEND_VAR_ALIASES: Record<string, string[]> = {
+  fullname:        ['Name', 'name', 'fullName', 'FullName', 'studentName', 'StudentName', 'full_name', 'Student Name'],
+  name:            ['Name', 'name', 'fullName', 'FullName', 'studentName', 'Student Name'],
+  studentname:     ['Name', 'name', 'studentName', 'StudentName', 'Student Name'],
+  classname:       ['Class', 'class', 'className', 'ClassName', 'standard', 'Standard'],
+  class:           ['Class', 'class', 'className', 'standard', 'Standard'],
+  section:         ['Section', 'section', 'Stream', 'stream', 'Division', 'div', 'Section / Stream / Section', 'Section / Stream'],
+  classsection:    ['Class', 'class', 'Section', 'section'],
+  fathername:      ['Father Name', 'fatherName', 'FatherName', 'father_name', 'Father', "Father's Name"],
+  mothername:      ['Mother Name', 'motherName', 'MotherName', 'mother_name', 'Mother', "Mother's Name"],
+  fathermobile:    ['Father Mobile', 'fatherMobile', 'FatherMobile', 'father_mobile', 'Father Mobile Number', 'Father Mobile No', "Father's Mobile"],
+  mothermobile:    ['Mother Mobile', 'motherMobile', 'MotherMobile', 'mother_mobile', 'Mother Mobile Number', 'Mother Mobile No'],
+  address:         ['Address', 'address', 'addr', 'Village', 'village', 'City', 'city', 'Permanent Address', 'permanent_address'],
+  phone:           ['Phone', 'phone', 'Mobile', 'mobile', 'Contact', 'contact', 'Father Mobile Number', 'Father Mobile'],
+  mobile:          ['Mobile', 'mobile', 'Phone', 'phone', 'Contact', 'contact', 'Father Mobile Number', 'Father Mobile'],
+  mobileno:        ['Mobile', 'mobile', 'Phone', 'phone', 'Father Mobile Number'],
+  contact:         ['Contact', 'contact', 'Mobile', 'mobile', 'Phone', 'phone'],
+  admissionno:     ['Admission Number', 'admissionNo', 'AdmissionNo', 'admission_no', 'Admission No', 'Admn No', 'rollNo', 'roll_no'],
+  admissionnumber: ['Admission Number', 'admissionNo', 'AdmissionNo', 'admission_no', 'Admn No'],
+  rollno:          ['Roll No', 'rollNo', 'roll_no', 'admissionNo', 'Admission Number'],
+  companyname:     ['Company Name', 'companyName', 'CompanyName', 'company_name', 'School Name', 'schoolName', 'SchoolName', 'school_name', 'Organisation', 'organization', 'Institute', 'institution'],
+  company:         ['Company Name', 'companyName', 'CompanyName', 'School Name', 'schoolName'],
+  schoolname:      ['School Name', 'schoolName', 'SchoolName', 'school_name', 'Company Name', 'companyName'],
+  institutename:   ['Institute', 'institution', 'School Name', 'schoolName', 'Company Name'],
+  designation:     ['Designation', 'designation', 'Role', 'role', 'Position', 'position', 'Post', 'post'],
+  signature:       ['Signature', 'signature', 'sign', 'Sign'],
+  dob:             ['DOB', 'dob', 'Date of Birth', 'dateOfBirth', 'birthDate', 'Date of Birth (DD/MM/YYYY)'],
+  dateofbirth:     ['Date of Birth', 'DOB', 'dob', 'dateOfBirth', 'Date of Birth (DD/MM/YYYY)'],
+  schoolcode:      ['School Code', 'schoolCode', 'school_code', 'SchoolCode'],
+  gender:          ['Gender', 'gender', 'Sex', 'sex'],
+  bloodgroup:      ['Blood Group', 'bloodGroup', 'blood_group', 'BloodGroup'],
+  house:           ['House', 'house', 'School House', 'schoolHouse'],
+  stream:          ['Stream', 'stream', 'Section', 'section', 'Division', 'Section / Stream / Section'],
+};
+
+function mapDataForRecord(text: string, record: Record<string, unknown>): string {
+  return text.replace(/\{\{([^}]+)\}\}/g, (_match: string, rawKey: string): string => {
+    const key = rawKey.trim();
+
+    // 1. Direct exact-key lookup
+    const direct = String(record[key] ?? '').trim();
+    if (direct) return direct;
+
+    // 2. Alias table lookup
+    const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const candidates = BACKEND_VAR_ALIASES[norm] ?? [];
+    for (const alias of candidates) {
+      const val = String(record[alias] ?? '').trim();
+      if (val) return val;
+      const entry = Object.entries(record).find(([k]) => k.toLowerCase() === alias.toLowerCase());
+      const entryVal = String(entry?.[1] ?? '').trim();
+      if (entryVal) return entryVal;
+    }
+
+    // 3. Fuzzy fallback: normalised key matches normalised record key
+    const fuzzy = Object.entries(record).find(
+      ([k]) => k.toLowerCase().replace(/[^a-z0-9]/g, '') === norm
+    );
+    return fuzzy ? String(fuzzy[1] ?? '').trim() : '';
+  });
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 /** Encode each path segment to handle spaces, commas, and other special chars in filenames. */
 function encodePathSegments(rawPath: string): string {
@@ -724,6 +804,511 @@ function renderTemplateCard(slug: TemplateSlug, context: TemplateRenderContext):
   }
 }
 
+// ─── Canvas-based card rendering ─────────────────────────────────────────────
+
+interface CanvasTextObject {
+  text: string;
+  left: number;      // px, absolute in canvas (top-left of text box)
+  top: number;       // px, absolute in canvas
+  width: number;     // px effective (already includes scaleX)
+  height: number;    // px effective (already includes scaleY)
+  fontSize: number;  // px in canvas coordinates (already includes parent scale)
+  fontWeight: string | number;
+  fontStyle: string;   // 'normal' | 'italic' | 'oblique'
+  fontFamily: string;
+  color: string;
+  textAlign: 'left' | 'center' | 'right';
+  angle: number;
+  opacity: number;     // 0–1
+  charSpacing: number; // Fabric.js units (thousandths of font size); convert at render time
+  lineHeight: number;  // multiplier, e.g. 1.16
+  underline: boolean;
+  hasVariables: boolean;
+  textType: 'text' | 'i-text' | 'textbox'; // Fabric.js object type; textbox wraps, others don't
+  textTransform: '' | 'uppercase' | 'lowercase' | 'capitalize'; // Fabric.js textTransform
+  textBackgroundColor: string;  // highlight colour behind text; '' = none
+  stroke: string;               // text outline colour; '' = none
+  strokeWidth: number;          // outline width in canvas pixels; 0 = none
+}
+
+interface CanvasPhotoArea {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+interface CanvasRenderInfo {
+  canvasWidthPx: number;
+  canvasHeightPx: number;
+  backgroundImageSrc: string;
+  textObjects: CanvasTextObject[];
+  photoAreas: CanvasPhotoArea[];
+  hasDynamicText: boolean;
+}
+
+function extractCanvasRenderInfo(
+  canvasJSON: string,
+  fallbackCanvasWidthMm?: number,
+  fallbackCanvasHeightMm?: number,
+): CanvasRenderInfo | null {
+  if (!canvasJSON) return null;
+  try {
+    const parsed = JSON.parse(canvasJSON) as Record<string, unknown>;
+
+    // ── Canvas dimensions ────────────────────────────────────────────────────
+    // config.canvas stores the design dimensions in mm (e.g. 54×86 for PVC card).
+    // Fabric.js toJSON() does NOT include canvas width/height in its output, so
+    // we derive pixels from the mm value using the same 96-DPI constant the
+    // frontend uses: px = Math.round(mm × 96/25.4)
+    const MM_TO_PX_RATIO = 96 / 25.4;
+    let canvasWidthPx = 0;
+    let canvasHeightPx = 0;
+
+    if (parsed.config && typeof parsed.config === 'object') {
+      const cfg = (parsed.config as Record<string, unknown>);
+      const cfgCanvas = (cfg.canvas && typeof cfg.canvas === 'object')
+        ? (cfg.canvas as Record<string, unknown>)
+        : {};
+      const wMm = Number(cfgCanvas.width ?? 0);
+      const hMm = Number(cfgCanvas.height ?? 0);
+      if (wMm > 0 && hMm > 0) {
+        canvasWidthPx = Math.round(wMm * MM_TO_PX_RATIO);
+        canvasHeightPx = Math.round(hMm * MM_TO_PX_RATIO);
+      }
+    }
+
+    // Some older saves may store raw pixel dimensions directly on the canvas node
+    // (or the Fabric.js node happens to carry them). Accept those too.
+    if (!canvasWidthPx || !canvasHeightPx) {
+      // We'll look at the canvas node after resolving it below.
+    }
+
+    // Fallback: caller can pass the resolved template's canvas mm dimensions.
+    if ((!canvasWidthPx || !canvasHeightPx) && fallbackCanvasWidthMm && fallbackCanvasHeightMm) {
+      canvasWidthPx = Math.round(fallbackCanvasWidthMm * MM_TO_PX_RATIO);
+      canvasHeightPx = Math.round(fallbackCanvasHeightMm * MM_TO_PX_RATIO);
+    }
+
+    // ── Canvas node (Fabric.js objects + backgroundImage) ────────────────────
+    // canvasJSON format: { config, pages, activePageId, canvas, elementMetadata }
+    // where `canvas` is the raw Fabric.js toJSON() output for the active page.
+    let canvasNode: Record<string, unknown> | null = null;
+    if (parsed.canvas && typeof parsed.canvas === 'object') {
+      canvasNode = parsed.canvas as Record<string, unknown>;
+    } else if (Array.isArray(parsed.pages) && parsed.pages.length > 0) {
+      const firstPage = parsed.pages[0] as { canvas?: Record<string, unknown> };
+      canvasNode = firstPage?.canvas ?? null;
+    }
+    if (!canvasNode) return null;
+
+    // Try pixel dimensions from the canvas node itself as a last resort.
+    if (!canvasWidthPx || !canvasHeightPx) {
+      const nw = Number(canvasNode.width ?? 0);
+      const nh = Number(canvasNode.height ?? 0);
+      if (nw > 0 && nh > 0) {
+        canvasWidthPx = nw;
+        canvasHeightPx = nh;
+      }
+    }
+
+    if (!canvasWidthPx || !canvasHeightPx) return null;
+
+    const bgImageObj = (canvasNode.backgroundImage ?? {}) as Record<string, unknown>;
+    const backgroundImageSrc = String(bgImageObj.src ?? '').trim();
+
+    const rawObjects = Array.isArray(canvasNode.objects)
+      ? (canvasNode.objects as Record<string, unknown>[])
+      : [];
+
+    const textObjects: CanvasTextObject[] = [];
+    const photoAreas: CanvasPhotoArea[] = [];
+
+    /**
+     * Recursively walks Fabric.js canvas objects and extracts text/photo info.
+     *
+     * @param objects      Array of Fabric.js serialised objects to process.
+     * @param parentCenterX  Absolute canvas-pixel X of the PARENT's geometric centre.
+     *                       For root-level objects this is 0 (canvas origin).
+     * @param parentCenterY  Absolute canvas-pixel Y of the PARENT's geometric centre.
+     * @param accumScaleX  Accumulated scale-X from all ancestor groups (start at 1).
+     * @param accumScaleY  Accumulated scale-Y from all ancestor groups (start at 1).
+     *
+     * Fabric.js coordinate rules:
+     *  - Root-level objects: `left`/`top` are absolute canvas pixels (their OWN
+     *    reference point, which is the top-left when originX='left').
+     *  - Objects inside a group: `left`/`top` are offsets from the GROUP's geometric
+     *    CENTRE (in the group's LOCAL, pre-scale coordinate space).
+     *  - The group's `scaleX`/`scaleY` stretches child positions AND sizes.
+     */
+    function processObjects(
+      objects: Record<string, unknown>[],
+      parentCenterX: number = 0,
+      parentCenterY: number = 0,
+      accumScaleX: number = 1,
+      accumScaleY: number = 1,
+    ): void {
+      for (const obj of objects) {
+        if (!obj || typeof obj !== 'object') continue;
+
+        const type = String(obj.type ?? '').toLowerCase();
+        const rawLeft = Number(obj.left ?? 0);
+        const rawTop  = Number(obj.top  ?? 0);
+        const ownScaleX = Number(obj.scaleX ?? 1) || 1;
+        const ownScaleY = Number(obj.scaleY ?? 1) || 1;
+
+        // Canvas-pixel offset of this object's reference point from the parent centre.
+        // (For root-level objects parentCenterX=0, accumScale=1, so this is just rawLeft.)
+        const absCenterX = parentCenterX + rawLeft * accumScaleX;
+        const absCenterY = parentCenterY + rawTop  * accumScaleY;
+
+        // Effective dimensions in canvas pixels (own scale × all ancestor scales).
+        const totalScaleX = ownScaleX * accumScaleX;
+        const totalScaleY = ownScaleY * accumScaleY;
+        const rawWidth  = Number((obj.__boxWidth  as number | undefined) ?? obj.width  ?? 0);
+        const rawHeight = Number((obj.__boxHeight as number | undefined) ?? obj.height ?? 0);
+        const effectiveWidth  = rawWidth  * totalScaleX;
+        const effectiveHeight = rawHeight * totalScaleY;
+
+        // Convert reference-point to TOP-LEFT corner (adjust for Fabric.js origin).
+        const originX = String(obj.originX ?? 'left');
+        const originY = String(obj.originY ?? 'top');
+        const objLeft = absCenterX - (originX === 'center' ? effectiveWidth  / 2 : 0);
+        const objTop  = absCenterY - (originY === 'center' ? effectiveHeight / 2 : 0);
+
+        const angle = Number(obj.angle ?? 0);
+
+        // ── Groups: recurse into children ─────────────────────────────────────
+        if (type === 'group' && Array.isArray(obj.objects)) {
+          // The group's geometric centre in absolute canvas pixels.
+          const groupCenterX = absCenterX + (originX === 'center' ? 0 : effectiveWidth  / 2);
+          const groupCenterY = absCenterY + (originY === 'center' ? 0 : effectiveHeight / 2);
+          // Pass totalScaleX (own × all ancestors) so that child positions, sizes, and
+          // font sizes all accumulate correctly for any nesting depth.
+          processObjects(
+            obj.objects as Record<string, unknown>[],
+            groupCenterX,
+            groupCenterY,
+            totalScaleX,   // accumulated scale: converts child local coords → canvas pixels
+            totalScaleY,
+          );
+          continue;
+        }
+
+        // ── Photo / image placeholders ────────────────────────────────────────
+        const varKey = String(
+          (obj.variableKey ?? obj.__fieldKey ?? obj.fieldKey ?? obj.dataKey ?? obj.photoField ?? '') as string
+        ).toLowerCase().replace(/[^a-z0-9]/g, '');
+        const isPhotoField = ['photo', 'photourl', 'profilepic', 'image', 'avatar', 'picture', 'studentphoto'].includes(varKey);
+
+        if ((type === 'image' || isPhotoField) && effectiveWidth > 0 && effectiveHeight > 0) {
+          photoAreas.push({ left: objLeft, top: objTop, width: effectiveWidth, height: effectiveHeight });
+          continue;
+        }
+
+        // ── Text objects ──────────────────────────────────────────────────────
+        if (['text', 'i-text', 'textbox'].includes(type)) {
+          const rawText = String(obj.text ?? obj.value ?? '').trim();
+          if (!rawText) continue;
+
+          // Font size in canvas pixels — scaled by totalScaleX (own scale × all ancestor
+          // group scales) so that grouped text renders at the correct physical size.
+          const fontSize = (Number.isFinite(Number(obj.fontSize)) ? Number(obj.fontSize) : 13)
+            * totalScaleX;
+
+          const fontWeight = String(obj.fontWeight ?? 'normal');
+          const fontStyle  = String(obj.fontStyle  ?? 'normal');
+          const fontFamily = String(obj.fontFamily ?? 'Helvetica').trim() || 'Helvetica';
+
+          const color = (typeof obj.fill === 'string' && obj.fill) ? obj.fill : '#111827';
+
+          const rawAlign = String(obj.textAlign ?? 'left');
+          const textAlign: 'left' | 'center' | 'right' =
+            rawAlign === 'center' ? 'center' : rawAlign === 'right' ? 'right' : 'left';
+
+          const opacity     = Number.isFinite(Number(obj.opacity))     ? Math.min(1, Math.max(0, Number(obj.opacity)))     : 1;
+          const charSpacing = Number.isFinite(Number(obj.charSpacing)) ? Number(obj.charSpacing) : 0;
+          const lineHeight  = Number.isFinite(Number(obj.lineHeight))  && Number(obj.lineHeight) > 0
+            ? Number(obj.lineHeight) : 1.16;
+          const underline   = Boolean(obj.underline);
+
+          const textType: 'text' | 'i-text' | 'textbox' =
+            type === 'textbox' ? 'textbox' : type === 'i-text' ? 'i-text' : 'text';
+
+          // Fabric.js extra styling properties
+          const rawTransform = String(obj.textTransform ?? '').toLowerCase();
+          const textTransform = (['uppercase', 'lowercase', 'capitalize'].includes(rawTransform)
+            ? rawTransform : '') as '' | 'uppercase' | 'lowercase' | 'capitalize';
+          const textBackgroundColor =
+            typeof obj.textBackgroundColor === 'string' &&
+            obj.textBackgroundColor &&
+            obj.textBackgroundColor !== 'transparent'
+              ? obj.textBackgroundColor : '';
+          const stroke =
+            typeof obj.stroke === 'string' &&
+            obj.stroke &&
+            obj.stroke !== 'transparent' &&
+            obj.stroke !== 'none'
+              ? obj.stroke : '';
+          const strokeWidth =
+            Number.isFinite(Number(obj.strokeWidth)) && Number(obj.strokeWidth) > 0
+              ? Number(obj.strokeWidth) : 0;
+
+          textObjects.push({
+            text: rawText,
+            left: objLeft,
+            top:  objTop,
+            width:  effectiveWidth,
+            height: effectiveHeight,
+            fontSize,
+            fontWeight,
+            fontStyle,
+            fontFamily,
+            color,
+            textAlign,
+            angle,
+            opacity,
+            charSpacing,
+            lineHeight,
+            underline,
+            hasVariables: /\{\{[^}]+\}\}/.test(rawText),
+            textType,
+            textTransform,
+            textBackgroundColor,
+            stroke,
+            strokeWidth,
+          });
+        }
+      }
+    }
+
+    processObjects(rawObjects);
+
+    return {
+      canvasWidthPx,
+      canvasHeightPx,
+      backgroundImageSrc,
+      textObjects,
+      photoAreas,
+      hasDynamicText: textObjects.some((t) => t.hasVariables),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map a Fabric.js/CSS font-family string to the nearest PDFKit built-in font.
+ * PDFKit built-ins: Courier, Helvetica, Times-Roman (+ Bold/Oblique variants).
+ */
+function selectPdfFont(fontFamily: string, bold: boolean, italic: boolean): string {
+  const f = (fontFamily || '').toLowerCase().replace(/['"]/g, '');
+  const isSerif = /^(times|georgia|garamond|palatino|didot|cambria|book antiqua|serif)/.test(f) || f === 'serif';
+  const isMono  = /^(courier|monaco|consolas|inconsolata|lucida console|monospace)/.test(f) || f === 'monospace';
+
+  if (isMono) {
+    if (bold && italic) return 'Courier-BoldOblique';
+    if (bold)   return 'Courier-Bold';
+    if (italic) return 'Courier-Oblique';
+    return 'Courier';
+  }
+  if (isSerif) {
+    if (bold && italic) return 'Times-BoldItalic';
+    if (bold)   return 'Times-Bold';
+    if (italic) return 'Times-Italic';
+    return 'Times-Roman';
+  }
+  // Default: sans-serif → Helvetica
+  if (bold && italic) return 'Helvetica-BoldOblique';
+  if (bold)   return 'Helvetica-Bold';
+  if (italic) return 'Helvetica-Oblique';
+  return 'Helvetica';
+}
+
+/**
+ * Render a card entirely from the parsed canvas data.
+ * Uses the canvas background image (not the full thumbnail) as the card backdrop,
+ * then draws all text objects with variable substitution and exact designer styling,
+ * and the student photo at the first photo-placeholder position.
+ */
+function renderCardFromCanvas(
+  doc: InstanceType<typeof PDFDocument>,
+  xMm: number,
+  yMm: number,
+  cardWidthMm: number,
+  cardHeightMm: number,
+  canvasInfo: CanvasRenderInfo,
+  record: Record<string, unknown>,
+  bgImage: unknown | null,
+  fallbackImage: unknown | null,
+  studentPhotoImage: unknown | null,
+): void {
+  const { canvasWidthPx, canvasHeightPx, textObjects, photoAreas } = canvasInfo;
+  if (!canvasWidthPx || !canvasHeightPx) return;
+
+  // Scale factors: canvas pixels → card mm
+  const scaleX  = cardWidthMm  / canvasWidthPx;
+  const scaleY  = cardHeightMm / canvasHeightPx;
+  const avgScale = (scaleX + scaleY) / 2;  // used for font size
+
+  // 1. Thin card border
+  doc.save();
+  doc.lineWidth(0.5).strokeColor('#cccccc');
+  doc.roundedRect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm), mmToPt(1.5));
+  doc.stroke();
+  doc.restore();
+
+  // 2. Background: prefer the canvas bg image; fall back to the full thumbnail
+  const backgroundToDraw = bgImage ?? fallbackImage;
+  if (backgroundToDraw) {
+    try {
+      doc.image(backgroundToDraw as Parameters<typeof doc.image>[0], mmToPt(xMm), mmToPt(yMm), {
+        width:  mmToPt(cardWidthMm),
+        height: mmToPt(cardHeightMm),
+      });
+    } catch { /* ignore – keep generating */ }
+  }
+
+  // 3. Student photo at the first photo-placeholder area
+  if (studentPhotoImage && photoAreas.length > 0) {
+    const area = photoAreas[0];
+    const pxMm = xMm + area.left  * scaleX;
+    const pyMm = yMm + area.top   * scaleY;
+    const pwMm = area.width  * scaleX;
+    const phMm = area.height * scaleY;
+    // Only draw if the area is within the card
+    if (pwMm > 0 && phMm > 0 && pxMm >= xMm - 1 && pyMm >= yMm - 1 &&
+        pxMm < xMm + cardWidthMm + 1 && pyMm < yMm + cardHeightMm + 1) {
+      try {
+        doc.image(studentPhotoImage as Parameters<typeof doc.image>[0], mmToPt(pxMm), mmToPt(pyMm), {
+          fit:   [mmToPt(pwMm), mmToPt(phMm)],
+          align: 'center',
+          valign: 'center',
+        });
+      } catch { /* ignore */ }
+    }
+  }
+
+  // 4. Text objects — clipped to the card boundary with exact designer styling
+  doc.save();
+  doc.rect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm)).clip();
+
+  for (const textObj of textObjects) {
+    // Resolve variable placeholders
+    const resolved  = mapDataForRecord(textObj.text, record);
+    const isOnlyVars = /^\s*(\{\{[^}]+\}\}\s*)+$/.test(textObj.text);
+    if (isOnlyVars && !resolved.trim()) continue;
+    const displayText = resolved || (isOnlyVars ? '' : textObj.text);
+    if (!displayText.trim()) continue;
+
+    // Map canvas px coords to card mm coords
+    const txMm = xMm + textObj.left  * scaleX;
+    const tyMm = yMm + textObj.top   * scaleY;
+    const twMm = textObj.width > 0
+      ? textObj.width  * scaleX
+      : cardWidthMm - (textObj.left * scaleX);
+    const thMm = textObj.height > 0 ? textObj.height * scaleY : 0;
+
+    // Hard bounds-check: skip objects whose top-left is completely outside the card
+    // (the PDF clip handles partial overlaps, but this prevents cursor drift)
+    if (txMm > xMm + cardWidthMm + 1 || tyMm > yMm + cardHeightMm + 1) continue;
+
+    // Convert canvas-pixel font size → mm (via avgScale) → PDF points.
+    // avgScale: canvas px → mm.  (72/25.4): mm → pt.
+    const fontSizePt = Math.max(4, textObj.fontSize * avgScale * (72 / 25.4));
+
+    const isBold   = textObj.fontWeight === 'bold' || Number(textObj.fontWeight) >= 700;
+    const isItalic = textObj.fontStyle === 'italic' || textObj.fontStyle === 'oblique';
+    const pdfFont  = selectPdfFont(textObj.fontFamily, isBold, isItalic);
+
+    // charSpacing: Fabric.js unit = 1/1000 of font size (in em).
+    // Convert to PDF points: charSpacing_pt = (charSpacing / 1000) * fontSizePt
+    const charSpacingPt = (textObj.charSpacing / 1000) * fontSizePt;
+
+    // Stroke (text outline): strokeWidthPt scaled from canvas pixels → PDF points.
+    const hasStroke = Boolean(textObj.stroke) && textObj.strokeWidth > 0;
+    const strokeWidthPt = hasStroke ? textObj.strokeWidth * avgScale * (72 / 25.4) : 0;
+
+    // Apply Fabric.js textTransform BEFORE rendering so the visible string matches the
+    // designer exactly (e.g. {{FULL_NAME}} styled uppercase → 'VANSHIKA KATIYAR').
+    const finalText =
+      textObj.textTransform === 'uppercase' ? displayText.toUpperCase()
+      : textObj.textTransform === 'lowercase' ? displayText.toLowerCase()
+      : textObj.textTransform === 'capitalize'
+          ? displayText.replace(/\b\w/g, (c) => c.toUpperCase())
+      : displayText;
+
+    doc.save();
+
+    // Apply opacity
+    if (textObj.opacity < 1) {
+      doc.fillOpacity(textObj.opacity);
+    }
+
+    // Apply rotation around the text box centre
+    if (textObj.angle !== 0) {
+      const cx = mmToPt(txMm + twMm / 2);
+      const cy = mmToPt(tyMm + (thMm > 0 ? thMm / 2 : fontSizePt / 2));
+      doc.rotate(textObj.angle, { origin: [cx, cy] });
+    }
+
+    // Draw textBackgroundColor highlight rectangle behind the text (in the rotated
+    // coordinate space, matching Fabric.js behaviour).
+    if (textObj.textBackgroundColor) {
+      const bgH = thMm > 0 ? thMm : (fontSizePt / (72 / 25.4)) * (textObj.lineHeight || 1.16);
+      doc.rect(mmToPt(txMm), mmToPt(tyMm), mmToPt(twMm), mmToPt(bgH))
+         .fill(textObj.textBackgroundColor);
+    }
+
+    // Set text fill colour; add stroke colour+width if the template uses a text outline.
+    doc.font(pdfFont)
+       .fontSize(fontSizePt)
+       .fillColor(textObj.color || '#111827');
+
+    if (hasStroke) {
+      doc.strokeColor(textObj.stroke).lineWidth(strokeWidthPt);
+    }
+
+    if (charSpacingPt !== 0) {
+      (doc as any).characterSpacing(charSpacingPt);
+    }
+
+    // Only Fabric.js textboxes perform line-wrapping; text/i-text are single-line.
+    const canWrap = textObj.textType === 'textbox';
+    const textOptions: Record<string, unknown> = {
+      width:     mmToPt(Math.max(twMm, 1)),
+      align:     textObj.textAlign,
+      lineBreak: canWrap,
+      ellipsis:  !canWrap,
+      underline: textObj.underline,
+      fill: true,
+      stroke: hasStroke,  // PDFKit mode 2 (fill + stroke) when true, mode 0 otherwise
+    };
+
+    // lineGap adds extra space between lines (PDFKit uses pts between baseline and next line).
+    if (canWrap && textObj.lineHeight !== 1.16) {
+      const lineGapPt = (textObj.lineHeight - 1) * fontSizePt - fontSizePt * 0.16;
+      if (lineGapPt > 0) textOptions['lineGap'] = lineGapPt;
+    }
+
+    // Clip to the text box height so wrapped text cannot overflow beyond its Fabric.js
+    // bounding box (Fabric.js clips overflow; we replicate that behaviour here).
+    if (thMm > 0) {
+      doc.save();
+      doc.rect(mmToPt(txMm), mmToPt(tyMm), mmToPt(twMm + 0.5), mmToPt(thMm)).clip();
+      doc.text(finalText, mmToPt(txMm), mmToPt(tyMm), textOptions as any);
+      doc.restore();
+    } else {
+      doc.text(finalText, mmToPt(txMm), mmToPt(tyMm), textOptions as any);
+    }
+
+    doc.restore();
+  }
+
+  doc.restore();
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 router.post('/generate', async (req: Request, res: Response) => {
   try {
     const body = (req.body || {}) as PreviewRequestBody;
@@ -890,6 +1475,8 @@ router.post('/generate', async (req: Request, res: Response) => {
     const rowMarginMm = clampNumber(configuration.rowMarginMm, 4, 0, 50);
     const columnMarginMm = clampNumber(configuration.columnMarginMm, 4, 0, 50);
 
+
+
     const availableWidthMm = sheetWidthMm - (marginLeftMm * 2);
     const availableHeightMm = sheetHeightMm - (marginTopMm * 2);
 
@@ -907,6 +1494,33 @@ router.post('/generate', async (req: Request, res: Response) => {
       const previewSource = resolved.thumbnail || resolved.previewImageUrl;
       const previewImageBuffer = await loadTemplatePreviewBuffer(previewSource);
       previewImageBufferByTemplateId.set(templateId, previewImageBuffer);
+    }
+
+    // Extract canvas render info and load canvas background images for variable substitution
+    const canvasRenderInfoByTemplateId = new Map<string, CanvasRenderInfo | null>();
+    for (const [templateId, resolved] of resolvedTemplateById.entries()) {
+      if (resolved.layoutJSON) {
+        const info = extractCanvasRenderInfo(
+          resolved.layoutJSON,
+          resolved.canvas.width,   // mm – used as fallback when config block is absent
+          resolved.canvas.height,
+        );
+        canvasRenderInfoByTemplateId.set(templateId, info);
+        if (info) {
+          console.debug(`[CanvasRender] Template ${templateId}: canvas=${info.canvasWidthPx}x${info.canvasHeightPx}, texts=${info.textObjects.length}, dynamic=${info.hasDynamicText}, bgSrc=${info.backgroundImageSrc ? 'yes' : 'no'}`);
+        } else {
+          console.warn(`[CanvasRender] Template ${templateId}: failed to parse canvasJSON (layoutJSON length=${resolved.layoutJSON.length})`);
+        }
+      }
+    }
+
+    const canvasBgBufferByTemplateId = new Map<string, Buffer | null>();
+    for (const [templateId, canvasInfo] of canvasRenderInfoByTemplateId.entries()) {
+      if (!canvasInfo?.backgroundImageSrc) continue;
+      const absUrl = toAbsoluteAssetUrl(canvasInfo.backgroundImageSrc, req);
+      if (!absUrl) continue;
+      const buffer = await loadTemplatePreviewBuffer(absUrl);
+      canvasBgBufferByTemplateId.set(templateId, buffer ?? null);
     }
 
     const safeName = sanitizeFileName(configuration.fileName);
@@ -929,6 +1543,17 @@ router.post('/generate', async (req: Request, res: Response) => {
       } catch {
         // Ignore preview image decoding errors per template.
       }
+    });
+
+    const canvasBgImageByTemplateId = new Map<string, any>();
+    canvasBgBufferByTemplateId.forEach((buffer, templateId) => {
+      if (!buffer) return;
+      try {
+        const image = (doc as any).openImage(buffer);
+        if (image) {
+          canvasBgImageByTemplateId.set(templateId, image);
+        }
+      } catch { /* ignore */ }
     });
 
     // Stream PDF bytes directly to the response — no in-memory buffering.
@@ -1046,22 +1671,36 @@ router.post('/generate', async (req: Request, res: Response) => {
         const recordTemplate = resolvedTemplateById.get(recordTemplateId) || resolvedTemplate;
         const recordPreviewImage = previewImageByTemplateId.get(recordTemplateId) || previewImageByTemplateId.get(requestedTemplateId) || null;
 
-        if (globalRecordIndex < 3 || useFieldBasedMapping) {
-          // Log first 3 records or all records if using field-based mapping
-          console.log(`[RECORD ${globalRecordIndex}] name="${student.name}", admissionNo="${student.admissionNo}", selectedTemplateId="${recordTemplateId}", selectedTemplateName="${recordTemplate.templateName}"`);
+        const canvasInfo = canvasRenderInfoByTemplateId.get(recordTemplateId) ?? null;
+        if (canvasInfo && canvasInfo.hasDynamicText) {
+          // Canvas-based rendering: substitute all {{VARIABLE}} placeholders
+          const canvasBgImage = canvasBgImageByTemplateId.get(recordTemplateId) ?? null;
+          renderCardFromCanvas(
+            doc,
+            xMm,
+            yMm,
+            cardWidthMm,
+            cardHeightMm,
+            canvasInfo,
+            record,
+            canvasBgImage,
+            recordPreviewImage,
+            studentPhotoImage,
+          );
+        } else {
+          renderTemplateCard(recordTemplate.templateSlug as TemplateSlug, {
+            doc,
+            xMm,
+            yMm,
+            cardWidthMm,
+            cardHeightMm,
+            templateLabel: recordTemplate.templateName,
+            student,
+            studentPhotoImage,
+            previewImage: recordPreviewImage,
+          });
         }
 
-        renderTemplateCard(recordTemplate.templateSlug as TemplateSlug, {
-          doc,
-          xMm,
-          yMm,
-          cardWidthMm,
-          cardHeightMm,
-          templateLabel: recordTemplate.templateName,
-          student,
-          studentPhotoImage,
-          previewImage: recordPreviewImage,
-        });
       });
     };
 

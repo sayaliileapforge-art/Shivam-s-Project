@@ -331,6 +331,10 @@ function asString(value: unknown): string {
   return String(value);
 }
 
+function normalizeVariableKey(key: string): string {
+  return key.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 function flattenVariableMap(input: VariableRenderInput): Record<string, string> {
   const merged: Record<string, string> = {};
 
@@ -341,9 +345,19 @@ function flattenVariableMap(input: VariableRenderInput): Record<string, string> 
 
   sources.forEach((source) => {
     Object.entries(source).forEach(([rawKey, rawValue]) => {
-      const key = rawKey.trim().toLowerCase();
-      if (!key) return;
-      merged[key] = asString(rawValue);
+      const directKey = rawKey.trim().toLowerCase();
+      if (!directKey) return;
+
+      const value = asString(rawValue);
+      const normalizedKey = normalizeVariableKey(rawKey);
+
+      // Preserve the original lowercased key for exact lookups, and also store
+      // a compact alphanumeric variant so placeholders like {{FULL_NAME}},
+      // {{Father Name}} and {{father_name}} can resolve the same CSV field.
+      merged[directKey] = value;
+      if (normalizedKey && normalizedKey !== directKey) {
+        merged[normalizedKey] = value;
+      }
     });
   });
 
@@ -352,7 +366,8 @@ function flattenVariableMap(input: VariableRenderInput): Record<string, string> 
 
 function resolveVariableValue(key: string, values: Record<string, string>): string {
   if (!key) return "";
-  return values[key.trim().toLowerCase()] ?? "";
+  const directKey = key.trim().toLowerCase();
+  return values[directKey] ?? values[normalizeVariableKey(key)] ?? "";
 }
 
 function resolveObjectBox(obj: fabric.FabricObject, fallbackH = 28): { width: number; height: number } {

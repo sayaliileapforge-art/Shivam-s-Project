@@ -55,6 +55,7 @@ import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
 import { createTemplate, getTemplateById, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { matchImages } from "../../lib/imageMatchEngine";
 import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
 
@@ -521,6 +522,7 @@ const mapApiProjectToUi = (p: any) => {
     amount: Number(p.amount || 0),
     description: String(p.description || ""),
     workflowType: (p.workflowType || "variable_data") as "variable_data" | "direct_print",
+    dataFieldsByCategory: (p.dataFieldsByCategory || p.dataFields || {}) as Record<string, ProjectDataField[]>,
     createdAt: String(p.createdAt || new Date().toISOString()),
   };
 };
@@ -558,6 +560,26 @@ function isPhotoFieldKey(key: string): boolean {
     "profileimage",
     "studentphoto",
   ].includes(normalized);
+}
+
+function deriveDataFieldsFromRecords(records: ProjectDataRecord[]): ProjectDataField[] {
+  const seen = new Set<string>();
+  const fields: ProjectDataField[] = [];
+  const ignoredKeys = new Set(["id", "projectId", "category", "groupId"]);
+
+  for (const record of records) {
+    for (const key of Object.keys(record)) {
+      const trimmed = String(key || "").trim();
+      const normalized = trimmed.toLowerCase();
+      if (!trimmed || ignoredKeys.has(trimmed) || ignoredKeys.has(normalized)) continue;
+      if (normalized.startsWith("__")) continue;
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      fields.push({ key: trimmed, label: trimmed });
+    }
+  }
+
+  return fields;
 }
 
 function getRecordPhotoUrl(rec: ProjectDataRecord): string {
@@ -1085,10 +1107,7 @@ export function ProjectDetail() {
 
     const hydrateFromBackend = async () => {
       const remote = await fetchProjectRecords(id, dataCategory);
-      if (cancelled || !remote) return;
-
-      const local = loadDataRecords(id, dataCategory);
-      if (remote.length === 0 && local.length > 0) return;
+      if (cancelled || remote === null) return;
 
       const normalized: ProjectDataRecord[] = remote.map((record, idx) => {
         const rawId = String((record as Record<string, unknown>).id ?? "").trim();
@@ -1110,6 +1129,29 @@ export function ProjectDetail() {
       cancelled = true;
     };
   }, [id, dataCategory]);
+
+  useEffect(() => {
+    if (!id) return;
+
+    const projectFields = project?.dataFieldsByCategory?.[dataCategory];
+    if (Array.isArray(projectFields) && projectFields.length > 0) {
+      setDataFields(projectFields);
+      saveDataFields(id, dataCategory, projectFields);
+      return;
+    }
+
+    const localFields = loadDataFields(id, dataCategory);
+    if (localFields.length > 0) {
+      setDataFields(localFields);
+      return;
+    }
+
+    const derivedFields = deriveDataFieldsFromRecords(dataRecords);
+    if (derivedFields.length > 0) {
+      setDataFields(derivedFields);
+      saveDataFields(id, dataCategory, derivedFields);
+    }
+  }, [id, dataCategory, project, dataRecords]);
 
   // Persist field-based template mapping draft so it survives refresh/navigation.
   useEffect(() => {
@@ -1451,9 +1493,8 @@ export function ProjectDetail() {
 
   const deleteSelected = () => {
     if (!id) return;
-    dataSelectedIds.forEach((rid) => deleteDataRecord(rid));
-    const updated = loadDataRecords(id, dataCategory);
-    setDataRecords(updated);
+    const updated = dataRecords.filter((record) => !dataSelectedIds.has(record.id));
+    persistDataRecords(updated);
     setDataSelectedIds(new Set());
   };
 
@@ -1578,8 +1619,7 @@ export function ProjectDetail() {
       ...addDataDraft,
     };
     const updated = [...dataRecords, rec];
-    saveDataRecords(id, dataCategory, updated);
-    setDataRecords(updated);
+    persistDataRecords(updated);
     setAddDataDraft({});
     setIsAddDataOpen(false);
   };
@@ -1593,8 +1633,7 @@ export function ProjectDetail() {
     const updated = dataRecords.map((r) =>
       targetIds.has(r.id) ? { ...r, [bulkEditField]: bulkEditValue } : r
     );
-    saveDataRecords(id, dataCategory, updated);
-    setDataRecords(updated);
+    persistDataRecords(updated);
     setIsBulkEditOpen(false);
     setBulkEditField("");
     setBulkEditValue("");
@@ -1630,8 +1669,7 @@ export function ProjectDetail() {
       const source = getRecordPhotoUrl(rec);
       if (i >= 0 && source) updated[i] = { ...updated[i], photo: await doCrop(source) };
     }
-    if (id) saveDataRecords(id, dataCategory, updated);
-    setDataRecords(updated);
+    if (id) persistDataRecords(updated);
     setAiProcessing(null);
   };
 
@@ -1670,8 +1708,7 @@ export function ProjectDetail() {
       const source = getRecordPhotoUrl(rec);
       if (i >= 0 && source) updated[i] = { ...updated[i], photo: await doRemoveBg(source) };
     }
-    if (id) saveDataRecords(id, dataCategory, updated);
-    setDataRecords(updated);
+    if (id) persistDataRecords(updated);
     setAiProcessing(null);
   };
 
@@ -1687,8 +1724,7 @@ export function ProjectDetail() {
       delete next.photo;
       return next as ProjectDataRecord;
     });
-    saveDataRecords(id, dataCategory, updated);
-    setDataRecords(updated);
+    persistDataRecords(updated);
   };
 
   // Image Upload (match by filename, or direct assign when target set)
@@ -1763,8 +1799,7 @@ export function ProjectDetail() {
           });
         }
       }
-      saveDataRecords(id, dataCategory, updated);
-      setDataRecords(updated);
+      persistDataRecords(updated);
       setImageUploadTarget("selection");
     });
     e.target.value = "";
@@ -1785,323 +1820,28 @@ export function ProjectDetail() {
         imageUrl: imageUrls[idx] || '/uploads/assets/default.jpg'
       }));
 
-      // ── Normalisation helpers ──────────────────────────────────────────────
+      const bulkResult = matchImages(
+        loaded.map(({ file, imageUrl }) => ({ name: file.name, dataUrl: imageUrl })),
+        dataRecords,
+      );
 
-      // Generic value normalisation: lowercase, trim, strip trailing ".0" float artifact
-      const normVal = (s: unknown) =>
-        String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "");
-
-      // School code normalisation: keep only alphanumeric characters and lowercase.
-      const normSchool = (s: unknown): string =>
-        String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "").replace(/[^a-z0-9]/g, "");
-
-      // Admission/roll number normalisation: keep only alphanumeric chars so
-      // values like ".", ",", "...1", "-1" are treated consistently.
-      const normAdm = (s: unknown): string =>
-        String(s ?? "").toLowerCase().trim().replace(/\.0+$/, "").replace(/[^a-z0-9]/g, "");
-
-      // Name normalisation: lowercase, keep only alphanumeric chars so spaces,
-      // dots, hyphens and underscores are all stripped before comparison.
-      const normName = (s: unknown): string =>
-        String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
-
-      // Normalise a field key: lowercase, collapse separators to a single space
-      const normKey = (k: string) =>
-        k.toLowerCase().trim().replace(/[_.\s]+/g, " ");
-
-      // Read a field from a record trying multiple key spellings
-      const getField = (rec: ProjectDataRecord, ...keys: string[]): string => {
-        for (const k of keys) {
-          if (rec[k] !== undefined && rec[k] !== null) return normVal(rec[k]);
-          const nk = normKey(k);
-          const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
-          if (entry && entry[1] !== undefined && entry[1] !== null) return normVal(entry[1]);
-        }
-        return "";
-      };
-
-      // Read a raw field preserving original casing/content for display or name parsing.
-      const getFieldRaw = (rec: ProjectDataRecord, ...keys: string[]): string => {
-        for (const k of keys) {
-          if (rec[k] !== undefined && rec[k] !== null) return String(rec[k] ?? "").trim();
-          const nk = normKey(k);
-          const entry = Object.entries(rec).find(([rk]) => normKey(rk) === nk);
-          if (entry && entry[1] !== undefined && entry[1] !== null) return String(entry[1] ?? "").trim();
-        }
-        return "";
-      };
-
-      // Read the admission/roll number for a record (using normAdm so dots are stripped)
-      const getAdmField = (rec: ProjectDataRecord): string =>
-        normAdm(getField(
-          rec,
-          "admission_number", "Admission Number", "admission_no", "Admission No",
-          "adm_no", "Adm No", "adm_number", "Adm Number", "Adm. No",
-          "admNo", "admissionNumber", "admissionNo",
-          "roll_number", "Roll Number", "roll_no", "Roll No",
-          "rollNumber", "rollNo", "Roll_No", "Roll_Number",
-        ));
-
-      // Read the school code for a record
-      const getSchoolField = (rec: ProjectDataRecord): string =>
-        normSchool(getField(
-          rec,
-          "school_code", "School Code", "schoolCode", "school_id", "School Id",
-          "Sch Code", "sch_code",
-        ));
-
-      // Best display name for a record
-      const getName = (rec: ProjectDataRecord) =>
-        getFieldRaw(
-          rec,
-          "Name", "name",
-          "student_name", "Student Name", "studentName",
-          "full_name", "Full Name", "fullName",
-        ) || String(rec.id);
-
-      const getNameNorm = (rec: ProjectDataRecord): string => normName(getName(rec));
-
-      const getNameTokens = (rec: ProjectDataRecord): string[] => {
-        const rawTokens: string[] = [];
-        const pushTokens = (value: string) => {
-          const parts = String(value || "").toLowerCase().match(/[a-z0-9]+/g) ?? [];
-          parts.forEach((p) => { if (p) rawTokens.push(p); });
-        };
-
-        pushTokens(getName(rec));
-        pushTokens(getFieldRaw(rec, "firstName", "first_name", "First Name"));
-        pushTokens(getFieldRaw(rec, "lastName", "last_name", "Last Name"));
-
-        return Array.from(new Set(rawTokens.map((t) => sanitizeFilenamePart(t)).filter(Boolean)));
-      };
-
-      const recordNameMatches = (rec: ProjectDataRecord, fileNameNorm: string, fileNameTokens: string[]): boolean => {
-        const recNorm = getNameNorm(rec);
-        if (recNorm && (recNorm === fileNameNorm || fileNameNorm.startsWith(recNorm) || recNorm.startsWith(fileNameNorm))) {
-          return true;
-        }
-
-        const recTokens = getNameTokens(rec);
-        if (recTokens.length > 0 && fileNameTokens.length > 0) {
-          // If all tokens available in record name are present in filename, treat as match.
-          if (recTokens.every((token) => fileNameTokens.includes(token))) return true;
-        }
-
-        return false;
-      };
-
-      const normalizePhotoReference = (value: string): string => {
-        const raw = String(value || "").trim();
-        if (!raw) return "";
-        const withoutQuery = raw.split("?")[0].split("#")[0];
-        const basename = withoutQuery.split("/").pop() ?? withoutQuery;
-        const noExt = basename.replace(/\.[^.]+$/, "");
-        return sanitizeFilenamePart(noExt);
-      };
-
-      const schoolEq = (a: string, b: string): boolean => {
-        const aa = normSchool(a).replace(/^0+/, "");
-        const bb = normSchool(b).replace(/^0+/, "");
-        if (!aa || !bb) return false;
-        return aa === bb;
-      };
-
-      const matched: { userId: string; name: string; filename: string; imageUrl: string }[] = [];
-      const unmatched: { filename: string; reason: string }[] = [];
-      const duplicates: { filename: string; allMatchNames: string[]; appliedName: string }[] = [];
-      const usedUserIds = new Set<string>();
-
-      // Internal fields that are never data-column values
-      const META_KEYS = new Set(["id", "projectId", "category", "photo"]);
-
-      const sanitizeFilenamePart = (s: string): string =>
-        s.toLowerCase().trim().replace(/[^a-z0-9]/g, "");
-
-      const isLikelyAdmissionToken = (token: string): boolean => {
-        if (!token) return false;
-        if (/\d/.test(token)) return true;
-        // Very short alpha tokens can be section/admission markers like A, B, AB.
-        // Do not treat longer pure-alpha tokens as admission to avoid swallowing names.
-        if (/^[a-z]{1,2}$/.test(token)) return true;
-        return false;
-      };
-
-      /**
-       * 3-tier matching strategy
-       *
-       * Tier 1 — school + admission number (exact, normalised)
-       *   If exactly one match → return it.
-       *   If multiple matches → use name from filename to disambiguate (Tier 1b).
-       *
-       * Tier 2 — school + name only (when admission is blank/all-dots after normalisation)
-       *   Used when the admission segment of the filename normalises to "".
-       *
-       * Tier 3 — value-scan (column-name-agnostic fallback)
-       *   Scans every column value; a record matches if it contains both the
-       *   school code and the admission number as values in different columns.
-       */
-      type TierMatch =
-        | { kind: 'exact';     record: ProjectDataRecord; method: string }
-        | { kind: 'duplicate'; records: ProjectDataRecord[]; method: string }
-        | { kind: 'none' };
-
-      const resolveMatch = (
-        fileSchoolCode: string,
-        fileAdmNorm: string,
-        fileNameNorm: string,
-        fileNameTokens: string[],
-        fileBaseNorm: string,
-      ): TierMatch => {
-
-        // CSV photo path/filename fallback (same data source used by CSV import mapping).
-        // If records already contain photo/profilePic filename refs from CSV import,
-        // prefer this deterministic match first.
-        if (fileBaseNorm) {
-          const photoHits = dataRecords.filter((rec) => {
-            const recPhotoRaw = getRecordPhoto(rec);
-            if (!recPhotoRaw) return false;
-            const recPhotoNorm = normalizePhotoReference(recPhotoRaw);
-            return recPhotoNorm.length > 0 && recPhotoNorm === fileBaseNorm;
-          });
-          if (photoHits.length === 1) return { kind: 'exact', record: photoHits[0], method: 'csv-photo-reference' };
-          if (photoHits.length > 1)  return { kind: 'duplicate', records: photoHits, method: 'csv-photo-reference-duplicate' };
-        }
-
-        // ── Tier 1: school + admission ────────────────────────────────────
-        if (fileAdmNorm) {
-          const hits = dataRecords.filter((rec) => {
-            const recSchool = getSchoolField(rec);
-            const recAdm    = getAdmField(rec);
-            return schoolEq(recSchool, fileSchoolCode) && recAdm !== "" && recAdm === fileAdmNorm;
-          });
-
-          if (hits.length === 1) return { kind: 'exact', record: hits[0], method: 'school+admission' };
-
-          if (hits.length > 1) {
-            // Tier 1b: disambiguate by name from filename
-            if (fileNameNorm) {
-              const nameHits = hits.filter((rec) => recordNameMatches(rec, fileNameNorm, fileNameTokens));
-              if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+admission+name' };
-              if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'admission+name-ambiguous' };
-            }
-            // Name didn't narrow it down — report all admission hits as duplicates
-            return { kind: 'duplicate', records: hits, method: 'admission-duplicate' };
-          }
-        }
-
-        // ── Tier 2: school + name (when admission is blank or no admission hit) ──
-        if (fileNameNorm) {
-          const nameHits = dataRecords.filter((rec) => {
-            const recSchool = getSchoolField(rec);
-            return schoolEq(recSchool, fileSchoolCode) && recordNameMatches(rec, fileNameNorm, fileNameTokens);
-          });
-          if (nameHits.length === 1) return { kind: 'exact', record: nameHits[0], method: 'school+name' };
-          if (nameHits.length > 1)  return { kind: 'duplicate', records: nameHits, method: 'name-duplicate' };
-        }
-
-        // ── Tier 3: value-scan fallback ────────────────────────────────────
-        if (fileAdmNorm) {
-          const scanHits = dataRecords.filter((rec) => {
-            const values = Object.entries(rec)
-              .filter(([k]) => !META_KEYS.has(k))
-              .map(([, v]) => normAdm(v))
-              .filter((v) => v.length > 0 && v.length <= 20);
-            return values.includes(fileSchoolCode) && values.includes(fileAdmNorm) && fileSchoolCode !== fileAdmNorm;
-          });
-          if (scanHits.length === 1) return { kind: 'exact', record: scanHits[0], method: 'value-scan' };
-          if (scanHits.length > 1)  return { kind: 'duplicate', records: scanHits, method: 'value-scan-duplicate' };
-        }
-
-        return { kind: 'none' };
-      };
-
-      loaded.forEach(({ file: f, imageUrl }) => {
-        // Strip extension, then tokenize alphanumeric chunks so punctuation style
-        // (underscore/comma/hyphen/space) does not affect parsing.
-        const basename = f.name.replace(/\.[^.]+$/, "");
-        const rawTokens = (basename.toLowerCase().match(/[a-z0-9]+/g) ?? []).map((t) => t.trim()).filter(Boolean);
-
-        if (rawTokens.length < 1) {
-          unmatched.push({
-            filename: f.name,
-            reason: 'Invalid filename format — must be <SchoolCode>_<AdmNo>_<Name>.jpg',
-          });
-          return;
-        }
-
-        const fileSchoolCode = normSchool(rawTokens[0]);
-        const cleanedTail = rawTokens.slice(1).map(sanitizeFilenamePart).filter(Boolean);
-
-        // Heuristic parse:
-        // - if first token after school code looks like admission, treat it as admission
-        // - otherwise treat whole tail as student name (handles 145_,_Vanshika_Katiyar.jpg)
-        let fileAdmRaw = cleanedTail[0] ?? "";
-        let fileAdmNorm = "";
-        let nameTokens: string[] = [];
-
-        if (cleanedTail.length > 0) {
-          // Only consume first token as admission when there is at least one
-          // remaining token for the student name.
-          if (cleanedTail.length > 1 && isLikelyAdmissionToken(cleanedTail[0])) {
-            fileAdmRaw = cleanedTail[0];
-            fileAdmNorm = normAdm(cleanedTail[0]);
-            nameTokens = cleanedTail.slice(1);
-          } else {
-            fileAdmRaw = "";
-            fileAdmNorm = "";
-            nameTokens = cleanedTail;
-          }
-        }
-
-        const fileNameRaw = nameTokens.join(" ");
-        const fileNameNorm = normName(fileNameRaw);
-        const fileBaseNorm = sanitizeFilenamePart(basename.replace(/\.[^.]+$/, ""));
-
-        if (!fileSchoolCode) {
-          unmatched.push({ filename: f.name, reason: 'Could not extract school code from filename' });
-          return;
-        }
-
-        if (!fileNameNorm) {
-          unmatched.push({
-            filename: f.name,
-            reason: 'Could not extract student name from filename',
-          });
-          return;
-        }
-
-        const result = resolveMatch(fileSchoolCode, fileAdmNorm, fileNameNorm, nameTokens, fileBaseNorm);
-
-        if (result.kind === 'exact') {
-          const rec = result.record;
-          if (usedUserIds.has(rec.id)) {
-            // A different file was already assigned to this record
-            duplicates.push({
-              filename: f.name,
-              allMatchNames: [getName(rec)],
-              appliedName: '(record already assigned by another file)',
-            });
-          } else {
-            usedUserIds.add(rec.id);
-            matched.push({ userId: rec.id, name: getName(rec), filename: f.name, imageUrl });
-          }
-        } else if (result.kind === 'duplicate') {
-          const allMatchNames = result.records.map(getName);
-          // Do NOT auto-assign to an arbitrary record — list as duplicate for review
-          duplicates.push({ filename: f.name, allMatchNames, appliedName: '(not applied — ambiguous)' });
-        } else {
-          const sampleKeys = dataRecords.length > 0
-            ? Object.keys(dataRecords[0]).filter((k) => !META_KEYS.has(k)).slice(0, 6).join(", ")
-            : "no records";
-          unmatched.push({
-            filename: f.name,
-            reason: `No match for school="${fileSchoolCode}" adm="${fileAdmRaw}" name="${fileNameRaw}". ` +
-                    `Columns: [${sampleKeys}]`,
-          });
-        }
+      setBulkImageResults({
+        matched: bulkResult.matched.map((m) => ({
+          userId: m.userId,
+          name: m.name,
+          filename: m.filename,
+          imageUrl: m.dataUrl,
+        })),
+        unmatched: bulkResult.unmatched.map((u) => ({
+          filename: u.filename,
+          reason: u.reason,
+        })),
+        duplicates: bulkResult.duplicates.map((d) => ({
+          filename: d.filename,
+          allMatchNames: d.allMatches.map((m) => `${m.name} (${m.score}%)`),
+          appliedName: d.appliedName,
+        })),
       });
-
-      setBulkImageResults({ matched, unmatched, duplicates });
     } catch (err) {
       console.error('[Bulk Images] Upload error:', err);
       setBulkImageResults({
@@ -2193,8 +1933,7 @@ export function ProjectDetail() {
       const i = updated.findIndex((r) => r.id === rec.id);
       if (i >= 0) updated[i] = { ...updated[i], barcode: dataUrl };
     });
-    saveDataRecords(id, dataCategory, updated);
-    setDataRecords(updated);
+    persistDataRecords(updated);
     setIsGenerateBarcodeOpen(false);
     setBarcodeField("");
   };
@@ -2525,6 +2264,7 @@ export function ProjectDetail() {
             canvas: requestTemplate.canvas,
             thumbnail: requestTemplate.thumbnail,
             previewImageUrl: requestTemplate.thumbnail,
+            layoutJSON: requestTemplate.canvasJSON || undefined,
           }
         : { id: requestTemplateId };
 
@@ -2620,10 +2360,7 @@ export function ProjectDetail() {
   // ── Delete All student/staff Data ──
   const handleDeleteAllData = () => {
     if (!id) return;
-    saveDataRecords(id, dataCategory, []);
-    saveDataFields(id, dataCategory, []);
-    setDataRecords([]);
-    setDataFields([]);
+    persistDataRecords([]);
     setDataSelectedIds(new Set());
     setIsDeleteAllOpen(false);
   };
@@ -4495,18 +4232,11 @@ export function ProjectDetail() {
                     )}
                   </div>
 
-                  {selectedGenerateTemplateDiagnostics && (
-                    <div className="sm:col-span-2 space-y-1">
-                      {selectedGenerateTemplateDiagnostics.fallbackMessage && (
-                        <p className="text-xs text-destructive">
-                          {selectedGenerateTemplateDiagnostics.fallbackMessage}
-                        </p>
-                      )}
-                      {selectedGenerateTemplateDiagnostics.missingFieldKeys.length > 0 && (
-                        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
-                          Missing field mapping: {selectedGenerateTemplateDiagnostics.missingFieldKeys.map(formatFieldLabel).join(", ")}
-                        </p>
-                      )}
+                  {selectedGenerateTemplateDiagnostics?.fallbackMessage && (
+                    <div className="sm:col-span-2">
+                      <p className="text-xs text-destructive">
+                        {selectedGenerateTemplateDiagnostics.fallbackMessage}
+                      </p>
                     </div>
                   )}
 

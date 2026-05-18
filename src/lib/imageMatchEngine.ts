@@ -100,7 +100,7 @@ function normalizeName(s: unknown): string {
 
 /** Normalize a CSV column key for loosy lookup. */
 function normKey(k: string): string {
-  return k.toLowerCase().trim().replace(/[_.\s]+/g, ' ');
+  return k.toLowerCase().trim().replace(/[_.\s.]+/g, ' ');
 }
 
 /**
@@ -169,10 +169,26 @@ function getField(rec: AnyRecord, ...keys: string[]): string {
 }
 
 function getName(rec: AnyRecord): string {
-  return String(
-    rec['Name'] ?? rec['name'] ?? rec['full_name'] ?? rec['Full Name'] ??
-    rec['Student Name'] ?? rec['student_name'] ?? rec['id'] ?? ''
-  ).trim();
+  const nameKeys = [
+    'Name', 'name', 'full_name', 'Full Name', 'fullName', 'FullName',
+    'Student Name', 'student_name', 'studentName', 'StudentName',
+    'student full name', 'Student Full Name', 'full name', 'id',
+  ];
+
+  for (const key of nameKeys) {
+    const directValue = rec[key];
+    if (directValue !== undefined && directValue !== null && String(directValue).trim() !== '') {
+      return String(directValue).trim();
+    }
+
+    const normalizedKey = normKey(key);
+    const entry = Object.entries(rec).find(([recordKey]) => normKey(recordKey) === normalizedKey);
+    if (entry?.[1] !== undefined && entry[1] !== null && String(entry[1]).trim() !== '') {
+      return String(entry[1]).trim();
+    }
+  }
+
+  return String(rec['id'] ?? '').trim();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -205,13 +221,16 @@ interface FileParts {
  *   - Names: strip digits, strip separators, lowercase
  */
 function decompose(filename: string): FileParts {
-  const basename = filename.replace(/\.[^.]+$/, '');
-  const parts = basename.split('_').map((p) => p.trim()).filter(Boolean);
+  let decoded = filename;
+  try { decoded = decodeURIComponent(filename); } catch { /* keep original */ }
 
-  const schoolCode  = normalizeId(parts[0] ?? '');
-  const rollOrAdmNo = normalizeId(parts[1] ?? '');
+  const basename = decoded.replace(/\.[^.]+$/, '');
+  const tokens = basename.toLowerCase().match(/[a-z0-9]+/g) ?? [];
 
-  const rawNameParts = parts.slice(2);
+  const schoolCode  = normalizeId(tokens[0] ?? '');
+  const rollOrAdmNo = normalizeId(tokens[1] ?? '');
+
+  const rawNameParts = tokens.slice(2);
   const firstName  = normalizeName(rawNameParts[0] ?? '');
   const lastName   = normalizeName(rawNameParts.length > 1 ? rawNameParts[rawNameParts.length - 1] : '');
   const nameFragment = normalizeName(rawNameParts.join(' '));   // full name, digits stripped
