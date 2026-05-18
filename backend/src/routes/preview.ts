@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import PDFDocument from 'pdfkit';
 import ProductTemplate from '../models/ProductTemplate';
+import fs from 'fs';
+import path from 'path';
 
 const router = Router();
 
@@ -113,6 +115,42 @@ function parseDataUrl(src: string): Buffer | null {
   }
 }
 
+// Uploads directory — same resolution logic as server.ts.
+// In compiled output __dirname = backend/dist/routes/, so ../../ = backend root.
+const _localUploadsDir = process.env.UPLOADS_DIR?.trim()
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.resolve(__dirname, '../../public/uploads');
+
+/**
+ * For URLs pointing to the local server (localhost / 127.0.0.1), read the file
+ * from disk instead of making an HTTP round-trip back to the same process.
+ * Returns null if the URL is not local, file doesn't exist, or path is outside
+ * the uploads directory (path-traversal guard).
+ */
+async function readLocalFileBuffer(url: string): Promise<Buffer | null> {
+  try {
+    const parsed = new URL(url);
+    const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+    if (!isLocal) return null;
+
+    const pathname = decodeURIComponent(parsed.pathname);
+    let relPath: string | null = null;
+    if (pathname.startsWith('/uploads/')) relPath = pathname.slice('/uploads/'.length);
+    else if (pathname.startsWith('/images/')) relPath = pathname.slice('/images/'.length);
+    if (!relPath) return null;
+
+    // Path-traversal guard: resolved path must stay inside _localUploadsDir
+    const filePath = path.resolve(_localUploadsDir, relPath);
+    if (!filePath.startsWith(_localUploadsDir + path.sep) && filePath !== _localUploadsDir) {
+      return null;
+    }
+
+    return await fs.promises.readFile(filePath);
+  } catch {
+    return null;
+  }
+}
+
 async function loadTemplatePreviewBuffer(src: string | undefined): Promise<Buffer | null> {
   if (!src) return null;
 
@@ -123,6 +161,11 @@ async function loadTemplatePreviewBuffer(src: string | undefined): Promise<Buffe
   if (!/^https?:\/\//i.test(src)) {
     return null;
   }
+
+  // Fast path: for files hosted on the same server, read from disk to avoid
+  // an HTTP round-trip back to the same Node.js process.
+  const localBuf = await readLocalFileBuffer(src);
+  if (localBuf) return localBuf;
 
   try {
     const response = await fetch(src);
@@ -1490,11 +1533,13 @@ router.post('/generate', async (req: Request, res: Response) => {
     const pageCapacity = columns * rows;
 
     const previewImageBufferByTemplateId = new Map<string, Buffer | null>();
-    for (const [templateId, resolved] of resolvedTemplateById.entries()) {
-      const previewSource = resolved.thumbnail || resolved.previewImageUrl;
-      const previewImageBuffer = await loadTemplatePreviewBuffer(previewSource);
-      previewImageBufferByTemplateId.set(templateId, previewImageBuffer);
-    }
+    await Promise.all(
+      Array.from(resolvedTemplateById.entries()).map(async ([templateId, resolved]) => {
+        const previewSource = resolved.thumbnail || resolved.previewImageUrl;
+        const buffer = await loadTemplatePreviewBuffer(previewSource);
+        previewImageBufferByTemplateId.set(templateId, buffer);
+      })
+    );
 
     // Extract canvas render info and load canvas background images for variable substitution
     const canvasRenderInfoByTemplateId = new Map<string, CanvasRenderInfo | null>();
@@ -1515,13 +1560,15 @@ router.post('/generate', async (req: Request, res: Response) => {
     }
 
     const canvasBgBufferByTemplateId = new Map<string, Buffer | null>();
-    for (const [templateId, canvasInfo] of canvasRenderInfoByTemplateId.entries()) {
-      if (!canvasInfo?.backgroundImageSrc) continue;
-      const absUrl = toAbsoluteAssetUrl(canvasInfo.backgroundImageSrc, req);
-      if (!absUrl) continue;
-      const buffer = await loadTemplatePreviewBuffer(absUrl);
-      canvasBgBufferByTemplateId.set(templateId, buffer ?? null);
-    }
+    await Promise.all(
+      Array.from(canvasRenderInfoByTemplateId.entries()).map(async ([templateId, canvasInfo]) => {
+        if (!canvasInfo?.backgroundImageSrc) return;
+        const absUrl = toAbsoluteAssetUrl(canvasInfo.backgroundImageSrc, req);
+        if (!absUrl) return;
+        const buffer = await loadTemplatePreviewBuffer(absUrl);
+        canvasBgBufferByTemplateId.set(templateId, buffer ?? null);
+      })
+    );
 
     const safeName = sanitizeFileName(configuration.fileName);
 
