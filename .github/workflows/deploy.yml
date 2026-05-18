@@ -42,7 +42,7 @@ jobs:
 
             echo "=== Installing backend dependencies ==="
             cd /var/www/saasapp/backend
-            npm ci --omit=dev
+            npm ci
 
             echo "=== Building backend (TypeScript) ==="
             npm run build
