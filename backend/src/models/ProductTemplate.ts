@@ -71,4 +71,9 @@ ProductTemplateSchema.index(
   { unique: true, partialFilterExpression: { productId: { $exists: true, $ne: null } } }
 );
 
+// Compound index for fast gallery list queries (isActive filter + sort by updatedAt)
+ProductTemplateSchema.index({ isActive: 1, isGlobal: 1, updatedAt: -1 });
+// Compound index for per-project template lookups
+ProductTemplateSchema.index({ projectId: 1, isActive: 1, updatedAt: -1 });
+
 export default mongoose.model<IProductTemplate>('ProductTemplate', ProductTemplateSchema);

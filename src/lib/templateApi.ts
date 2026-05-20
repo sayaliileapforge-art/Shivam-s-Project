@@ -23,6 +23,112 @@ export interface TemplateRecord {
 
 const TEMPLATE_API_BASE = `${API_ROOT}/templates`;
 
+// ── Module-level in-memory cache ─────────────────────────────────────────────
+// Survives component unmount/remount and navigation.
+const CACHE_TTL = 5 * 60_000;          // 5 minutes — in-memory / sessionStorage
+const LS_CACHE_TTL = 30 * 60_000;      // 30 minutes — localStorage (persistent across sessions)
+const SESSION_CACHE_KEY = 'tg_gallery_cache_v3';
+const LS_CACHE_KEY      = 'tg_gallery_ls_v3';
+const LS_PROJECT_PREFIX = 'tg_proj_v3_';
+
+interface CacheEntry { data: TemplateRecord[]; fetchedAt: number }
+
+let _galleryCache: CacheEntry | null = null;
+const _projectCache = new Map<string, CacheEntry>();
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function safeReadStorage(storage: Storage, key: string, ttl: number): TemplateRecord[] | null {
+  try {
+    const raw = storage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { data: TemplateRecord[]; fetchedAt: number };
+    if (Date.now() - parsed.fetchedAt < ttl) return parsed.data;
+    return null;
+  } catch { return null; }
+}
+
+function safeWriteStorage(storage: Storage, key: string, data: TemplateRecord[]): void {
+  try {
+    storage.setItem(key, JSON.stringify({ data, fetchedAt: Date.now() }));
+  } catch { /* quota exceeded – ignore */ }
+}
+
+/** Persist gallery list to sessionStorage (hot-reload) and localStorage (cross-session). */
+function writeSessionCache(data: TemplateRecord[]): void {
+  safeWriteStorage(sessionStorage, SESSION_CACHE_KEY, data);
+  safeWriteStorage(localStorage,   LS_CACHE_KEY,      data);
+}
+
+function readSessionCache(): TemplateRecord[] | null {
+  return safeReadStorage(sessionStorage, SESSION_CACHE_KEY, CACHE_TTL);
+}
+
+function readLocalStorageCache(): TemplateRecord[] | null {
+  return safeReadStorage(localStorage, LS_CACHE_KEY, LS_CACHE_TTL);
+}
+
+/** Return cached gallery data if still fresh, or null if stale/missing.
+ *  Priority: memory → sessionStorage → localStorage */
+export function getGalleryCacheData(): TemplateRecord[] | null {
+  if (_galleryCache && Date.now() - _galleryCache.fetchedAt < CACHE_TTL) {
+    return _galleryCache.data;
+  }
+  // sessionStorage — survives hot-reloads within the same tab
+  const session = readSessionCache();
+  if (session) {
+    _galleryCache = { data: session, fetchedAt: Date.now() };
+    return session;
+  }
+  // localStorage — survives across tabs and browser restarts (30 min TTL)
+  const ls = readLocalStorageCache();
+  if (ls) {
+    _galleryCache = { data: ls, fetchedAt: Date.now() };
+    safeWriteStorage(sessionStorage, SESSION_CACHE_KEY, ls); // re-populate sessionStorage
+    return ls;
+  }
+  return null;
+}
+
+/** Return cached per-project template list if still fresh, or null.
+ *  Priority: memory → localStorage */
+export function getProjectTemplateCacheData(projectId: string): TemplateRecord[] | null {
+  const entry = _projectCache.get(projectId);
+  if (entry && Date.now() - entry.fetchedAt < CACHE_TTL) return entry.data;
+  // localStorage fallback so data survives page refresh
+  const ls = safeReadStorage(localStorage, `${LS_PROJECT_PREFIX}${projectId}`, LS_CACHE_TTL);
+  if (ls) {
+    _projectCache.set(projectId, { data: ls, fetchedAt: Date.now() });
+    return ls;
+  }
+  return null;
+}
+
+/** Wipe all template list caches (call after create/update/delete). */
+export function invalidateTemplateCache(projectId?: string): void {
+  _galleryCache = null;
+  try { sessionStorage.removeItem(SESSION_CACHE_KEY); } catch { /* ignore */ }
+  try { localStorage.removeItem(LS_CACHE_KEY); } catch { /* ignore */ }
+  if (projectId) {
+    _projectCache.delete(projectId);
+    try { localStorage.removeItem(`${LS_PROJECT_PREFIX}${projectId}`); } catch { /* ignore */ }
+  } else {
+    _projectCache.clear();
+    // Remove all per-project localStorage keys
+    try {
+      Object.keys(localStorage)
+        .filter((k) => k.startsWith(LS_PROJECT_PREFIX))
+        .forEach((k) => localStorage.removeItem(k));
+    } catch { /* ignore */ }
+  }
+}
+
+/** Populate the per-project cache (call after a successful fetch). */
+export function setProjectTemplateCacheData(projectId: string, data: TemplateRecord[]): void {
+  _projectCache.set(projectId, { data, fetchedAt: Date.now() });
+  safeWriteStorage(localStorage, `${LS_PROJECT_PREFIX}${projectId}`, data);
+}
+
 export function generatePreview(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL('image/png');
 }
@@ -58,7 +164,10 @@ export function resolveTemplatePreview(
 }
 
 type TemplateSaveInput = {
-  productId: string;
+  /** Use projectId for templates that belong to a project (preferred). */
+  projectId?: string;
+  /** Legacy: product-scoped template ID. Kept for backward compatibility. */
+  productId?: string;
   templateName: string;
   userId?: string;
   description?: string;
@@ -129,17 +238,31 @@ export async function getTemplatesByProductId(productId: string, params?: { cate
   return payload;
 }
 
-export async function getTemplates(params?: { productId?: string }): Promise<TemplateRecord[]> {
+export async function getTemplates(params?: { productId?: string; signal?: AbortSignal }): Promise<TemplateRecord[]> {
   const query = new URLSearchParams();
   if (params?.productId) query.set('productId', params.productId);
   const requestUrl = `${TEMPLATE_API_BASE}${query.toString() ? `?${query}` : ''}`;
-  const response = await fetch(requestUrl);
+
+  // Use module-level cache for the unfiltered gallery list
+  if (!params?.productId) {
+    const cached = getGalleryCacheData();
+    if (cached) return cached;
+  }
+
+  const response = await fetch(requestUrl, { signal: params?.signal });
   const payload = await handleResponse<TemplateRecord[]>(response);
   console.info('[templateApi] GET templates', {
     url: requestUrl,
     status: response.status,
     count: Array.isArray(payload) ? payload.length : 0,
   });
+
+  // Store in cache
+  if (!params?.productId) {
+    _galleryCache = { data: payload, fetchedAt: Date.now() };
+    writeSessionCache(payload);
+  }
+
   return payload;
 }
 
@@ -163,7 +286,9 @@ export async function createTemplate(input: TemplateSaveInput): Promise<Template
     }),
   });
 
-  return handleResponse<TemplateRecord>(response);
+  const result = await handleResponse<TemplateRecord>(response);
+  invalidateTemplateCache(input.productId?.length === 24 ? undefined : input.productId);
+  return result;
 }
 
 export async function createTemplateWithImage(input: TemplateUploadInput): Promise<TemplateRecord> {
@@ -205,6 +330,7 @@ export async function deleteTemplate(templateId: string): Promise<void> {
     method: 'DELETE',
   });
   await handleResponse<unknown>(response);
+  invalidateTemplateCache();
 }
 
 export async function saveSelectedTemplate(input: {

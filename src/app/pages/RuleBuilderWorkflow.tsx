@@ -1,7 +1,13 @@
-/**
+﻿/**
  * RuleBuilderWorkflow.tsx
- * Full-page 3-step Rule Builder wizard.
- * Route: /projects/:id/rule-builder?templateId=xxx&ruleId=xxx
+ * Full-page 4-step Rule Builder wizard matching the reference UI.
+ * Route: /projects/:id/rule-builder
+ *
+ * Steps:
+ *  1. Upload CSV
+ *  2. Rule Builder  (multi-rule: left sidebar + center editor + right preview + bottom CSV bar)
+ *  3. Field Mapping (per-rule mapping in tabs)
+ *  4. Preview & Generate
  */
 
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
@@ -9,9 +15,10 @@ import { useNavigate, useParams, useSearchParams, Link } from "react-router";
 import { nanoid } from "nanoid";
 import {
   ArrowLeft, Plus, Trash2, ChevronRight, ChevronLeft,
-  Upload, CheckCircle2, AlertTriangle, Sparkles, Wand2,
+  CheckCircle2, AlertTriangle, Wand2,
   Eye, EyeOff, Save, RotateCcw, Info, GripVertical,
-  FileSpreadsheet, Layers, Settings2, ListFilter, Play, Loader2,
+  FileSpreadsheet, Layers, Settings2, Play, Loader2,
+  MoreVertical, ChevronUp, ChevronDown, ExternalLink,
 } from "lucide-react";
 
 import { Button } from "../components/ui/button";
@@ -25,34 +32,67 @@ import {
 import {
   Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
 } from "../components/ui/tooltip";
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
+} from "../components/ui/dropdown-menu";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from "../components/ui/dialog";
 import { Switch } from "../components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { toast } from "sonner";
 
-import { parseCsvFile, type ParsedCsv, type CsvRow } from "../../lib/csvBinding";
+import { parseCsvFile, type ParsedCsv, type CsvRow, type CsvField } from "../../lib/csvBinding";
 import { API_BASE, resolveProfileImageUrl } from "../../lib/apiService";
-import { mapTemplateRecordToProjectTemplate, type TemplateRecord } from "../../lib/templateApi";
+import { mapTemplateRecordToProjectTemplate, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { type ProjectTemplate } from "../../lib/projectStore";
 import {
-  createRule, updateRule, getRuleById,
-  autoMapFields, extractTemplateFields, applyMappings, filterRowsByRule,
+  createRule,
+  updateRule as updateRuleApi,
+  deleteRule as deleteRuleApi,
+  getRuleById,
+  getProjectRuleSession,
+  autoMapFields,
+  extractTemplateFields,
+  applyMappings,
+  filterRowsByRule,
   CONDITION_OPERATOR_LABELS,
-  type Condition, type ConditionGroup, type FieldMapping, type PrintRule,
+  type Condition,
+  type ConditionGroup,
+  type FieldMapping,
   type ConditionOperator,
 } from "../../lib/ruleBuilderApi";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────────────────────
 
-type Step = 1 | 2 | 3;
-
+type Step = 1 | 2 | 3 | 4;
 type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean; _id?: string };
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+interface RuleEntry {
+  localId: string;
+  _id?: string;
+  name: string;
+  template: PreviewTemplateOption | null;
+  conditionGroups: ConditionGroup[];
+  fieldMappings: FieldMapping[];
+  groupOperator: "AND" | "OR";
+  isDefault: boolean;
+  priority: number;
+  active: boolean;
+}
 
-const STEPS: { id: Step; label: string; icon: React.ReactNode }[] = [
-  { id: 1, label: "Upload CSV", icon: <FileSpreadsheet className="h-4 w-4" /> },
-  { id: 2, label: "Rule Builder", icon: <Settings2 className="h-4 w-4" /> },
-  { id: 3, label: "Preview & Generate", icon: <Play className="h-4 w-4" /> },
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const STEPS: { id: Step; label: string }[] = [
+  { id: 1, label: "Upload CSV" },
+  { id: 2, label: "Rule Builder" },
+  { id: 3, label: "Field Mapping" },
+  { id: 4, label: "Preview & Generate" },
 ];
 
 const OPERATORS: ConditionOperator[] = [
@@ -62,7 +102,148 @@ const OPERATORS: ConditionOperator[] = [
 
 const VALUE_LESS_OPERATORS: ConditionOperator[] = ["is_empty", "is_not_empty"];
 
-// ─── Stepper ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Infer CsvField metadata from raw row objects (mirrors csvBinding.ts logic)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const IMAGE_KEY_RE = [/photo/i, /image/i, /\bimg\b/i, /picture/i, /\bpic\b/i, /avatar/i, /logo/i, /icon/i];
+const BARCODE_KEY_RE = [/barcode/i, /\bqr\b/i, /qrcode/i];
+
+function inferFieldType(key: string): CsvField["type"] {
+  if (BARCODE_KEY_RE.some((re) => re.test(key))) return "barcode";
+  if (IMAGE_KEY_RE.some((re) => re.test(key))) return "image";
+  return "text";
+}
+
+type FieldSchema = { key: string; label: string };
+
+/** Normalise a string for fuzzy matching: lower-case, strip non-alphanumeric. */
+function norm(s: string) {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Build CsvField[] from raw DataRecord rows.
+ * If a project field schema is provided, its labels replace the auto-generated ones.
+ * When schema has keys not present in rows, those fields are still included.
+ */
+function inferCsvFieldsFromRows(
+  rows: Record<string, string>[],
+  schema: FieldSchema[] = [],
+): CsvField[] {
+  const schemaLabelMap = new Map(schema.map((f) => [f.key, f.label]));
+  // Start with schema keys (preserves configured field order)
+  const schemaKeys = schema.map((f) => f.key);
+  // Scan EVERY row (not just rows[0]) — early rows may be sparse test records
+  // that only carry a subset of keys present in later production rows.
+  const rowKeys = rows.length > 0
+    ? [...new Set(rows.flatMap((r) => Object.keys(r).filter((k) => k.length > 0)))]
+    : [];
+  const allKeys = [...new Set([...schemaKeys, ...rowKeys])].filter((k) => k.length > 0);
+
+  if (allKeys.length === 0) return [];
+
+  return allKeys.map((k) => ({
+    key: k,
+    label:
+      schemaLabelMap.get(k) ??
+      k.trim().replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+    type: inferFieldType(k),
+  }));
+}
+
+/**
+ * Enhanced auto-mapping that uses the project field schema for label-based matching.
+ * Matching order:
+ *  1. Exact key normalisation  (norm(templateField) === norm(csvCol))
+ *  2. Schema label match       (norm(label) === norm(templateField))
+ *  3. Partial key match        (one contains the other)
+ *  4. Partial label match      (schema label partially overlaps templateField)
+ */
+function buildMappingsWithSchema(
+  templateFields: string[],
+  csvColumns: string[],
+  schema: FieldSchema[],
+): FieldMapping[] {
+  // Pre-build maps: normalised label → raw key, normalised key → raw key
+  const labelToKey = new Map<string, string>();
+  const keyNormToKey = new Map<string, string>();
+  for (const f of schema) {
+    labelToKey.set(norm(f.label), f.key);
+    keyNormToKey.set(norm(f.key), f.key);
+  }
+
+  return templateFields.map((field) => {
+    const normField = norm(field);
+    let matched = "";
+
+    // 1. Direct key exact match
+    matched = csvColumns.find((col) => norm(col) === normField) ?? "";
+
+    // 2. Schema label exact match
+    if (!matched) {
+      const keyByLabel = labelToKey.get(normField);
+      if (keyByLabel) matched = csvColumns.find((col) => col === keyByLabel) ?? "";
+    }
+
+    // 3. Partial key match
+    if (!matched) {
+      matched =
+        csvColumns.find((col) => {
+          const nc = norm(col);
+          return nc.includes(normField) || normField.includes(nc);
+        }) ?? "";
+    }
+
+    // 4. Partial schema label match
+    if (!matched) {
+      for (const f of schema) {
+        const nl = norm(f.label);
+        if (nl.includes(normField) || normField.includes(nl)) {
+          matched = csvColumns.find((col) => col === f.key) ?? "";
+          if (matched) break;
+        }
+      }
+    }
+
+    return {
+      templateField: field,
+      csvColumn: matched,
+      fieldType: inferFieldType(matched || field),
+    };
+  });
+}
+
+function makeRule(
+  template: PreviewTemplateOption | null,
+  priority: number,
+  csvColumns: string[],
+  schema: FieldSchema[] = [],
+): RuleEntry {
+  const fields = template ? extractTemplateFields(template.canvasJSON) : [];
+  const mappings = schema.length > 0
+    ? buildMappingsWithSchema(fields, csvColumns, schema)
+    : autoMapFields(fields, csvColumns);
+  return {
+    localId: nanoid(),
+    name: template?.templateName ?? `Rule ${priority}`,
+    template,
+    conditionGroups: [],
+    fieldMappings: mappings,
+    groupOperator: "AND",
+    isDefault: false,
+    priority,
+    active: true,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stepper
+// ─────────────────────────────────────────────────────────────────────────────
 
 function Stepper({ current, completed }: { current: Step; completed: Set<Step> }) {
   return (
@@ -71,22 +252,22 @@ function Stepper({ current, completed }: { current: Step; completed: Set<Step> }
         <div key={step.id} className="flex items-center">
           <div className="flex items-center gap-2">
             <div
-              className={`flex h-8 w-8 items-center justify-center rounded-full text-sm font-semibold border-2 transition-all ${
+              className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold border-2 transition-all ${
                 current === step.id
                   ? "border-primary bg-primary text-primary-foreground"
                   : completed.has(step.id)
                   ? "border-emerald-500 bg-emerald-500 text-white"
-                  : "border-muted bg-muted text-muted-foreground"
+                  : "border-muted bg-background text-muted-foreground"
               }`}
             >
               {completed.has(step.id) && current !== step.id ? (
-                <CheckCircle2 className="h-4 w-4" />
+                <CheckCircle2 className="h-3.5 w-3.5" />
               ) : (
                 step.id
               )}
             </div>
             <span
-              className={`hidden sm:block text-sm font-medium ${
+              className={`hidden lg:block text-xs font-medium ${
                 current === step.id
                   ? "text-foreground"
                   : completed.has(step.id)
@@ -99,7 +280,7 @@ function Stepper({ current, completed }: { current: Step; completed: Set<Step> }
           </div>
           {index < STEPS.length - 1 && (
             <div
-              className={`mx-3 h-px w-12 sm:w-20 transition-colors ${
+              className={`mx-3 h-px w-8 lg:w-14 transition-colors ${
                 completed.has(step.id) ? "bg-emerald-400" : "bg-border"
               }`}
             />
@@ -110,18 +291,30 @@ function Stepper({ current, completed }: { current: Step; completed: Set<Step> }
   );
 }
 
-// ─── Step 1: Upload CSV ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 1 – Upload CSV
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface CsvLoadedInfo {
+  /** Last-updated ISO string from saved rules */
+  lastUpdated?: string;
+}
 
 function StepUploadCsv({
   csv,
+  savedInfo,
   onCsvLoaded,
+  onContinue,
 }: {
   csv: ParsedCsv | null;
+  savedInfo: CsvLoadedInfo | null;
   onCsvLoaded: (csv: ParsedCsv) => void;
+  onContinue: () => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [isDrag, setIsDrag] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [showReplace, setShowReplace] = useState(false);
 
   const handleFile = async (file: File) => {
     if (!file.name.toLowerCase().endsWith(".csv")) {
@@ -132,6 +325,7 @@ function StepUploadCsv({
     try {
       const parsed = await parseCsvFile(file);
       onCsvLoaded(parsed);
+      setShowReplace(false);
       toast.success(`CSV loaded: ${parsed.rows.length} records, ${parsed.fields.length} columns`);
     } catch {
       toast.error("Failed to parse CSV");
@@ -147,15 +341,139 @@ function StepUploadCsv({
     if (file) handleFile(file);
   };
 
+  // Already has CSV from project data — show the "data loaded" card
+  if (csv && !showReplace) {
+    const updatedAt = savedInfo?.lastUpdated
+      ? new Date(savedInfo.lastUpdated).toLocaleString()
+      : null;
+
+    return (
+      <div className="flex flex-col gap-6 max-w-3xl mx-auto">
+        {/* Already-loaded banner */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 rounded-xl border border-emerald-200 bg-emerald-50 dark:bg-emerald-950/20 dark:border-emerald-800 p-5">
+          <div className="flex-shrink-0 h-12 w-12 rounded-full bg-emerald-100 dark:bg-emerald-900 flex items-center justify-center">
+            <CheckCircle2 className="h-6 w-6 text-emerald-600" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="font-semibold text-emerald-800 dark:text-emerald-300">CSV Data Already Loaded</h3>
+            <p className="text-sm text-emerald-700 dark:text-emerald-400 mt-0.5">
+              <span className="font-medium">{csv.fileName}</span>
+              {" · "}{csv.rows.length} records · {csv.fields.length} columns
+            </p>
+            {updatedAt && (
+              <p className="text-xs text-emerald-600 dark:text-emerald-500 mt-0.5">Last updated: {updatedAt}</p>
+            )}
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2 flex-shrink-0">
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1.5 text-xs border-emerald-300 hover:border-emerald-400"
+              onClick={() => setShowReplace(true)}
+            >
+              <RotateCcw className="h-3.5 w-3.5" />Replace CSV
+            </Button>
+            <Button
+              size="sm"
+              className="gap-1.5 text-xs"
+              onClick={onContinue}
+            >
+              Continue Rule Builder
+              <ChevronRight className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+
+        {/* Column preview */}
+        <div>
+          <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">Detected Columns</p>
+          <div className="flex flex-wrap gap-2">
+            {csv.fields.map((f) => (
+              <div key={f.key} className="flex items-center gap-1.5 rounded-full border bg-muted/50 px-3 py-1">
+                <span className={`inline-block w-2 h-2 rounded-sm flex-shrink-0 ${
+                  f.type === "image" ? "bg-sky-400" : f.type === "barcode" ? "bg-emerald-400" : "bg-violet-400"
+                }`} />
+                <span className="text-xs font-medium">{f.label}</span>
+                <span className="text-[10px] text-muted-foreground capitalize">{f.type}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Data preview table */}
+        {csv.rows.length > 0 && (
+          <Card>
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-sm font-medium">Data Preview</CardTitle>
+                <Badge variant="secondary">{csv.rows.length} records</Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="p-0">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b bg-muted/50">
+                      {csv.fields.map((f) => (
+                        <th key={f.key} className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap">
+                          <div className="flex items-center gap-1">
+                            <span className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                              f.type === "image" ? "bg-sky-400" : f.type === "barcode" ? "bg-emerald-400" : "bg-violet-400"
+                            }`} />
+                            {f.label}
+                          </div>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {csv.rows.slice(0, 5).map((row, i) => (
+                      <tr key={i} className="border-b hover:bg-muted/30">
+                        {csv.fields.map((f) => (
+                          <td key={f.key} className="px-3 py-2 max-w-[160px] truncate">
+                            {f.type === "image" && row[f.key] ? (
+                              <span className="text-sky-600 font-mono">{row[f.key]}</span>
+                            ) : (
+                              row[f.key] || <span className="text-muted-foreground/50">—</span>
+                            )}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {csv.rows.length > 5 && (
+                  <p className="px-3 py-2 text-xs text-muted-foreground border-t">
+                    +{csv.rows.length - 5} more rows
+                  </p>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+    );
+  }
+
+  // Fresh upload UI (first time, or user clicked "Replace CSV")
   return (
     <div className="flex flex-col gap-6 max-w-3xl mx-auto">
-      {/* Upload zone */}
+      {showReplace && (
+        <div className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 dark:bg-amber-950/20 px-4 py-3">
+          <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0" />
+          <p className="text-sm text-amber-700 dark:text-amber-400 flex-1">
+            Replacing the CSV will reset all field mappings. Your saved rules and conditions will be preserved.
+          </p>
+          <Button size="sm" variant="ghost" className="text-xs h-7" onClick={() => setShowReplace(false)}>
+            Cancel
+          </Button>
+        </div>
+      )}
+
       <div
-        className={`relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-12 text-center transition-all cursor-pointer ${
+        className={`relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-14 text-center transition-all cursor-pointer ${
           isDrag
             ? "border-primary bg-primary/5"
-            : csv
-            ? "border-emerald-400 bg-emerald-50 dark:bg-emerald-950/20"
             : "border-muted-foreground/30 hover:border-primary/60 hover:bg-muted/40"
         }`}
         onDragOver={(e) => { e.preventDefault(); setIsDrag(true); }}
@@ -174,92 +492,17 @@ function StepUploadCsv({
             e.target.value = "";
           }}
         />
-
         {loading ? (
           <Loader2 className="h-12 w-12 animate-spin text-primary mb-4" />
-        ) : csv ? (
-          <CheckCircle2 className="h-12 w-12 text-emerald-500 mb-4" />
         ) : (
           <FileSpreadsheet className="h-12 w-12 text-muted-foreground mb-4" />
         )}
-
-        <h3 className="text-lg font-semibold mb-1">
-          {csv ? csv.fileName : "Upload CSV Data File"}
-        </h3>
+        <h3 className="text-lg font-semibold mb-1">Upload CSV Data File</h3>
         <p className="text-sm text-muted-foreground">
-          {csv
-            ? `${csv.rows.length} records · ${csv.fields.length} columns`
-            : "Drag & drop your CSV file here, or click to browse"}
+          Drag &amp; drop your CSV file here, or click to browse
         </p>
-
-        {csv && (
-          <Button
-            size="sm"
-            variant="outline"
-            className="mt-4"
-            onClick={(e) => { e.stopPropagation(); fileRef.current?.click(); }}
-          >
-            <RotateCcw className="h-3.5 w-3.5 mr-1.5" />
-            Replace file
-          </Button>
-        )}
       </div>
 
-      {/* Preview table */}
-      {csv && csv.rows.length > 0 && (
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <CardTitle className="text-sm font-medium">Data Preview</CardTitle>
-              <Badge variant="secondary">{csv.rows.length} records</Badge>
-            </div>
-          </CardHeader>
-          <CardContent className="p-0">
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b bg-muted/50">
-                    {csv.fields.map((f) => (
-                      <th key={f.key} className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap">
-                        <div className="flex items-center gap-1">
-                          <span
-                            className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                              f.type === "image" ? "bg-sky-400" : f.type === "barcode" ? "bg-emerald-400" : "bg-violet-400"
-                            }`}
-                          />
-                          {f.label}
-                        </div>
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {csv.rows.slice(0, 5).map((row, i) => (
-                    <tr key={i} className="border-b hover:bg-muted/30">
-                      {csv.fields.map((f) => (
-                        <td key={f.key} className="px-3 py-2 max-w-[160px] truncate">
-                          {f.type === "image" && row[f.key] ? (
-                            <span className="text-sky-600 font-mono">{row[f.key]}</span>
-                          ) : (
-                            row[f.key] || <span className="text-muted-foreground/50">—</span>
-                          )}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {csv.rows.length > 5 && (
-                <p className="px-3 py-2 text-xs text-muted-foreground border-t">
-                  +{csv.rows.length - 5} more rows
-                </p>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* CSV errors */}
       {csv?.errors && csv.errors.length > 0 && (
         <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
           <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5" />
@@ -273,7 +516,9 @@ function StepUploadCsv({
   );
 }
 
-// ─── Condition Row ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Condition Row
+// ─────────────────────────────────────────────────────────────────────────────
 
 function ConditionRow({
   condition,
@@ -288,7 +533,6 @@ function ConditionRow({
   onChange: (c: Condition) => void;
   onRemove: () => void;
 }) {
-  // Unique values for the selected field (used for value dropdown)
   const uniqueValues = useMemo(() => {
     if (!condition.field || !csvRows.length) return [];
     const vals = new Set<string>();
@@ -303,15 +547,12 @@ function ConditionRow({
   const needsValue = !VALUE_LESS_OPERATORS.includes(condition.operator);
 
   return (
-    <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-      <GripVertical className="h-4 w-4 text-muted-foreground/40 flex-shrink-0 hidden sm:block" />
-
-      {/* Field selector */}
+    <div className="flex items-center gap-2">
       <Select
         value={condition.field}
         onValueChange={(v) => onChange({ ...condition, field: v, value: "" })}
       >
-        <SelectTrigger className="h-9 min-w-[140px] flex-1 text-sm">
+        <SelectTrigger className="h-8 min-w-[130px] flex-1 text-xs">
           <SelectValue placeholder="Select field" />
         </SelectTrigger>
         <SelectContent>
@@ -321,12 +562,11 @@ function ConditionRow({
         </SelectContent>
       </Select>
 
-      {/* Operator selector */}
       <Select
         value={condition.operator}
         onValueChange={(v) => onChange({ ...condition, operator: v as ConditionOperator })}
       >
-        <SelectTrigger className="h-9 w-[150px] flex-shrink-0 text-sm">
+        <SelectTrigger className="h-8 w-[130px] flex-shrink-0 text-xs">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -336,14 +576,13 @@ function ConditionRow({
         </SelectContent>
       </Select>
 
-      {/* Value — combobox seeded with CSV values */}
       {needsValue && (
         <Select
           value={condition.value}
           onValueChange={(v) => onChange({ ...condition, value: v })}
         >
-          <SelectTrigger className="h-9 min-w-[140px] flex-1 text-sm">
-            <SelectValue placeholder="Select or type value" />
+          <SelectTrigger className="h-8 min-w-[120px] flex-1 text-xs">
+            <SelectValue placeholder="Select value" />
           </SelectTrigger>
           <SelectContent>
             {uniqueValues.map((v) => (
@@ -359,7 +598,7 @@ function ConditionRow({
 
       <button
         onClick={onRemove}
-        className="flex-shrink-0 h-8 w-8 flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+        className="flex-shrink-0 h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
         type="button"
       >
         <Trash2 className="h-3.5 w-3.5" />
@@ -368,141 +607,334 @@ function ConditionRow({
   );
 }
 
-// ─── Field Mapping Table ──────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule Card (left sidebar)
+// ─────────────────────────────────────────────────────────────────────────────
 
-function FieldMappingTable({
-  mappings,
-  csvColumns,
-  csvRows,
-  onChange,
+function RuleCard({
+  rule,
+  selected,
+  onSelect,
+  onDelete,
+  onDuplicate,
+  onMoveUp,
+  onMoveDown,
+  isFirst,
+  isLast,
 }: {
-  mappings: FieldMapping[];
-  csvColumns: string[];
-  csvRows: CsvRow[];
-  onChange: (m: FieldMapping[]) => void;
+  rule: RuleEntry;
+  selected: boolean;
+  onSelect: () => void;
+  onDelete: () => void;
+  onDuplicate: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  isFirst: boolean;
+  isLast: boolean;
 }) {
-  const mappedCount = mappings.filter((m) => m.csvColumn).length;
-  const sampleRow = csvRows[0] ?? {};
+  const condCount = rule.conditionGroups.reduce((s, g) => s + g.conditions.length, 0);
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <h3 className="text-sm font-semibold">Field Mapping</h3>
-          <Badge
-            variant={mappedCount === mappings.length ? "default" : "secondary"}
-            className="text-xs"
-          >
-            {mappedCount}/{mappings.length} Mapped
-          </Badge>
-        </div>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-8 text-xs gap-1"
-          onClick={() => onChange(autoMapFields(mappings.map((m) => m.templateField), csvColumns))}
-        >
-          <Wand2 className="h-3 w-3" />
-          Auto Map
-        </Button>
+    <div
+      className={`group relative flex items-start gap-2.5 rounded-lg border p-2.5 cursor-pointer transition-all ${
+        selected
+          ? "border-primary bg-primary/5 shadow-sm"
+          : "border-border bg-card hover:border-primary/40 hover:bg-accent/30"
+      }`}
+      onClick={onSelect}
+    >
+      <div className="flex-shrink-0 w-9 h-[52px] rounded overflow-hidden border bg-muted">
+        <TemplateThumbnailCard template={rule.template} size="sm" />
       </div>
 
-      {mappings.length === 0 ? (
-        <p className="text-sm text-muted-foreground py-4 text-center">
-          No variable fields detected in this template.
-        </p>
-      ) : (
-        <div className="rounded-lg border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-muted/50 border-b">
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground w-6"></th>
-                <th className="px-3 py-2 text-left font-medium">Template Field</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground text-xs uppercase tracking-wide">Field Type</th>
-                <th className="px-3 py-2 text-left font-medium">CSV Column</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Sample Data</th>
-                <th className="px-3 py-2 text-center font-medium text-muted-foreground">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {mappings.map((m, idx) => {
-                const sampleValue = m.csvColumn ? (sampleRow[m.csvColumn] ?? "") : "";
-                const isMapped = Boolean(m.csvColumn);
-                return (
-                  <tr key={m.templateField} className="border-b last:border-0 hover:bg-muted/20">
-                    <td className="px-3 py-2">
-                      <span
-                        className={`inline-flex h-5 w-5 items-center justify-center rounded text-[9px] font-bold ${
-                          m.fieldType === "image"
-                            ? "bg-sky-100 text-sky-700"
-                            : m.fieldType === "barcode"
-                            ? "bg-emerald-100 text-emerald-700"
-                            : "bg-violet-100 text-violet-700"
-                        }`}
-                      >
-                        {m.fieldType === "image" ? "IMG" : m.fieldType === "barcode" ? "BAR" : "T"}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 font-medium">{m.templateField}</td>
-                    <td className="px-3 py-2 text-xs text-muted-foreground capitalize">{m.fieldType}</td>
-                    <td className="px-3 py-2">
-                      <Select
-                        value={m.csvColumn || "__none__"}
-                        onValueChange={(v) => {
-                          const next = [...mappings];
-                          next[idx] = { ...m, csvColumn: v === "__none__" ? "" : v };
-                          onChange(next);
-                        }}
-                      >
-                        <SelectTrigger className="h-8 text-sm w-full max-w-[200px]">
-                          <SelectValue placeholder="— Not mapped —" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="__none__">— Not mapped —</SelectItem>
-                          {csvColumns.map((col) => (
-                            <SelectItem key={col} value={col}>{col}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </td>
-                    <td className="px-3 py-2 text-xs text-muted-foreground max-w-[160px] truncate">
-                      {m.fieldType === "image" && sampleValue ? (
-                        <span className="text-sky-600">{sampleValue}</span>
-                      ) : (
-                        sampleValue || <span className="opacity-40">—</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 text-center">
-                      {isMapped ? (
-                        <CheckCircle2 className="h-4 w-4 text-emerald-500 mx-auto" />
-                      ) : (
-                        <AlertTriangle className="h-4 w-4 text-amber-400 mx-auto" />
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-          {mappings.some((m) => !m.csvColumn) && (
-            <div className="px-3 py-2 border-t bg-amber-50 dark:bg-amber-950/20 flex items-center gap-2 text-xs text-amber-700">
-              <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
-              {mappings.filter((m) => !m.csvColumn).length} field(s) are not mapped.
-              <button
-                className="underline underline-offset-2 font-medium"
-                onClick={() => onChange(autoMapFields(mappings.map((m) => m.templateField), csvColumns))}
-              >
-                Auto-map now
-              </button>
-            </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs font-semibold truncate">{rule.name}</span>
+          {rule.isDefault && (
+            <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-4 flex-shrink-0">Default</Badge>
           )}
         </div>
-      )}
+        <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+          <span className="text-[10px] text-muted-foreground">Priority: {rule.priority}</span>
+          {rule.active ? (
+            <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-950/30">Active</Badge>
+          ) : (
+            <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 text-muted-foreground">Inactive</Badge>
+          )}
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-0.5">{condCount} condition{condCount !== 1 ? "s" : ""}</p>
+      </div>
+
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            className="flex-shrink-0 h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <MoreVertical className="h-3.5 w-3.5" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onMoveUp(); }} disabled={isFirst}>
+            <ChevronUp className="h-3.5 w-3.5 mr-2" />Move Up
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onMoveDown(); }} disabled={isLast}>
+            <ChevronDown className="h-3.5 w-3.5 mr-2" />Move Down
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onDuplicate(); }}>
+            Duplicate
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            className="text-destructive focus:text-destructive"
+          >
+            <Trash2 className="h-3.5 w-3.5 mr-2" />Delete
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }
 
-// ─── Live Template Preview ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: detect blank (all-white / transparent) images via canvas pixel sample
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isImgBlank(img: HTMLImageElement): boolean {
+  try {
+    const SAMPLE = 24;
+    const c = document.createElement("canvas");
+    c.width = SAMPLE; c.height = SAMPLE;
+    const ctx = c.getContext("2d");
+    if (!ctx || !img.naturalWidth) return false;
+    ctx.drawImage(img, 0, 0, SAMPLE, SAMPLE);
+    const { data } = ctx.getImageData(0, 0, SAMPLE, SAMPLE);
+    let nonWhite = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3];
+      const r = data[i]; const g = data[i + 1]; const b = data[i + 2];
+      if (a > 20 && (r < 238 || g < 238 || b < 238)) nonWhite++;
+    }
+    return nonWhite < 8; // fewer than 8 non-white pixels → blank
+  } catch {
+    return false; // cross-origin taint — assume not blank
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TemplateThumbnailCard — unified thumbnail with blank-detection + canvas fallback
+// Used by: sidebar rule card, live preview panel, template chooser modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ThumbSize = "sm" | "md" | "lg";
+
+function TemplateThumbnailCard({
+  template,
+  size = "md",
+  className = "",
+}: {
+  template: PreviewTemplateOption | null | undefined;
+  size?: ThumbSize;
+  className?: string;
+}) {
+  const [imgState, setImgState] = useState<"loading" | "ok" | "blank" | "error">("loading");
+
+  // Reset when the template changes
+  useEffect(() => { setImgState("loading"); }, [template?.thumbnail, template?.id]);
+
+  const sizeClasses: Record<ThumbSize, string> = {
+    sm: "w-full h-full",
+    md: "w-full min-h-[100px]",
+    lg: "w-full min-h-[230px]",
+  };
+
+  if (!template) {
+    return (
+      <div className={`${sizeClasses[size]} flex items-center justify-center bg-muted ${className}`}>
+        <Layers className="h-6 w-6 text-muted-foreground" />
+      </div>
+    );
+  }
+
+  const thumbUrl = template.thumbnail || "";
+  const hasCanvas = Boolean(template.canvasJSON);
+  const showCanvas = (!thumbUrl || imgState === "blank" || imgState === "error") && hasCanvas;
+  const showPlaceholder = !thumbUrl && !hasCanvas;
+  const showFallbackPlaceholder =
+    (imgState === "blank" || imgState === "error") && !hasCanvas;
+
+  // Initials for placeholder
+  const initials = template.templateName
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((w) => w[0]?.toUpperCase() ?? "")
+    .join("");
+
+  if (showPlaceholder || showFallbackPlaceholder) {
+    return (
+      <div
+        className={`${sizeClasses[size]} flex flex-col items-center justify-center bg-gradient-to-br from-muted to-muted/60 gap-1 ${className}`}
+      >
+        <span className="text-lg font-bold text-muted-foreground/60 select-none">{initials}</span>
+        <Layers className="h-4 w-4 text-muted-foreground/40" />
+      </div>
+    );
+  }
+
+  if (showCanvas) {
+    return (
+      <CanvasThumbnail
+        canvasJSON={template.canvasJSON!}
+        widthMm={template.canvas.width}
+        heightMm={template.canvas.height}
+        className={`${sizeClasses[size]} ${className}`}
+      />
+    );
+  }
+
+  // Show image; on load run blank detection; on error fall through to canvas/placeholder
+  return (
+    <img
+      key={thumbUrl}
+      src={thumbUrl}
+      alt={template.templateName}
+      className={`${sizeClasses[size]} object-cover ${imgState === "loading" ? "opacity-0" : "opacity-100"} transition-opacity ${className}`}
+      onLoad={(e) => {
+        const img = e.currentTarget;
+        setImgState(isImgBlank(img) ? "blank" : "ok");
+      }}
+      onError={() => setImgState("error")}
+    />
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Canvas Thumbnail — renders canvasJSON via Fabric StaticCanvas as a fallback
+// preview when no thumbnail image URL is available.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function CanvasThumbnail({
+  canvasJSON,
+  widthMm,
+  heightMm,
+  className = "",
+}: {
+  canvasJSON: string;
+  widthMm: number;
+  heightMm: number;
+  className?: string;
+}) {
+  const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setDataUrl(null);
+
+    (async () => {
+      try {
+        const { StaticCanvas } = await import("fabric");
+        if (cancelled) return;
+
+        // Unwrap pages[] wrapper if present (multi-page canvas format)
+        let fabricJSON = canvasJSON;
+        try {
+          const parsed = JSON.parse(canvasJSON) as Record<string, any>;
+          if (Array.isArray(parsed.pages) && parsed.pages.length > 0) {
+            const p = parsed.pages[0] as Record<string, any>;
+            fabricJSON = JSON.stringify(p.canvas ?? p);
+          }
+        } catch { /* use raw */ }
+
+        // Convert mm → px at 96 DPI
+        const MM_TO_PX = 96 / 25.4;
+        const srcW = widthMm > 0 ? Math.round(widthMm * MM_TO_PX) : 204;
+        const srcH = heightMm > 0 ? Math.round(heightMm * MM_TO_PX) : 324;
+
+        // Strip cross-origin images to prevent canvas taint
+        try {
+          const json = JSON.parse(fabricJSON) as Record<string, any>;
+          if (Array.isArray(json.objects)) {
+            json.objects = (json.objects as Record<string, any>[]).filter((o) => {
+              if (String(o.type || "").toLowerCase() !== "image") return true;
+              const src = String(o.src || "");
+              try {
+                const u = new URL(src, window.location.href);
+                return !(
+                  (u.protocol === "http:" || u.protocol === "https:") &&
+                  u.origin !== window.location.origin
+                );
+              } catch { return true; }
+            });
+          }
+          if (json.backgroundImage) {
+            const bgSrc = String((json.backgroundImage as Record<string, any>).src || "");
+            try {
+              const u = new URL(bgSrc, window.location.href);
+              if (
+                (u.protocol === "http:" || u.protocol === "https:") &&
+                u.origin !== window.location.origin
+              ) {
+                delete json.backgroundImage;
+              }
+            } catch { /* keep */ }
+          }
+          fabricJSON = JSON.stringify(json);
+        } catch { /* use as-is */ }
+
+        const el = document.createElement("canvas");
+        const sc = new StaticCanvas(el, { width: srcW, height: srcH, renderOnAddRemove: false });
+
+        await sc.loadFromJSON(fabricJSON);
+        if (!sc.backgroundColor) sc.backgroundColor = "#ffffff";
+        (sc as any).clipPath = undefined;
+        sc.renderAll();
+
+        let url = "";
+        try {
+          // Render at 50% to keep the preview lightweight
+          url = sc.toDataURL({ format: "png", multiplier: 0.5 } as any);
+        } catch { /* cross-origin taint — leave url empty */ }
+        sc.dispose();
+
+        if (!cancelled) {
+          setDataUrl(url || null);
+          setLoading(false);
+        }
+      } catch {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [canvasJSON, widthMm, heightMm]);
+
+  if (loading) {
+    return (
+      <div className={`${className} flex items-center justify-center bg-muted min-h-[120px]`}>
+        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (!dataUrl) {
+    return (
+      <div className={`${className} flex items-center justify-center bg-muted min-h-[120px]`}>
+        <Layers className="h-8 w-8 text-muted-foreground" />
+      </div>
+    );
+  }
+
+  return (
+    <img src={dataUrl} alt="" className={`${className} object-cover w-full`} />
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live Template Preview
+// ─────────────────────────────────────────────────────────────────────────────
 
 function LiveTemplatePreview({
   template,
@@ -515,451 +947,716 @@ function LiveTemplatePreview({
 }) {
   if (!template) {
     return (
-      <div className="flex flex-col items-center justify-center h-64 gap-3 text-muted-foreground">
+      <div className="flex flex-col items-center justify-center h-48 gap-3 text-muted-foreground">
         <Layers className="h-10 w-10" />
-        <p className="text-sm">No template selected</p>
+        <p className="text-xs text-center text-muted-foreground">No template selected</p>
       </div>
     );
   }
 
   const resolved = sampleRow ? applyMappings(sampleRow, mappings) : {};
-  const thumbUrl = template.thumbnail || "";
 
-  // Try to get student name / photo from mappings
-  const getField = (keys: string[]) => {
-    for (const k of keys) {
-      if (resolved[k]) return resolved[k];
-    }
-    return "";
-  };
-  const name = getField(["Student Name", "student_name", "name", "Name", "fullname"]);
-  const photoVal = getField(["Photo", "photo", "image", "Image", "avatar", "profilepic"]);
+  const getField = (keys: string[]) => { for (const k of keys) { if (resolved[k]) return resolved[k]; } return ""; };
+  const photoVal = getField(["Photo", "photo", "image", "Image", "avatar"]);
   const photoUrl = photoVal ? resolveProfileImageUrl(photoVal) : "";
 
   return (
-    <div className="flex flex-col items-center gap-4">
-      <div className="relative w-[200px] rounded-lg overflow-hidden border shadow-md bg-white">
-        {thumbUrl ? (
-          <img
-            src={thumbUrl}
-            alt={template.templateName}
-            className="w-full object-cover"
-            onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
-          />
-        ) : (
-          <div className="h-[270px] flex items-center justify-center bg-muted text-muted-foreground text-xs">
-            <Layers className="h-8 w-8" />
-          </div>
-        )}
-
-        {/* Overlay the photo if we have one */}
+    <div className="flex flex-col items-center gap-3">
+      <div className="relative w-[170px] rounded-lg overflow-hidden border shadow-md bg-white">
+        <TemplateThumbnailCard template={template} size="lg" />
         {photoUrl && (
-          <div className="absolute inset-0 flex items-start justify-center pointer-events-none pt-12">
+          <div className="absolute inset-0 flex items-start justify-center pointer-events-none pt-10">
             <img
               src={photoUrl}
-              alt="student"
-              className="h-14 w-14 rounded-full object-cover border-2 border-white shadow"
+              alt=""
+              className="h-12 w-12 rounded-full object-cover border-2 border-white shadow"
               onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
             />
           </div>
         )}
       </div>
 
-      <div className="w-full text-sm space-y-1">
-        <p className="font-semibold text-center truncate">{template.templateName}</p>
-        <div className="flex items-center justify-center gap-2 flex-wrap">
-          <Badge variant="secondary" className="text-xs">
-            {template.canvas.width}×{template.canvas.height}mm
-          </Badge>
-          <Badge variant="outline" className="text-xs capitalize">{template.templateType}</Badge>
-          {template.isGlobal && (
-            <Badge variant="outline" className="text-xs text-sky-600 border-sky-200">Global</Badge>
-          )}
+      <div className="w-full text-center space-y-1">
+        <p className="text-xs font-semibold truncate">{template.templateName}</p>
+        <div className="flex items-center justify-center gap-1.5 flex-wrap">
+          <Badge variant="secondary" className="text-[10px]">{template.canvas.width}×{template.canvas.height}mm</Badge>
+          <Badge variant="outline" className="text-[10px] capitalize">{template.templateType}</Badge>
+          {template.isGlobal && <Badge variant="outline" className="text-[10px] text-sky-600 border-sky-200">Global</Badge>}
         </div>
-
-        {/* Mapped field sample preview */}
-        {sampleRow && (
-          <div className="mt-3 rounded-lg border p-2.5 space-y-1 text-xs bg-muted/30">
-            <p className="font-medium text-muted-foreground uppercase tracking-wide text-[10px] mb-1.5">Sample data</p>
-            {mappings.filter((m) => m.csvColumn).slice(0, 6).map((m) => (
-              <div key={m.templateField} className="flex gap-2">
-                <span className="text-muted-foreground font-medium min-w-[80px] truncate">{m.templateField}:</span>
-                <span className="truncate font-medium">{resolved[m.templateField] || resolved[m.csvColumn] || "—"}</span>
-              </div>
-            ))}
-          </div>
-        )}
       </div>
+
+      {sampleRow && mappings.filter((m) => m.csvColumn).length > 0 && (
+        <div className="w-full rounded-lg border p-2.5 space-y-1 text-xs bg-muted/30">
+          <p className="font-medium text-muted-foreground uppercase tracking-wide text-[10px] mb-1.5">Sample data</p>
+          {mappings.filter((m) => m.csvColumn).slice(0, 5).map((m) => (
+            <div key={m.templateField} className="flex gap-2">
+              <span className="text-muted-foreground min-w-[70px] truncate">{m.templateField}:</span>
+              <span className="truncate font-medium">{resolved[m.templateField] || resolved[m.csvColumn] || "—"}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-// ─── Step 2: Rule Builder ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Full Template Preview Dialog
+// ─────────────────────────────────────────────────────────────────────────────
 
-function StepRuleBuilder({
+function FullTemplatePreviewDialog({
   template,
-  csv,
-  conditionGroups,
-  fieldMappings,
-  groupOperator,
-  isDefault,
-  onConditionGroupsChange,
-  onFieldMappingsChange,
-  onGroupOperatorChange,
-  onIsDefaultChange,
-  onChangeTemplate,
-  matchedCount,
+  onClose,
 }: {
   template: PreviewTemplateOption | null;
-  csv: ParsedCsv | null;
-  conditionGroups: ConditionGroup[];
-  fieldMappings: FieldMapping[];
-  groupOperator: "AND" | "OR";
-  isDefault: boolean;
-  onConditionGroupsChange: (g: ConditionGroup[]) => void;
-  onFieldMappingsChange: (m: FieldMapping[]) => void;
-  onGroupOperatorChange: (op: "AND" | "OR") => void;
-  onIsDefaultChange: (v: boolean) => void;
-  onChangeTemplate: () => void;
-  matchedCount: number;
+  onClose: () => void;
 }) {
+  if (!template) return null;
+
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="max-w-3xl w-full p-0 overflow-hidden">
+        <DialogHeader className="px-5 py-4 border-b">
+          <DialogTitle className="flex items-center gap-2 text-base font-semibold">
+            <Layers className="h-4 w-4 text-muted-foreground" />
+            {template.templateName}
+          </DialogTitle>
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
+            <Badge variant="secondary" className="text-xs capitalize">{template.templateType}</Badge>
+            <Badge variant="outline" className="text-xs">{template.canvas.width}×{template.canvas.height}mm</Badge>
+            {template.isGlobal && <Badge variant="outline" className="text-xs text-sky-600 border-sky-200">Global</Badge>}
+          </div>
+        </DialogHeader>
+
+        <div className="flex items-center justify-center bg-muted/30 min-h-[420px] p-6">
+          <div
+            className="rounded-xl overflow-hidden border shadow-xl bg-white"
+            style={{ maxHeight: "70vh", maxWidth: "100%", width: "fit-content" }}
+          >
+            {template.thumbnail ? (
+              <img
+                src={template.thumbnail}
+                alt={template.templateName}
+                className="block max-h-[65vh] max-w-full object-contain"
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+              />
+            ) : template.canvasJSON ? (
+              <CanvasThumbnail
+                canvasJSON={template.canvasJSON}
+                widthMm={template.canvas.width}
+                heightMm={template.canvas.height}
+                className="min-h-[300px] min-w-[200px]"
+              />
+            ) : (
+              <div className="flex flex-col items-center justify-center h-64 w-64 gap-3 text-muted-foreground">
+                <Layers className="h-12 w-12" />
+                <p className="text-sm">No preview available</p>
+              </div>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 2 – Rule Builder (3-column layout matching reference)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function StepRuleBuilder({
+  rules,
+  selectedRuleId,
+  csv,
+  allTemplates,
+  defaultTemplateId,
+  onSelectRule,
+  onAddRule,
+  onUpdateRule,
+  onDeleteRule,
+  onDuplicateRule,
+  onMoveRule,
+  onDefaultTemplateChange,
+  onChangeTemplate,
+}: {
+  rules: RuleEntry[];
+  selectedRuleId: string | null;
+  csv: ParsedCsv | null;
+  allTemplates: PreviewTemplateOption[];
+  defaultTemplateId: string;
+  onSelectRule: (id: string) => void;
+  onAddRule: () => void;
+  onUpdateRule: (id: string, patch: Partial<RuleEntry>) => void;
+  onDeleteRule: (id: string) => void;
+  onDuplicateRule: (id: string) => void;
+  onMoveRule: (idx: number, dir: "up" | "down") => void;
+  onDefaultTemplateChange: (val: string) => void;
+  onChangeTemplate: (ruleId: string) => void;
+}) {
+  const selectedRule = rules.find((r) => r.localId === selectedRuleId) ?? null;
   const csvColumns = csv?.fields.map((f) => f.key) ?? [];
   const csvRows = csv?.rows ?? [];
+  const [previewTemplate, setPreviewTemplate] = useState<PreviewTemplateOption | null>(null);
+
+  const patch = useCallback(
+    (p: Partial<RuleEntry>) => { if (selectedRule) onUpdateRule(selectedRule.localId, p); },
+    [selectedRule, onUpdateRule],
+  );
+
+  const conditionGroups = selectedRule?.conditionGroups ?? [];
+
+  const addCondition = () => {
+    if (!selectedRule) return;
+    const newCond: Condition = { id: nanoid(), field: csvColumns[0] ?? "", operator: "equals", value: "" };
+    if (conditionGroups.length === 0) {
+      patch({ conditionGroups: [{ id: nanoid(), operator: "AND", conditions: [newCond] }] });
+    } else {
+      patch({ conditionGroups: conditionGroups.map((g, i) => i === 0 ? { ...g, conditions: [...g.conditions, newCond] } : g) });
+    }
+  };
 
   const addConditionGroup = () => {
-    onConditionGroupsChange([
-      ...conditionGroups,
-      { id: nanoid(), operator: "AND", conditions: [] },
-    ]);
-  };
-
-  const updateGroup = (idx: number, patch: Partial<ConditionGroup>) => {
-    const next = conditionGroups.map((g, i) => i === idx ? { ...g, ...patch } : g);
-    onConditionGroupsChange(next);
-  };
-
-  const removeGroup = (idx: number) => {
-    onConditionGroupsChange(conditionGroups.filter((_, i) => i !== idx));
-  };
-
-  const addCondition = (groupIdx: number) => {
-    const group = conditionGroups[groupIdx];
-    const updated: ConditionGroup = {
-      ...group,
-      conditions: [
-        ...group.conditions,
-        { id: nanoid(), field: csvColumns[0] ?? "", operator: "equals", value: "" },
+    if (!selectedRule) return;
+    patch({
+      conditionGroups: [
+        ...conditionGroups,
+        { id: nanoid(), operator: "AND", conditions: [{ id: nanoid(), field: csvColumns[0] ?? "", operator: "equals", value: "" }] },
       ],
-    };
-    updateGroup(groupIdx, updated);
+    });
   };
 
-  const updateCondition = (groupIdx: number, condIdx: number, patch: Partial<Condition>) => {
-    const group = conditionGroups[groupIdx];
-    const next = group.conditions.map((c, i) => i === condIdx ? { ...c, ...patch } : c);
-    updateGroup(groupIdx, { conditions: next });
+  const updateCondition = (groupIdx: number, condIdx: number, c: Condition) => {
+    patch({ conditionGroups: conditionGroups.map((g, gi) => gi !== groupIdx ? g : { ...g, conditions: g.conditions.map((x, ci) => ci !== condIdx ? x : c) }) });
   };
 
   const removeCondition = (groupIdx: number, condIdx: number) => {
     const group = conditionGroups[groupIdx];
     const next = group.conditions.filter((_, i) => i !== condIdx);
     if (next.length === 0 && conditionGroups.length > 1) {
-      removeGroup(groupIdx);
+      patch({ conditionGroups: conditionGroups.filter((_, i) => i !== groupIdx) });
     } else {
-      updateGroup(groupIdx, { conditions: next });
+      patch({ conditionGroups: conditionGroups.map((g, i) => i !== groupIdx ? g : { ...g, conditions: next }) });
     }
   };
 
+  const matchedCount = useMemo(() => {
+    if (!csv || !selectedRule) return 0;
+    return filterRowsByRule({ conditionGroups: selectedRule.conditionGroups, groupOperator: selectedRule.groupOperator }, csv.rows).length;
+  }, [csv, selectedRule]);
+
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-[1fr_280px] gap-6">
-      {/* LEFT – conditions + mapping */}
-      <div className="space-y-6 min-w-0">
-        {/* Template info bar */}
-        <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs text-muted-foreground">Template</span>
-              <span className="font-semibold text-sm truncate">
-                {template ? template.templateName : "No template"}
-              </span>
-              {template && (
-                <Badge variant="outline" className="text-xs">{template.templateType}</Badge>
-              )}
-            </div>
-            {csv && (
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-xs text-muted-foreground">Data Source</span>
-                <span className="text-xs font-medium text-emerald-600">{csv.fileName}</span>
-                <span className="text-xs text-muted-foreground">{csv.rows.length} records</span>
-                <Badge
-                  variant={matchedCount > 0 ? "default" : "secondary"}
-                  className="text-xs ml-1"
-                >
-                  {matchedCount} matching
-                </Badge>
-              </div>
-            )}
+    <>
+      {previewTemplate && (
+        <FullTemplatePreviewDialog
+          template={previewTemplate}
+          onClose={() => setPreviewTemplate(null)}
+        />
+      )}
+    <div className="flex flex-col flex-1 overflow-hidden min-h-0">
+      {/* 3-column main area */}
+      <div className="flex flex-1 overflow-hidden min-h-0">
+
+        {/* LEFT SIDEBAR: Templates & Rules */}
+        <div className="w-[260px] flex-shrink-0 border-r flex flex-col overflow-hidden bg-background">
+          <div className="flex items-center justify-between px-3 py-2.5 border-b bg-muted/30">
+            <span className="text-xs font-semibold">Templates &amp; Rules</span>
+            <Button size="sm" variant="outline" className="h-7 text-[11px] gap-1 px-2" onClick={onAddRule}>
+              <Plus className="h-3 w-3" />
+              Add Template Rule
+            </Button>
           </div>
-          <Button size="sm" variant="ghost" className="text-xs h-8" onClick={onChangeTemplate}>
-            Change Template
-          </Button>
-        </div>
 
-        {/* Conditions */}
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="text-sm">1. Conditions</CardTitle>
-                <p className="text-xs text-muted-foreground mt-0.5">All must match</p>
-              </div>
-              {conditionGroups.length > 1 && (
-                <div className="flex items-center gap-2 text-xs">
-                  <span className="text-muted-foreground">Groups joined by</span>
-                  <Select value={groupOperator} onValueChange={(v) => onGroupOperatorChange(v as "AND" | "OR")}>
-                    <SelectTrigger className="h-7 w-[70px] text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="AND">AND</SelectItem>
-                      <SelectItem value="OR">OR</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {conditionGroups.length === 0 && (
-              <p className="text-sm text-muted-foreground py-2 text-center">
-                No conditions — all records will match this rule.
-              </p>
-            )}
-
-            {conditionGroups.map((group, groupIdx) => (
-              <div key={group.id} className="rounded-lg border p-3 space-y-2.5 bg-muted/20">
-                <div className="flex items-center justify-between mb-1">
-                  <div className="flex items-center gap-2">
-                    <ListFilter className="h-3.5 w-3.5 text-muted-foreground" />
-                    <span className="text-xs font-medium text-muted-foreground">
-                      Group {groupIdx + 1}
-                    </span>
-                    {group.conditions.length > 1 && (
-                      <Select
-                        value={group.operator}
-                        onValueChange={(v) => updateGroup(groupIdx, { operator: v as "AND" | "OR" })}
-                      >
-                        <SelectTrigger className="h-6 w-[60px] text-[10px]">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="AND">AND</SelectItem>
-                          <SelectItem value="OR">OR</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    )}
-                  </div>
-                  <button
-                    onClick={() => removeGroup(groupIdx)}
-                    className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                </div>
-
-                {group.conditions.map((condition, condIdx) => (
-                  <div key={condition.id}>
-                    {condIdx > 0 && (
-                      <div className="flex items-center gap-2 my-1">
-                        <div className="h-px flex-1 bg-border" />
-                        <span className="text-[10px] font-semibold text-muted-foreground px-1">{group.operator}</span>
-                        <div className="h-px flex-1 bg-border" />
-                      </div>
-                    )}
-                    <ConditionRow
-                      condition={condition}
-                      csvColumns={csvColumns}
-                      csvRows={csvRows}
-                      onChange={(c) => updateCondition(groupIdx, condIdx, c)}
-                      onRemove={() => removeCondition(groupIdx, condIdx)}
-                    />
-                  </div>
-                ))}
-
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 text-xs gap-1 text-muted-foreground"
-                  onClick={() => addCondition(groupIdx)}
-                  disabled={csvColumns.length === 0}
-                >
-                  <Plus className="h-3 w-3" />
-                  Add Condition
+          <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+            {rules.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-10 gap-2 text-muted-foreground">
+                <Layers className="h-7 w-7" />
+                <p className="text-xs text-center">No template rules yet</p>
+                <Button size="sm" variant="ghost" className="text-xs h-7 gap-1" onClick={onAddRule}>
+                  <Plus className="h-3 w-3" />Add first rule
                 </Button>
               </div>
-            ))}
-
-            <div className="flex gap-2 pt-1">
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 text-xs gap-1"
-                onClick={addConditionGroup}
-                disabled={csvColumns.length === 0}
+            ) : (
+              rules.map((rule, idx) => (
+                <RuleCard
+                  key={rule.localId}
+                  rule={rule}
+                  selected={rule.localId === selectedRuleId}
+                  onSelect={() => onSelectRule(rule.localId)}
+                  onDelete={() => onDeleteRule(rule.localId)}
+                  onDuplicate={() => onDuplicateRule(rule.localId)}
+                  onMoveUp={() => onMoveRule(idx, "up")}
+                  onMoveDown={() => onMoveRule(idx, "down")}
+                  isFirst={idx === 0}
+                  isLast={idx === rules.length - 1}
+                />
+              ))
+            )}
+            {rules.length > 0 && (
+              <button
+                className="w-full flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground border border-dashed rounded-lg py-2 hover:bg-muted/40 hover:text-foreground transition-colors mt-1"
+                onClick={onAddRule}
               >
-                <Plus className="h-3.5 w-3.5" />
-                Add Condition
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 text-xs gap-1"
-                onClick={() => {
-                  const g = conditionGroups[conditionGroups.length - 1];
-                  if (g) {
-                    onConditionGroupsChange([...conditionGroups, { id: nanoid(), operator: "AND", conditions: [] }]);
-                  } else {
-                    addConditionGroup();
-                  }
-                }}
-                disabled={csvColumns.length === 0}
-              >
-                <Plus className="h-3.5 w-3.5" />
-                Add Condition Group
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+                <Plus className="h-3 w-3" />Add Template Rule
+              </button>
+            )}
+          </div>
 
-        {/* Field mapping */}
-        <Card>
-          <CardContent className="pt-5">
-            <FieldMappingTable
-              mappings={fieldMappings}
-              csvColumns={csvColumns}
-              csvRows={csvRows}
-              onChange={onFieldMappingsChange}
-            />
-          </CardContent>
-        </Card>
+          <div className="border-t px-3 py-2 bg-muted/20">
+            <p className="text-[10px] text-muted-foreground leading-relaxed">
+              Templates are matched in priority order from top to bottom.
+            </p>
+          </div>
+        </div>
 
-        {/* Options */}
-        <Card>
-          <CardContent className="pt-5">
-            <div className="flex items-center justify-between">
-              <div>
-                <Label className="text-sm font-medium">Set as Default Rule</Label>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  Default rules apply to all records not matched by other rules.
-                </p>
+        {/* CENTER: Rule Editor */}
+        <div className="flex-1 overflow-y-auto min-w-0">
+          {selectedRule ? (
+            <div className="p-5 space-y-5 max-w-2xl">
+              {/* Header row */}
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h3 className="text-sm font-semibold">Edit Rule: {selectedRule.name}</h3>
+                  <p className="text-xs text-muted-foreground mt-0.5">Rows matching these conditions will use this template.</p>
+                </div>
+                <div className="flex items-center gap-4 flex-shrink-0">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">Priority</span>
+                    <div className="flex items-center gap-0.5">
+                      <Input
+                        type="number"
+                        min={1}
+                        value={selectedRule.priority}
+                        onChange={(e) => patch({ priority: Math.max(1, parseInt(e.target.value) || 1) })}
+                        className="h-7 w-12 text-xs text-center px-1"
+                      />
+                      <div className="flex flex-col">
+                        <button className="h-3.5 w-5 flex items-center justify-center hover:bg-muted rounded-sm" onClick={() => patch({ priority: Math.max(1, selectedRule.priority - 1) })}>
+                          <ChevronUp className="h-3 w-3" />
+                        </button>
+                        <button className="h-3.5 w-5 flex items-center justify-center hover:bg-muted rounded-sm" onClick={() => patch({ priority: selectedRule.priority + 1 })}>
+                          <ChevronDown className="h-3 w-3" />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">Active</span>
+                    <Switch checked={selectedRule.active} onCheckedChange={(v) => patch({ active: v })} className="scale-90" />
+                  </div>
+                </div>
               </div>
-              <Switch checked={isDefault} onCheckedChange={onIsDefaultChange} />
+
+              {/* Template row */}
+              {selectedRule.template && (
+                <div className="flex items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2">
+                  {selectedRule.template.thumbnail && (
+                    <img src={selectedRule.template.thumbnail} alt="" className="h-8 w-6 object-cover rounded flex-shrink-0"
+                      onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-medium truncate">{selectedRule.template.templateName}</p>
+                    <p className="text-[10px] text-muted-foreground capitalize">{selectedRule.template.templateType}</p>
+                  </div>
+                  <Button size="sm" variant="ghost" className="h-7 text-xs flex-shrink-0" onClick={() => onChangeTemplate(selectedRule.localId)}>
+                    Change
+                  </Button>
+                </div>
+              )}
+
+              {/* Conditions section */}
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-medium">Conditions</h4>
+                    <span className="text-xs text-muted-foreground">(All conditions must match)</span>
+                  </div>
+                  {csv && (
+                    <Badge variant={matchedCount > 0 ? "default" : "secondary"} className="text-xs">
+                      {matchedCount} matching
+                    </Badge>
+                  )}
+                </div>
+
+                <div className="rounded-lg border p-3 bg-muted/10 space-y-2">
+                  {conditionGroups.length === 0 && (
+                    <p className="text-xs text-muted-foreground text-center py-2">
+                      No conditions — all records will match this template.
+                    </p>
+                  )}
+                  {conditionGroups.map((group, groupIdx) => (
+                    <div key={group.id}>
+                      {groupIdx > 0 && (
+                        <div className="flex items-center gap-2 my-2">
+                          <div className="h-px flex-1 bg-border" />
+                          <Select value={selectedRule.groupOperator} onValueChange={(v) => patch({ groupOperator: v as "AND" | "OR" })}>
+                            <SelectTrigger className="h-6 w-[60px] text-[10px] font-semibold">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="AND">AND</SelectItem>
+                              <SelectItem value="OR">OR</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <div className="h-px flex-1 bg-border" />
+                        </div>
+                      )}
+                      <div className="space-y-2">
+                        {group.conditions.map((cond, condIdx) => (
+                          <div key={cond.id}>
+                            {condIdx > 0 && (
+                              <p className="text-[10px] font-semibold text-muted-foreground text-center my-1">{group.operator}</p>
+                            )}
+                            <ConditionRow
+                              condition={cond}
+                              csvColumns={csvColumns}
+                              csvRows={csvRows}
+                              onChange={(c) => updateCondition(groupIdx, condIdx, c)}
+                              onRemove={() => removeCondition(groupIdx, condIdx)}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex gap-2 mt-3">
+                  <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={addCondition} disabled={csvColumns.length === 0}>
+                    <Plus className="h-3.5 w-3.5" />Add Condition
+                  </Button>
+                  <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={addConditionGroup} disabled={csvColumns.length === 0}>
+                    <Plus className="h-3.5 w-3.5" />Add Condition Group
+                  </Button>
+                </div>
+              </div>
+
+              {/* How it works */}
+              <div className="rounded-lg border border-blue-200 bg-blue-50 dark:bg-blue-950/20 dark:border-blue-800 p-3">
+                <div className="flex items-start gap-2">
+                  <Info className="h-4 w-4 text-blue-500 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-xs font-semibold text-blue-700 dark:text-blue-400 mb-1">How it works</p>
+                    <p className="text-xs text-blue-600 dark:text-blue-500">
+                      If a CSV row matches all the conditions above, this template will be used.
+                      If multiple templates match, the one with higher priority will be applied.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Default template fallback */}
+              <div className="rounded-lg border p-4 space-y-3">
+                <p className="text-xs font-medium">If no template matches</p>
+                <Select value={defaultTemplateId || "__none__"} onValueChange={onDefaultTemplateChange}>
+                  <SelectTrigger className="h-9 text-xs">
+                    <SelectValue placeholder="Use Default Template" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">— None —</SelectItem>
+                    {allTemplates.map((t) => (
+                      <SelectItem key={t.id} value={t.id}>{t.templateName}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">Select a template to use when no rules match a row.</p>
+                <button className="text-xs text-primary hover:underline flex items-center gap-1">
+                  <ExternalLink className="h-3 w-3" />Manage Default Template
+                </button>
+              </div>
             </div>
-          </CardContent>
-        </Card>
+          ) : (
+            <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
+              <Settings2 className="h-10 w-10" />
+              <p className="text-sm font-medium">Select a rule to edit</p>
+              <p className="text-xs text-center max-w-xs">Click a template rule from the left panel, or add a new one.</p>
+              <Button size="sm" variant="outline" className="gap-1.5" onClick={onAddRule}>
+                <Plus className="h-4 w-4" />Add Template Rule
+              </Button>
+            </div>
+          )}
+        </div>
+
+        {/* RIGHT: Template Preview */}
+        <div className="w-[260px] flex-shrink-0 border-l flex flex-col overflow-hidden bg-background">
+          <div className="px-3 py-2.5 border-b bg-muted/30">
+            <span className="text-xs font-semibold">Template Preview</span>
+          </div>
+          <div className="flex-1 overflow-y-auto p-3">
+            <LiveTemplatePreview
+              template={selectedRule?.template ?? null}
+              sampleRow={csv?.rows[0] ?? null}
+              mappings={selectedRule?.fieldMappings ?? []}
+            />
+          </div>
+          {selectedRule?.template && (
+            <div className="border-t p-3">
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full h-8 text-xs gap-1.5"
+                onClick={() => setPreviewTemplate(selectedRule.template!)}
+              >
+                <Eye className="h-3.5 w-3.5" />View Full Template
+              </Button>
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* RIGHT – live preview */}
-      <div className="xl:sticky xl:top-6 xl:self-start">
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <CardTitle className="text-sm">Template Preview</CardTitle>
-              {csv && csv.rows.length > 0 && (
-                <Badge variant="secondary" className="text-xs">Sample Data</Badge>
-              )}
+      {/* BOTTOM: CSV Columns Detected bar */}
+      {csv && (
+        <div className="flex-shrink-0 border-t bg-background px-4 py-2.5">
+          <div className="flex items-center gap-3 overflow-hidden">
+            <span className="text-xs font-medium text-muted-foreground whitespace-nowrap flex-shrink-0">
+              CSV Columns Detected ({csv.fields.length})
+            </span>
+            <div className="flex items-center gap-2 overflow-x-auto flex-1 pb-0.5">
+              {csv.fields.map((f) => (
+                <div key={f.key} className="flex items-center gap-1.5 rounded border bg-muted/50 px-2 py-1 flex-shrink-0">
+                  <span className={`inline-block w-2 h-2 rounded-sm flex-shrink-0 ${
+                    f.type === "image" ? "bg-sky-400" : f.type === "barcode" ? "bg-emerald-400" : "bg-violet-400"
+                  }`} />
+                  <span className="text-[11px] font-medium">{f.label}</span>
+                  <span className="text-[10px] text-muted-foreground capitalize">{f.type}</span>
+                </div>
+              ))}
             </div>
-          </CardHeader>
-          <CardContent>
-            <LiveTemplatePreview
-              template={template}
-              sampleRow={csv?.rows[0] ?? null}
-              mappings={fieldMappings}
-            />
-          </CardContent>
-        </Card>
+            {csv.fields.length > 8 && (
+              <Button size="sm" variant="ghost" className="h-7 text-xs flex-shrink-0">View All Columns</Button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+    </>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 3 – Field Mapping
+// ─────────────────────────────────────────────────────────────────────────────
+
+function StepFieldMapping({
+  rules,
+  csv,
+  selectedRuleId,
+  onSelectRule,
+  onUpdateRule,
+  schema,
+}: {
+  rules: RuleEntry[];
+  csv: ParsedCsv | null;
+  selectedRuleId: string | null;
+  onSelectRule: (id: string) => void;
+  onUpdateRule: (id: string, patch: Partial<RuleEntry>) => void;
+  schema: FieldSchema[];
+}) {
+  const csvColumns = csv?.fields.map((f) => f.key) ?? [];
+  const sampleRow = csv?.rows[0] ?? {};
+  // Build key → label lookup for display in Select options
+  const keyToLabel = new Map(schema.map((f) => [f.key, f.label]));
+
+  if (rules.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 gap-3 text-muted-foreground max-w-lg mx-auto">
+        <Settings2 className="h-10 w-10" />
+        <p className="font-medium">No rules configured</p>
+        <p className="text-sm text-center">Go back to Rule Builder step to add template rules first.</p>
       </div>
+    );
+  }
+
+  const activeTab = selectedRuleId ?? rules[0]?.localId ?? "";
+
+  return (
+    <div className="max-w-5xl mx-auto space-y-4">
+      <div>
+        <h2 className="text-base font-semibold">Field Mapping</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">Map each template variable to a column from your CSV file.</p>
+      </div>
+
+      <Tabs value={activeTab} onValueChange={onSelectRule}>
+        <TabsList className="h-9">
+          {rules.map((rule) => {
+            const mapped = rule.fieldMappings.filter((m) => m.csvColumn).length;
+            const total = rule.fieldMappings.length;
+            return (
+              <TabsTrigger key={rule.localId} value={rule.localId} className="text-xs gap-1.5">
+                {rule.name}
+                {total > 0 && (
+                  <span className={`inline-flex items-center justify-center h-4 min-w-[1rem] rounded-full text-[10px] px-1 ${
+                    mapped === total ? "bg-emerald-100 text-emerald-700" : "bg-muted text-muted-foreground"
+                  }`}>
+                    {mapped}/{total}
+                  </span>
+                )}
+              </TabsTrigger>
+            );
+          })}
+        </TabsList>
+
+        {rules.map((rule) => {
+          const mappings = rule.fieldMappings;
+          const mappedCount = mappings.filter((m) => m.csvColumn).length;
+
+          return (
+            <TabsContent key={rule.localId} value={rule.localId} className="mt-4">
+              <Card>
+                <CardHeader className="pb-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <CardTitle className="text-sm">{rule.name} — {rule.template?.templateName ?? "No template"}</CardTitle>
+                      <Badge variant={mappedCount === mappings.length ? "default" : "secondary"} className="text-xs">
+                        {mappedCount}/{mappings.length} Mapped
+                      </Badge>
+                    </div>
+                    <Button size="sm" variant="outline" className="h-8 text-xs gap-1"
+                      onClick={() => onUpdateRule(rule.localId, { fieldMappings: buildMappingsWithSchema(mappings.map((m) => m.templateField), csvColumns, schema) })}>
+                      <Wand2 className="h-3 w-3" />Auto Map
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent className="p-0">
+                  {mappings.length === 0 ? (
+                    <p className="text-sm text-muted-foreground py-6 text-center px-4">No variable fields detected in the selected template.</p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="bg-muted/50 border-b">
+                            <th className="px-3 py-2 text-left font-medium text-muted-foreground w-8"></th>
+                            <th className="px-3 py-2 text-left font-medium">Template Field</th>
+                            <th className="px-3 py-2 text-left font-medium text-muted-foreground text-xs uppercase">Type</th>
+                            <th className="px-3 py-2 text-left font-medium">CSV Column</th>
+                            <th className="px-3 py-2 text-left font-medium text-muted-foreground">Sample</th>
+                            <th className="px-3 py-2 text-center font-medium text-muted-foreground">Status</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {mappings.map((m, idx) => {
+                            const sample = m.csvColumn ? (sampleRow[m.csvColumn] ?? "") : "";
+                            return (
+                              <tr key={m.templateField} className="border-b last:border-0 hover:bg-muted/20">
+                                <td className="px-3 py-2">
+                                  <span className={`inline-flex h-5 w-[26px] items-center justify-center rounded text-[9px] font-bold ${
+                                    m.fieldType === "image" ? "bg-sky-100 text-sky-700" : m.fieldType === "barcode" ? "bg-emerald-100 text-emerald-700" : "bg-violet-100 text-violet-700"
+                                  }`}>
+                                    {m.fieldType === "image" ? "IMG" : m.fieldType === "barcode" ? "BAR" : "T"}
+                                  </span>
+                                </td>
+                                <td className="px-3 py-2 font-medium">{m.templateField}</td>
+                                <td className="px-3 py-2 text-xs text-muted-foreground capitalize">{m.fieldType}</td>
+                                <td className="px-3 py-2">
+                                  <Select
+                                    value={m.csvColumn || "__none__"}
+                                    onValueChange={(v) => {
+                                      const next = [...mappings];
+                                      next[idx] = { ...m, csvColumn: v === "__none__" ? "" : v };
+                                      onUpdateRule(rule.localId, { fieldMappings: next });
+                                    }}
+                                  >
+                                    <SelectTrigger className="h-8 text-sm w-full max-w-[220px]">
+                                      <SelectValue placeholder="— Not mapped —" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="__none__">— Not mapped —</SelectItem>
+                                      {csvColumns.map((col) => {
+                                        const colLabel = keyToLabel.get(col);
+                                        return (
+                                          <SelectItem key={col} value={col}>
+                                            {colLabel ? (
+                                              <span>
+                                                {colLabel}
+                                                <span className="text-muted-foreground text-[11px] ml-1.5 opacity-70">({col})</span>
+                                              </span>
+                                            ) : col}
+                                          </SelectItem>
+                                        );
+                                      })}
+                                    </SelectContent>
+                                  </Select>
+                                </td>
+                                <td className="px-3 py-2 text-xs text-muted-foreground max-w-[160px] truncate">
+                                  {m.fieldType === "image" && sample ? <span className="text-sky-600">{sample}</span> : (sample || <span className="opacity-40">—</span>)}
+                                </td>
+                                <td className="px-3 py-2 text-center">
+                                  {m.csvColumn ? <CheckCircle2 className="h-4 w-4 text-emerald-500 mx-auto" /> : <AlertTriangle className="h-4 w-4 text-amber-400 mx-auto" />}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      {mappings.some((m) => !m.csvColumn) && (
+                        <div className="px-3 py-2 border-t bg-amber-50 dark:bg-amber-950/20 flex items-center gap-2 text-xs text-amber-700">
+                          <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+                          {mappings.filter((m) => !m.csvColumn).length} field(s) not mapped.
+                          <button className="underline underline-offset-2 font-medium"
+                            onClick={() => onUpdateRule(rule.localId, { fieldMappings: buildMappingsWithSchema(mappings.map((m) => m.templateField), csvColumns, schema) })}>
+                            Auto-map now
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </TabsContent>
+          );
+        })}
+      </Tabs>
     </div>
   );
 }
 
-// ─── Step 3: Preview & Generate ───────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 4 – Preview & Generate
+// ─────────────────────────────────────────────────────────────────────────────
 
-function openDesignerWithTemplate(template: PreviewTemplateOption, projectId: string, navigate: ReturnType<typeof useNavigate>) {
+function openDesignerWithTemplate(
+  template: PreviewTemplateOption,
+  projectId: string,
+  navigate: ReturnType<typeof useNavigate>,
+) {
   const templateId = (template as any)._id || template.remoteId || template.id;
   const rawMargin = (template as any).margin ?? {};
-  const normalizedMargin = {
-    top:    Number(rawMargin.top    ?? 0) || 0,
-    left:   Number(rawMargin.left   ?? 0) || 0,
-    right:  Number(rawMargin.right  ?? 0) || 0,
-    bottom: Number(rawMargin.bottom ?? 0) || 0,
-  };
-  localStorage.setItem("vendor_designer_template_config", JSON.stringify({
-    templateName: template.templateName,
-    templateType: template.templateType,
-    canvas:       template.canvas,
-    margin:       normalizedMargin,
-  }));
-  localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-    projectId,
-    templateId,
-    projectName:  "",
-    templateName: template.templateName,
-  }));
+  const normalizedMargin = { top: Number(rawMargin.top ?? 0) || 0, left: Number(rawMargin.left ?? 0) || 0, right: Number(rawMargin.right ?? 0) || 0, bottom: Number(rawMargin.bottom ?? 0) || 0 };
+  localStorage.setItem("vendor_designer_template_config", JSON.stringify({ templateName: template.templateName, templateType: template.templateType, canvas: template.canvas, margin: normalizedMargin }));
+  localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({ projectId, templateId, projectName: "", templateName: template.templateName }));
   navigate("/designer-studio");
 }
 
 function StepPreviewGenerate({
-  template,
+  rules,
   csv,
-  conditionGroups,
-  groupOperator,
-  fieldMappings,
   projectId,
 }: {
-  template: PreviewTemplateOption | null;
+  rules: RuleEntry[];
   csv: ParsedCsv | null;
-  conditionGroups: ConditionGroup[];
-  groupOperator: "AND" | "OR";
-  fieldMappings: FieldMapping[];
   projectId: string;
 }) {
   const navigate = useNavigate();
-
-  const matchedRows = useMemo(() => {
-    if (!csv) return [];
-    return filterRowsByRule({ conditionGroups, groupOperator }, csv.rows);
-  }, [csv, conditionGroups, groupOperator]);
-
   const [showSample, setShowSample] = useState(true);
-  const displayRows = showSample ? matchedRows.slice(0, 10) : matchedRows;
 
-  const handleOpenDesigner = () => {
-    if (!template) return;
-    openDesignerWithTemplate(template, projectId, navigate);
-  };
+  const ruleMatches = useMemo(() => {
+    if (!csv) return [] as { rule: RuleEntry; rows: CsvRow[] }[];
+    return rules.map((rule) => ({
+      rule,
+      rows: filterRowsByRule({ conditionGroups: rule.conditionGroups, groupOperator: rule.groupOperator }, csv.rows),
+    }));
+  }, [csv, rules]);
+
+  const totalConditions = rules.reduce((s, r) => s + r.conditionGroups.reduce((gs, g) => gs + g.conditions.length, 0), 0);
+  const totalMapped = rules.reduce((s, r) => s + r.fieldMappings.filter((m) => m.csvColumn).length, 0);
 
   return (
-    <div className="space-y-6 max-w-4xl mx-auto">
-      {/* Summary */}
+    <div className="space-y-6 max-w-5xl mx-auto">
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         {[
-          { label: "Total Records", value: csv?.rows.length ?? 0, color: "text-foreground" },
-          {
-            label: "Matching Records",
-            value: matchedRows.length,
-            color: matchedRows.length > 0 ? "text-emerald-600" : "text-amber-600",
-          },
-          {
-            label: "Conditions",
-            value: conditionGroups.reduce((s, g) => s + g.conditions.length, 0),
-            color: "text-foreground",
-          },
-          {
-            label: "Fields Mapped",
-            value: fieldMappings.filter((m) => m.csvColumn).length,
-            color: "text-foreground",
-          },
+          { label: "Total Records", value: csv?.rows.length ?? 0, color: "" },
+          { label: "Rules Configured", value: rules.length, color: rules.length > 0 ? "text-emerald-600" : "text-amber-600" },
+          { label: "Total Conditions", value: totalConditions, color: "" },
+          { label: "Fields Mapped", value: totalMapped, color: "" },
         ].map((item) => (
           <Card key={item.label}>
             <CardContent className="pt-4 pb-4">
@@ -970,109 +1667,81 @@ function StepPreviewGenerate({
         ))}
       </div>
 
-      {/* Template + action */}
-      <Card>
-        <CardContent className="pt-5">
-          <div className="flex items-center justify-between flex-wrap gap-4">
-            <div className="flex items-center gap-3">
-              {template?.thumbnail && (
-                <img
-                  src={template.thumbnail}
-                  alt=""
-                  className="h-12 w-12 rounded object-cover border"
-                />
-              )}
-              <div>
-                <p className="font-semibold">{template?.templateName ?? "No template"}</p>
-                <p className="text-xs text-muted-foreground">
-                  {template?.canvas.width}×{template?.canvas.height}mm · {template?.templateType}
-                </p>
+      {ruleMatches.map(({ rule, rows }) => (
+        <Card key={rule.localId}>
+          <CardContent className="pt-5">
+            <div className="flex items-center justify-between flex-wrap gap-4 mb-4">
+              <div className="flex items-center gap-3">
+                {rule.template?.thumbnail && (
+                  <img src={rule.template.thumbnail} alt="" className="h-12 w-8 rounded object-cover border" />
+                )}
+                <div>
+                  <p className="font-semibold">{rule.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {rule.template?.templateName ?? "No template"} · {" "}
+                    <span className={rows.length > 0 ? "text-emerald-600 font-medium" : "text-amber-600 font-medium"}>
+                      {rows.length} records
+                    </span>
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => rule.template && openDesignerWithTemplate(rule.template, projectId, navigate)} disabled={!rule.template}>
+                  Open in Designer
+                </Button>
+                <Button size="sm" onClick={() => rule.template && openDesignerWithTemplate(rule.template, projectId, navigate)} disabled={!rule.template || rows.length === 0} className="gap-1.5">
+                  <Play className="h-3.5 w-3.5" />Generate ({rows.length})
+                </Button>
               </div>
             </div>
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                onClick={handleOpenDesigner}
-                disabled={!template}
-              >
-                <Layers className="h-4 w-4 mr-2" />
-                Open in Designer
-              </Button>
-              <Button
-                onClick={handleOpenDesigner}
-                disabled={!template || matchedRows.length === 0}
-                className="gap-2"
-              >
-                <Play className="h-4 w-4" />
-                Generate ({matchedRows.length})
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
 
-      {/* Matched records preview */}
-      {matchedRows.length > 0 ? (
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <CardTitle className="text-sm">
-                Matching Records
-                <Badge variant="secondary" className="ml-2 text-xs">{matchedRows.length}</Badge>
-              </CardTitle>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 text-xs gap-1"
-                onClick={() => setShowSample((v) => !v)}
-              >
-                {showSample ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                {showSample ? "Show all" : "Show sample"}
-              </Button>
-            </div>
-          </CardHeader>
-          <CardContent className="p-0">
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b bg-muted/50">
-                    <th className="px-3 py-2 text-left font-medium text-muted-foreground w-10">#</th>
-                    {csv?.fields.slice(0, 6).map((f) => (
-                      <th key={f.key} className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap">
-                        {f.label}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayRows.map((row, i) => (
-                    <tr key={i} className="border-b last:border-0 hover:bg-muted/20">
-                      <td className="px-3 py-2 text-muted-foreground">{i + 1}</td>
-                      {csv?.fields.slice(0, 6).map((f) => (
-                        <td key={f.key} className="px-3 py-2 max-w-[120px] truncate">
-                          {row[f.key] || <span className="opacity-40">—</span>}
-                        </td>
+            {rows.length > 0 ? (
+              <div className="rounded-lg border overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="px-3 py-2 text-left text-muted-foreground w-8">#</th>
+                        {csv?.fields.slice(0, 5).map((f) => (
+                          <th key={f.key} className="px-3 py-2 text-left text-muted-foreground whitespace-nowrap">{f.label}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(showSample ? rows.slice(0, 5) : rows).map((row, i) => (
+                        <tr key={i} className="border-b last:border-0 hover:bg-muted/20">
+                          <td className="px-3 py-2 text-muted-foreground">{i + 1}</td>
+                          {csv?.fields.slice(0, 5).map((f) => (
+                            <td key={f.key} className="px-3 py-2 max-w-[120px] truncate">{row[f.key] || <span className="opacity-40">—</span>}</td>
+                          ))}
+                        </tr>
                       ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {showSample && matchedRows.length > 10 && (
-                <p className="px-3 py-2 text-xs text-muted-foreground border-t">
-                  Showing 10 of {matchedRows.length} matching records.
-                </p>
-              )}
-            </div>
+                    </tbody>
+                  </table>
+                  {showSample && rows.length > 5 && (
+                    <div className="px-3 py-2 border-t bg-muted/30 flex items-center justify-between">
+                      <p className="text-xs text-muted-foreground">Showing 5 of {rows.length} rows</p>
+                      <button className="text-xs text-primary hover:underline" onClick={() => setShowSample(false)}>Show all</button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+                <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+                No records match this rule's conditions.
+              </div>
+            )}
           </CardContent>
         </Card>
-      ) : (
+      ))}
+
+      {rules.length === 0 && (
         <Card>
           <CardContent className="py-10 flex flex-col items-center gap-3 text-muted-foreground">
             <AlertTriangle className="h-8 w-8 text-amber-400" />
-            <p className="font-medium">No records match the current conditions</p>
-            <p className="text-sm text-center">
-              Try relaxing the conditions in the Rule Builder step or check your CSV data.
-            </p>
+            <p className="font-medium">No rules configured</p>
+            <p className="text-sm text-center">Go back to the Rule Builder step to configure template assignment rules.</p>
           </CardContent>
         </Card>
       )}
@@ -1080,362 +1749,593 @@ function StepPreviewGenerate({
   );
 }
 
-// ─── Main Page ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Template Chooser Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+function TemplateChooser({
+  allTemplates,
+  currentTemplateId,
+  onSelect,
+  onClose,
+}: {
+  allTemplates: PreviewTemplateOption[];
+  currentTemplateId?: string;
+  onSelect: (t: PreviewTemplateOption) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div className="bg-background rounded-xl shadow-2xl max-w-2xl w-full max-h-[80vh] flex flex-col">
+        <div className="flex items-center justify-between px-6 py-4 border-b">
+          <h2 className="font-semibold">Select Template</h2>
+          <Button size="sm" variant="ghost" onClick={onClose} className="h-8 w-8 p-0">✕</Button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 grid grid-cols-2 sm:grid-cols-3 gap-3">
+          {allTemplates.map((t) => (
+            <button
+              key={t.id}
+              className={`rounded-lg border-2 p-3 text-left transition-all hover:border-primary ${
+                currentTemplateId === t.id ? "border-primary bg-primary/5" : "border-transparent hover:bg-accent"
+              }`}
+              onClick={() => { onSelect(t); onClose(); }}
+            >
+              <div className="w-full h-28 rounded mb-2 overflow-hidden">
+                <TemplateThumbnailCard template={t} size="sm" className="h-28 w-full" />
+              </div>
+              <p className="text-xs font-semibold truncate">{t.templateName}</p>
+              <p className="text-[10px] text-muted-foreground capitalize">{t.templateType}</p>
+            </button>
+          ))}
+          {allTemplates.length === 0 && (
+            <div className="col-span-3 flex flex-col items-center justify-center py-8 text-muted-foreground">
+              <Layers className="h-8 w-8 mb-2" />
+              <p className="text-sm">No templates found for this project.</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Page Export
+// ─────────────────────────────────────────────────────────────────────────────
 
 export function RuleBuilderWorkflow() {
   const { id: projectId } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-
   const templateIdParam = searchParams.get("templateId") ?? "";
-  const ruleIdParam = searchParams.get("ruleId") ?? "";
 
-  // ── Page state ───────────────────────────────────────────────────────────────
   const [step, setStep] = useState<Step>(1);
   const [completedSteps, setCompletedSteps] = useState<Set<Step>>(new Set());
-
   const [csv, setCsv] = useState<ParsedCsv | null>(null);
-  const [template, setTemplate] = useState<PreviewTemplateOption | null>(null);
+  const [csvSavedInfo, setCsvSavedInfo] = useState<{ lastUpdated?: string } | null>(null);
   const [allTemplates, setAllTemplates] = useState<PreviewTemplateOption[]>([]);
   const [templatesLoading, setTemplatesLoading] = useState(true);
-
-  const [conditionGroups, setConditionGroups] = useState<ConditionGroup[]>([]);
-  const [fieldMappings, setFieldMappings] = useState<FieldMapping[]>([]);
-  const [groupOperator, setGroupOperator] = useState<"AND" | "OR">("AND");
-  const [isDefault, setIsDefault] = useState(false);
-  const [priority, setPriority] = useState(1);
-  const [ruleName, setRuleName] = useState("");
-
-  const [savedRuleId, setSavedRuleId] = useState<string | null>(ruleIdParam || null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [rules, setRules] = useState<RuleEntry[]>([]);
+  const [selectedRuleId, setSelectedRuleId] = useState<string | null>(null);
+  const [defaultTemplateId, setDefaultTemplateId] = useState<string>("__none__");
+  const [choosingForRuleId, setChoosingForRuleId] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
-  const [showTemplateChooser, setShowTemplateChooser] = useState(false);
+  const [projectFieldSchema, setProjectFieldSchema] = useState<FieldSchema[]>([]);
 
-  // ── Load templates for project ───────────────────────────────────────────────
+  // ── Load templates + restore saved session ─────────────────────────────────
   useEffect(() => {
     if (!projectId) return;
-    setTemplatesLoading(true);
-    fetch(`${API_BASE}/templates?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" })
-      .then((r) => r.json())
-      .then((json) => {
-        const items: TemplateRecord[] = Array.isArray(json?.data) ? json.data : [];
-        const mapped: PreviewTemplateOption[] = items.map((t) => ({
-          ...mapTemplateRecordToProjectTemplate(t),
-          isGlobal: t.isGlobal === true,
-          _id: t._id,
-        }));
+
+    const loadAll = async () => {
+      setTemplatesLoading(true);
+      setSessionLoading(true);
+
+      try {
+        // Fetch templates, session rules, raw project records AND project schema all in parallel.
+        // NOTE: Use /projects/:id/templates (not /templates?projectId=...) because:
+        //   • It queries ProductTemplate directly — returns full documents WITH designData/canvasJSON
+        //   • /templates?projectId=... hits TemplateGalleryMeta first which has NO designData,
+        //     so canvasJSON would be undefined and extractTemplateFields() would return []
+        //   • Strictly project-scoped: only { projectId } or { productId } matches — no global leak
+        const [templatesJson, session, rawRecordsJson, projectJson] = await Promise.all([
+          fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/templates`, { cache: "no-store" }).then((r) => r.json()),
+          getProjectRuleSession(projectId).catch(() => null),
+          fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/records`, { cache: "no-store" })
+            .then((r) => r.json())
+            .catch(() => null),
+          fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}`, { cache: "no-store" })
+            .then((r) => r.json())
+            .catch(() => null),
+        ]);
+
+        // The backend /api/projects/:id/templates already enforces strict project-scoping
+        // ({ projectId } OR { productId: ObjectId(id) }). No frontend re-filter needed —
+        // it would incorrectly drop old-style templates that only store productId.
+        const items: TemplateRecord[] = Array.isArray(templatesJson?.data) ? templatesJson.data : [];
+        const mapped: PreviewTemplateOption[] = items.map((t) => {
+          const base = mapTemplateRecordToProjectTemplate(t);
+          // Resolve the raw preview_image / previewImageUrl through the URL normalizer
+          // so relative paths (/uploads/...) become fully-qualified URLs and
+          // corrupt data: URIs are discarded. Falls back to the base thumbnail if
+          // the resolver returns empty (e.g. no preview at all).
+          const resolvedThumb = resolveTemplatePreview(t, { fallbackToPlaceholder: false });
+          return {
+            ...base,
+            thumbnail: resolvedThumb || base.thumbnail || undefined,
+            isGlobal: t.isGlobal === true,
+            _id: t._id,
+          };
+        });
         setAllTemplates(mapped);
 
-        // Auto-select from URL param or first template
-        if (templateIdParam) {
-          const found = mapped.find(
-            (m) => m.id === templateIdParam || (m as any)._id === templateIdParam
-          );
-          if (found) selectTemplate(found);
-          else if (mapped.length > 0) selectTemplate(mapped[0]);
-        } else if (mapped.length > 0) {
-          selectTemplate(mapped[0]);
+        // ── Extract flat field schema from project's dataFieldsByCategory ───────────────
+        const rawProjectData = projectJson?.data;
+        const schema: FieldSchema[] = [];
+        if (rawProjectData?.dataFieldsByCategory && typeof rawProjectData.dataFieldsByCategory === "object") {
+          for (const cat of Object.values(rawProjectData.dataFieldsByCategory as Record<string, FieldSchema[]>)) {
+            if (Array.isArray(cat)) {
+              for (const f of cat) {
+                if (f?.key && f?.label && !schema.some((s) => s.key === f.key)) {
+                  schema.push({ key: f.key, label: f.label });
+                }
+              }
+            }
+          }
         }
-      })
-      .catch(() => toast.error("Failed to load templates"))
-      .finally(() => setTemplatesLoading(false));
+        setProjectFieldSchema(schema);
+
+        // ── Resolve best available CSV rows ───────────────────────────────
+        // Priority: session rows (already cleaned) → raw DataRecord variables
+        const rawRecords: Record<string, string>[] =
+          Array.isArray(rawRecordsJson?.data) ? rawRecordsJson.data : [];
+
+        const bestRows: Record<string, string>[] =
+          session && session.csvRows.length > 0 ? session.csvRows : rawRecords;
+
+        // ── Build COMPREHENSIVE column list from ALL available sources ─────
+        // Sources (in priority order for deduplication):
+        //   1. dataFieldsByCategory keys  — authoritative project schema (15+ fields)
+        //   2. Actual DataRecord variable keys — any extra columns in raw rows
+        //   3. csvColumn values in saved PrintRule fieldMappings — previously mapped cols
+        //
+        // This ensures ALL configured/mapped columns appear in the Field Mapping UI
+        // even when DataRecord rows only carry a subset of columns (e.g. Photo/Name/Roll).
+        // Scan EVERY row for unique keys — rows[0] may be a sparse test record
+        // (e.g. only Photo/Name/Roll) while production rows further down carry
+        // the full 26-column schema. Using flatMap + Set gives the true key union.
+        const recordColKeys: string[] =
+          bestRows.length > 0
+            ? [...new Set(bestRows.flatMap((r) => Object.keys(r).filter((k) => k.length > 0)))]
+            : [];
+        const schemaColKeys: string[] = schema.map((f) => f.key);
+        const savedMappingCols: string[] = (session?.rules ?? []).flatMap((r) =>
+          (r.fieldMappings ?? [])
+            .map((m) => m.csvColumn)
+            .filter((c): c is string => Boolean(c)),
+        );
+
+        // Union: schema order first (respects user-defined field order), then any extras
+        const allColKeys: string[] = [
+          ...new Set([...schemaColKeys, ...recordColKeys, ...savedMappingCols]),
+        ].filter((k) => k.length > 0);
+
+        const schemaLabelMap = new Map(schema.map((f) => [f.key, f.label]));
+
+        const bestFields: CsvField[] =
+          allColKeys.length > 0
+            ? allColKeys.map((k) => ({
+                key: k,
+                label:
+                  schemaLabelMap.get(k) ??
+                  k.trim().replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+                type: inferFieldType(k),
+              }))
+            : inferCsvFieldsFromRows(bestRows, schema);
+
+        const hasCsvData = bestRows.length > 0 && bestFields.length > 0;
+
+        const builtCsv: ParsedCsv | null = hasCsvData
+          ? {
+              fields: bestFields,
+              rows: bestRows,
+              fileName: session?.csvMeta?.fileName ?? "Project Data",
+              errors: [],
+            }
+          : null;
+
+        if (builtCsv) {
+          setCsv(builtCsv);
+          setCsvSavedInfo({
+            lastUpdated: session?.csvMeta?.lastUpdated ?? new Date().toISOString(),
+          });
+        }
+
+        const cols = bestFields.map((f) => f.key);
+
+        // ── Restore saved session ──────────────────────────────────────────
+        if (session && session.rules.length > 0) {
+          // Reconstruct RuleEntry[] from saved PrintRules + templates
+          const restoredRules: RuleEntry[] = session.rules.map((r) => {
+            const tplId = String((r as any).templateId ?? "");
+            const template =
+              mapped.find((t) => (t as any)._id === tplId || t.id === tplId) ?? null;
+            // Use saved fieldMappings if present; otherwise re-derive with schema
+            const fieldMappings =
+              r.fieldMappings && r.fieldMappings.length > 0
+                ? r.fieldMappings
+                : template
+                ? buildMappingsWithSchema(extractTemplateFields(template.canvasJSON), cols, schema)
+                : [];
+            return {
+              localId: nanoid(),
+              _id: r._id,
+              name: r.templateName,
+              template,
+              conditionGroups: r.conditionGroups,
+              fieldMappings,
+              groupOperator: r.groupOperator,
+              isDefault: r.isDefault,
+              priority: r.priority,
+              active: r.isActive,
+            };
+          });
+
+          // Also auto-create rules for any project templates not yet covered by a saved rule
+          // (handles the "new template added to project" case)
+          const coveredTemplateIds = new Set(
+            restoredRules
+              .map((r) => (r.template as any)?._id ?? r.template?.id)
+              .filter(Boolean),
+          );
+          const missingTemplates = mapped.filter(
+            (t) => !coveredTemplateIds.has((t as any)._id) && !coveredTemplateIds.has(t.id),
+          );
+          const allRules: RuleEntry[] = [
+            ...restoredRules,
+            ...missingTemplates.map((tpl, idx) =>
+              makeRule(tpl, restoredRules.length + idx + 1, cols, schema),
+            ),
+          ];
+
+          setRules(allRules);
+          setSelectedRuleId(allRules[0]?.localId ?? null);
+
+          // Jump directly to Rule Builder step if we also have CSV data
+          if (hasCsvData) {
+            setCompletedSteps(new Set([1 as Step]));
+            setStep(2);
+          }
+        } else if (hasCsvData && mapped.length > 0) {
+          // CSV data exists but no saved rules — seed one rule per template
+          // Put the preferred template (from URL param) first, otherwise keep API order
+          const preferredFirst = templateIdParam
+            ? (mapped.find((m) => m.id === templateIdParam || (m as any)._id === templateIdParam) ?? null)
+            : null;
+          const orderedTemplates = preferredFirst
+            ? [preferredFirst, ...mapped.filter((m) => m !== preferredFirst)]
+            : mapped;
+          const seededRules = orderedTemplates.map((tpl, idx) => makeRule(tpl, idx + 1, cols, schema));
+          setRules(seededRules);
+          setSelectedRuleId(seededRules[0]?.localId ?? null);
+          // Stay on step 1 so user sees the banner and clicks "Continue"
+        } else {
+          // Truly first time — no data, no rules — seed one rule per template with no columns
+          if (mapped.length > 0) {
+            const preferredFirst = templateIdParam
+              ? (mapped.find((m) => m.id === templateIdParam || (m as any)._id === templateIdParam) ?? null)
+              : null;
+            const orderedTemplates = preferredFirst
+              ? [preferredFirst, ...mapped.filter((m) => m !== preferredFirst)]
+              : mapped;
+            const seededRules = orderedTemplates.map((tpl, idx) => makeRule(tpl, idx + 1, [], schema));
+            setRules(seededRules);
+            setSelectedRuleId(seededRules[0]?.localId ?? null);
+          }
+        }
+      } catch (err) {
+        toast.error("Failed to load project data");
+        console.error(err);
+      } finally {
+        setTemplatesLoading(false);
+        setSessionLoading(false);
+      }
+    };
+
+    loadAll();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, templateIdParam]);
 
-  // ── Load existing rule if editing ────────────────────────────────────────────
-  useEffect(() => {
-    if (!ruleIdParam) return;
-    getRuleById(ruleIdParam)
-      .then((rule) => {
-        setConditionGroups(rule.conditionGroups);
-        setFieldMappings(rule.fieldMappings);
-        setGroupOperator(rule.groupOperator);
-        setIsDefault(rule.isDefault);
-        setPriority(rule.priority);
-        setRuleName(rule.templateName);
-        setSavedRuleId(rule._id);
-      })
-      .catch(() => toast.error("Failed to load rule"));
-  }, [ruleIdParam]);
-
-  // ── Select template → auto-extract fields → auto-map ─────────────────────────
-  const selectTemplate = useCallback((t: PreviewTemplateOption) => {
-    setTemplate(t);
-    const fields = extractTemplateFields(t.canvasJSON);
-    const csvCols = csv?.fields.map((f) => f.key) ?? [];
-    const mappings = autoMapFields(fields.length > 0 ? fields : [], csvCols);
-    setFieldMappings(mappings);
-    if (!ruleName) setRuleName(t.templateName);
-  }, [csv, ruleName]);
-
-  // Re-run auto-map when CSV loaded (after template already set)
   const handleCsvLoaded = (parsed: ParsedCsv) => {
     setCsv(parsed);
-    if (template) {
-      const fields = extractTemplateFields(template.canvasJSON);
-      const cols = parsed.fields.map((f) => f.key);
-      setFieldMappings(autoMapFields(fields, cols));
-    }
-    setCompletedSteps((prev) => new Set([...prev, 1]));
-    setStep(2);
+    setCsvSavedInfo(null); // new file, clear saved metadata
+    const cols = parsed.fields.map((f) => f.key);
+    setRules((prev) =>
+      prev.map((rule) => ({
+        ...rule,
+        fieldMappings: rule.template
+          ? buildMappingsWithSchema(extractTemplateFields(rule.template.canvasJSON), cols, projectFieldSchema)
+          : buildMappingsWithSchema(rule.fieldMappings.map((m) => m.templateField), cols, projectFieldSchema),
+      })),
+    );
+    setCompletedSteps((prev) => new Set([...prev, 1]));    setStep(2);
   };
 
-  // ── Matched records count ────────────────────────────────────────────────────
-  const matchedCount = useMemo(() => {
-    if (!csv) return 0;
-    return filterRowsByRule({ conditionGroups, groupOperator }, csv.rows).length;
-  }, [csv, conditionGroups, groupOperator]);
+  const handleAddRule = () => {
+    const cols = csv?.fields.map((f) => f.key) ?? [];
+    const nextPriority = rules.length + 1;
+    const template = allTemplates.find((t) => !rules.some((r) => r.template?.id === t.id)) ?? allTemplates[0] ?? null;
+    const newRule = makeRule(template, nextPriority, cols, projectFieldSchema);
+    setRules((prev) => [...prev, newRule]);
+    setSelectedRuleId(newRule.localId);
+  };
 
-  // ── Save rule ────────────────────────────────────────────────────────────────
-  const handleSave = async () => {
-    if (!projectId || !template) {
-      toast.error("Select a template first");
-      return;
-    }
-    const templateMongoId = (template as any)._id || template.remoteId || "";
-    if (!templateMongoId) {
-      toast.error("Template is not saved to the database yet");
-      return;
-    }
+  const handleUpdateRule = useCallback((id: string, p: Partial<RuleEntry>) => {
+    setRules((prev) => prev.map((r) => r.localId === id ? { ...r, ...p } : r));
+  }, []);
 
+  const handleDeleteRule = (id: string) => {
+    const rule = rules.find((r) => r.localId === id);
+    // Soft-delete from backend if it has a saved _id
+    if (rule?._id) {
+      deleteRuleApi(rule._id).catch(() => {/* non-critical */});
+    }
+    setRules((prev) => {
+      const next = prev.filter((r) => r.localId !== id).map((r, i) => ({ ...r, priority: i + 1 }));
+      if (selectedRuleId === id) setSelectedRuleId(next[0]?.localId ?? null);
+      return next;
+    });
+  };
+
+  const handleDuplicateRule = (id: string) => {
+    const rule = rules.find((r) => r.localId === id);
+    if (!rule) return;
+    const dup: RuleEntry = { ...rule, localId: nanoid(), _id: undefined, name: `${rule.name} (copy)`, priority: rules.length + 1 };
+    setRules((prev) => [...prev, dup]);
+    setSelectedRuleId(dup.localId);
+  };
+
+  const handleMoveRule = (idx: number, dir: "up" | "down") => {
+    setRules((prev) => {
+      const next = [...prev];
+      const swapIdx = dir === "up" ? idx - 1 : idx + 1;
+      if (swapIdx < 0 || swapIdx >= next.length) return prev;
+      [next[idx], next[swapIdx]] = [next[swapIdx], next[idx]];
+      return next.map((r, i) => ({ ...r, priority: i + 1 }));
+    });
+  };
+
+  const handleTemplateSelected = (t: PreviewTemplateOption) => {
+    if (!choosingForRuleId) return;
+    const cols = csv?.fields.map((f) => f.key) ?? [];
+    const fields = extractTemplateFields(t.canvasJSON);
+    const existingRule = rules.find((r) => r.localId === choosingForRuleId);
+    handleUpdateRule(choosingForRuleId, {
+      template: t,
+      name: existingRule?.name === existingRule?.template?.templateName ? t.templateName : existingRule?.name ?? t.templateName,
+      fieldMappings: autoMapFields(fields, cols),
+    });
+    setChoosingForRuleId(null);
+  };
+
+  const handleSaveRules = async () => {
+    if (!projectId) return;
     setIsSaving(true);
     try {
-      const payload = {
-        projectId,
-        templateId: templateMongoId,
-        templateName: ruleName || template.templateName,
-        csvFileName: csv?.fileName ?? "",
-        groupOperator,
-        conditionGroups,
-        fieldMappings,
-        priority,
-        isDefault,
-      };
-
-      if (savedRuleId) {
-        await updateRule(savedRuleId, payload);
-        toast.success("Rule updated");
-      } else {
-        const created = await createRule(payload);
-        setSavedRuleId(created._id);
-        toast.success("Rule saved");
+      let savedCount = 0;
+      for (const rule of rules) {
+        if (!rule.template) continue;
+        const templateMongoId = (rule.template as any)._id || rule.template.remoteId || "";
+        if (!templateMongoId) continue;
+        const payload = {
+          projectId,
+          templateId: templateMongoId,
+          templateName: rule.name,
+          csvFileName: csv?.fileName ?? "",
+          groupOperator: rule.groupOperator,
+          conditionGroups: rule.conditionGroups,
+          fieldMappings: rule.fieldMappings,
+          priority: rule.priority,
+          isDefault: rule.isDefault,
+        };
+        if (rule._id) {
+          await updateRuleApi(rule._id, payload);
+        } else {
+          const created = await createRule(payload);
+          handleUpdateRule(rule.localId, { _id: created._id });
+        }
+        savedCount++;
       }
+      toast.success(`${savedCount} rule${savedCount !== 1 ? "s" : ""} saved`);
     } catch (err) {
-      toast.error((err as Error).message || "Failed to save rule");
+      toast.error((err as Error).message || "Failed to save rules");
     } finally {
       setIsSaving(false);
     }
   };
 
-  // ── Navigation ───────────────────────────────────────────────────────────────
   const goToStep = (target: Step) => {
-    if (target === 1) {
-      setStep(1);
-      return;
-    }
+    if (target === 1) { setStep(1); return; }
     if (target === 2) {
-      if (!csv) { toast.error("Upload a CSV first"); return; }
-      setCompletedSteps((prev) => new Set([...prev, 1]));
-      setStep(2);
-      return;
+      if (!csv) { toast.error("Upload a CSV file first"); return; }
+      setCompletedSteps((prev) => new Set([...prev, 1])); setStep(2); return;
     }
     if (target === 3) {
-      if (!csv) { toast.error("Upload a CSV first"); return; }
-      if (!template) { toast.error("Select a template first"); return; }
-      setCompletedSteps((prev) => new Set([...prev, 1, 2]));
-      setStep(3);
+      if (!csv) { toast.error("Upload a CSV file first"); return; }
+      if (rules.length === 0) { toast.error("Add at least one template rule first"); return; }
+      setCompletedSteps((prev) => new Set([...prev, 1, 2])); setStep(3); return;
+    }
+    if (target === 4) {
+      if (!csv) { toast.error("Upload a CSV file first"); return; }
+      if (rules.length === 0) { toast.error("Add at least one template rule first"); return; }
+      setCompletedSteps((prev) => new Set([...prev, 1, 2, 3])); setStep(4);
     }
   };
 
-  const canProceed = step === 1 ? Boolean(csv) : step === 2 ? Boolean(csv && template) : false;
+  const canProceed =
+    step === 1 ? Boolean(csv) :
+    step === 2 ? Boolean(csv && rules.length > 0) :
+    step === 3 ? Boolean(csv && rules.length > 0) :
+    false;
 
-  // ── Template chooser modal ────────────────────────────────────────────────────
-  const TemplateChooser = () => (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="bg-background rounded-xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-auto">
-        <div className="flex items-center justify-between px-6 py-4 border-b sticky top-0 bg-background">
-          <h2 className="font-semibold">Select Template</h2>
-          <Button size="sm" variant="ghost" onClick={() => setShowTemplateChooser(false)}>✕</Button>
-        </div>
-        <div className="p-4 grid grid-cols-2 sm:grid-cols-3 gap-3">
-          {allTemplates.map((t) => (
-            <button
-              key={t.id}
-              className={`rounded-lg border-2 p-3 text-left transition-all hover:border-primary ${
-                template?.id === t.id ? "border-primary bg-primary/5" : "border-transparent"
-              }`}
-              onClick={() => { selectTemplate(t); setShowTemplateChooser(false); }}
-            >
-              {t.thumbnail ? (
-                <img src={t.thumbnail} alt="" className="w-full h-28 object-cover rounded mb-2" />
-              ) : (
-                <div className="w-full h-28 rounded mb-2 bg-muted flex items-center justify-center">
-                  <Layers className="h-6 w-6 text-muted-foreground" />
-                </div>
-              )}
-              <p className="text-xs font-semibold truncate">{t.templateName}</p>
-              <p className="text-[10px] text-muted-foreground capitalize">{t.templateType}</p>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-
-  if (templatesLoading) {
+  if (templatesLoading || sessionLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3">
         <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        <p className="text-sm text-muted-foreground">Restoring Rule Builder…</p>
       </div>
     );
   }
 
+  const choosingRule = choosingForRuleId ? rules.find((r) => r.localId === choosingForRuleId) : null;
+
   return (
     <TooltipProvider>
-      {showTemplateChooser && <TemplateChooser />}
+      {choosingForRuleId && (
+        <TemplateChooser
+          allTemplates={allTemplates}
+          currentTemplateId={choosingRule?.template?.id}
+          onSelect={handleTemplateSelected}
+          onClose={() => setChoosingForRuleId(null)}
+        />
+      )}
 
-      <div className="min-h-screen bg-background flex flex-col">
-        {/* Header */}
-        <div className="border-b bg-card sticky top-0 z-40">
-          <div className="max-w-screen-xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14 gap-4">
+      <div className="flex-1 flex flex-col overflow-hidden min-h-0 bg-background">
+        {/* Top header */}
+        <div className="border-b bg-card flex-shrink-0 z-40">
+          <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14 gap-4">
             <div className="flex items-center gap-3 min-w-0">
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-8 px-2 gap-1 text-muted-foreground"
-                asChild
-              >
+              <Button size="sm" variant="ghost" className="h-8 px-2 gap-1 text-muted-foreground" asChild>
                 <Link to={`/projects/${projectId}`}>
                   <ArrowLeft className="h-4 w-4" />
-                  <span className="hidden sm:inline">Back</span>
+                  <span className="hidden sm:inline text-sm">Back</span>
                 </Link>
               </Button>
               <div className="h-4 w-px bg-border" />
               <div className="min-w-0">
-                <h1 className="font-semibold text-sm sm:text-base truncate">Rule Builder</h1>
+                <h1 className="font-semibold text-sm sm:text-base flex items-center gap-1.5">
+                  Rule Builder
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Info className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
+                    </TooltipTrigger>
+                    <TooltipContent>Map multiple templates to CSV data using conditions.</TooltipContent>
+                  </Tooltip>
+                </h1>
                 <p className="text-xs text-muted-foreground hidden sm:block">
-                  Map multiple templates to your CSV data using conditions and field mapping.
+                  Map multiple templates to your CSV data using conditions. Each row in your CSV will use the template that matches the defined rules.
                 </p>
               </div>
             </div>
 
-            <div className="hidden md:flex">
+            <div className="hidden md:flex flex-shrink-0">
               <Stepper current={step} completed={completedSteps} />
             </div>
 
             <div className="flex items-center gap-2 flex-shrink-0">
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 gap-1 text-xs"
-                onClick={handleSave}
-                disabled={isSaving || !template || !projectId}
-              >
-                {isSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-                {savedRuleId ? "Update Rule" : "Save Rule"}
-              </Button>
-              {step < 3 ? (
-                <Button
-                  size="sm"
-                  className="h-8 gap-1 text-xs"
-                  onClick={() => goToStep((step + 1) as Step)}
-                  disabled={!canProceed}
-                >
-                  {step === 2 ? "Preview & Generate" : "Next: Rule Builder"}
+              {step >= 2 && (
+                <Button size="sm" variant="outline" className="h-8 gap-1 text-xs hidden sm:flex"
+                  onClick={handleSaveRules} disabled={isSaving || rules.length === 0}>
+                  {isSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  Save Rules
+                </Button>
+              )}
+              {step < 4 ? (
+                <Button size="sm" className="h-8 gap-1 text-xs" onClick={() => goToStep((step + 1) as Step)} disabled={!canProceed}>
+                  {step === 1 ? "Next: Rule Builder" : step === 2 ? "Next: Field Mapping" : "Preview & Generate"}
                   <ChevronRight className="h-3.5 w-3.5" />
                 </Button>
               ) : (
-                <Button
-                  size="sm"
-                  className="h-8 gap-1 text-xs"
-                  onClick={() => {
-                    if (!template || !projectId) return;
-                    openDesignerWithTemplate(template, projectId, navigate);
-                  }}
-                  disabled={!template}
-                >
-                  <Play className="h-3.5 w-3.5" />
-                  Open Designer
+                <Button size="sm" className="h-8 gap-1 text-xs" onClick={handleSaveRules} disabled={isSaving || rules.length === 0}>
+                  {isSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  Save &amp; Finish
                 </Button>
               )}
             </div>
           </div>
-
-          {/* Mobile stepper */}
           <div className="md:hidden flex justify-center pb-3">
             <Stepper current={step} completed={completedSteps} />
           </div>
         </div>
 
         {/* Body */}
-        <div className="flex-1 max-w-screen-xl mx-auto w-full px-4 sm:px-6 py-6">
+        <div className={`flex-1 flex flex-col overflow-hidden min-h-0`}>
           {step === 1 && (
-            <StepUploadCsv csv={csv} onCsvLoaded={handleCsvLoaded} />
+            <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
+              <StepUploadCsv
+                csv={csv}
+                savedInfo={csvSavedInfo}
+                onCsvLoaded={handleCsvLoaded}
+                onContinue={() => {
+                  setCompletedSteps((prev) => new Set([...prev, 1 as Step]));
+                  setStep(2);
+                }}
+              />
+            </div>
           )}
           {step === 2 && (
             <StepRuleBuilder
-              template={template}
+              rules={rules}
+              selectedRuleId={selectedRuleId}
               csv={csv}
-              conditionGroups={conditionGroups}
-              fieldMappings={fieldMappings}
-              groupOperator={groupOperator}
-              isDefault={isDefault}
-              onConditionGroupsChange={setConditionGroups}
-              onFieldMappingsChange={setFieldMappings}
-              onGroupOperatorChange={setGroupOperator}
-              onIsDefaultChange={setIsDefault}
-              onChangeTemplate={() => setShowTemplateChooser(true)}
-              matchedCount={matchedCount}
+              allTemplates={allTemplates}
+              defaultTemplateId={defaultTemplateId}
+              onSelectRule={setSelectedRuleId}
+              onAddRule={handleAddRule}
+              onUpdateRule={handleUpdateRule}
+              onDeleteRule={handleDeleteRule}
+              onDuplicateRule={handleDuplicateRule}
+              onMoveRule={handleMoveRule}
+              onDefaultTemplateChange={setDefaultTemplateId}
+              onChangeTemplate={(ruleId) => setChoosingForRuleId(ruleId)}
             />
           )}
           {step === 3 && (
-            <StepPreviewGenerate
-              template={template}
-              csv={csv}
-              conditionGroups={conditionGroups}
-              groupOperator={groupOperator}
-              fieldMappings={fieldMappings}
-              projectId={projectId ?? ""}
-            />
+            <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
+              <StepFieldMapping
+                rules={rules}
+                csv={csv}
+                selectedRuleId={selectedRuleId}
+                onSelectRule={setSelectedRuleId}
+                onUpdateRule={handleUpdateRule}
+                schema={projectFieldSchema}
+              />
+            </div>
+          )}
+          {step === 4 && (
+            <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
+              <StepPreviewGenerate rules={rules} csv={csv} projectId={projectId ?? ""} />
+            </div>
           )}
         </div>
 
-        {/* Footer nav */}
-        <div className="border-t bg-card">
-          <div className="max-w-screen-xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="gap-1.5"
-              onClick={() => step > 1 && setStep((s) => (s - 1) as Step)}
-              disabled={step === 1}
-            >
-              <ChevronLeft className="h-4 w-4" />
-              Back
+        {/* Footer */}
+        <div className="border-t bg-card flex-shrink-0">
+          <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-2.5 flex items-center justify-between">
+            <Button variant="ghost" size="sm" className="gap-1.5" onClick={() => step > 1 && setStep((s) => (s - 1) as Step)} disabled={step === 1}>
+              <ChevronLeft className="h-4 w-4" />Cancel
             </Button>
 
-            <div className="flex gap-1.5 items-center text-xs text-muted-foreground">
+            <div className="flex items-center gap-1.5">
               {STEPS.map((s) => (
-                <button
-                  key={s.id}
-                  onClick={() => {
-                    if (s.id <= step || completedSteps.has(s.id)) setStep(s.id);
-                  }}
-                  className={`h-2 w-2 rounded-full transition-all ${
-                    step === s.id ? "bg-primary w-4" : completedSteps.has(s.id) ? "bg-emerald-400" : "bg-muted-foreground/30"
-                  }`}
-                />
+                <button key={s.id} onClick={() => { if (s.id <= step || completedSteps.has(s.id)) setStep(s.id); }}
+                  className={`h-2 rounded-full transition-all ${step === s.id ? "bg-primary w-5" : completedSteps.has(s.id) ? "bg-emerald-400 w-2" : "bg-muted-foreground/30 w-2"}`} />
               ))}
             </div>
 
-            <Button
-              size="sm"
-              className="gap-1.5"
-              onClick={() => goToStep((step + 1) as Step)}
-              disabled={!canProceed || step === 3}
-            >
-              {step === 2 ? "Preview & Generate" : "Next: Rule Builder"}
-              <ChevronRight className="h-4 w-4" />
-            </Button>
+            <div className="flex items-center gap-2">
+              {step >= 2 && (
+                <Button size="sm" variant="outline" className="h-8 gap-1 text-xs sm:hidden"
+                  onClick={handleSaveRules} disabled={isSaving || rules.length === 0}>
+                  {isSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  Save Rules
+                </Button>
+              )}
+              <Button size="sm" className="gap-1.5" onClick={() => goToStep((step + 1) as Step)} disabled={!canProceed || step === 4}>
+                {step === 2 ? "Next: Field Mapping" : step === 3 ? "Preview & Generate" : "Next: Rule Builder"}
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
         </div>
       </div>

@@ -226,6 +226,41 @@ function parseJsonField<T>(value: unknown, fallback: T): T {
   return value as T;
 }
 
+// ── In-memory server-side response cache ─────────────────────────────────────
+// Keyed by the serialised query string (e.g. "" / "projectId=abc").
+// TTL: 30 s — balances freshness vs. Atlas M0 query latency (~200-400 ms).
+const _serverCache = new Map<string, { data: any[]; expiresAt: number }>();
+const SERVER_CACHE_TTL = 5 * 60_000; // 5 minutes
+
+function getServerCache(key: string): any[] | null {
+  const entry = _serverCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _serverCache.delete(key); return null; }
+  return entry.data;
+}
+
+function setServerCache(key: string, data: any[]): void {
+  _serverCache.set(key, { data, expiresAt: Date.now() + SERVER_CACHE_TTL });
+}
+
+export function invalidateServerCache(): void {
+  _serverCache.clear();
+}
+
+/** Read the pre-warmed gallery-cache.json (written at server startup). */
+function readGalleryCacheFile(): any[] | null {
+  try {
+    const CACHE_FILE = path.join(__dirname, '..', '..', 'tmp', 'gallery-cache.json');
+    if (!fs.existsSync(CACHE_FILE)) return null;
+    const raw = fs.readFileSync(CACHE_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as { data: any[]; expiresAt: number };
+    if (!Array.isArray(parsed.data) || Date.now() > parsed.expiresAt) return null;
+    return parsed.data;
+  } catch {
+    return null;
+  }
+}
+
 router.post('/upload-image', (req: Request, res: Response) => {
   upload.single('image')(req, res, async (error) => {
     if (error) {
@@ -250,6 +285,86 @@ router.post('/upload-image', (req: Request, res: Response) => {
   });
 });
 
+// ── Lightweight metadata-only endpoint ───────────────────────────────────────
+// Returns only the fields needed to render gallery cards (no designData).
+// Supports pagination via ?page=1&limit=24 and optional projectId/productId filter.
+const META_PROJECTION = '_id templateName category tags preview_image previewImageUrl isGlobal isActive productId projectId createdAt updatedAt';
+
+router.get('/meta', async (req: Request, res: Response) => {
+  try {
+    const requestedProductId = String(req.query.productId || '').trim();
+    const requestedProjectId = String(req.query.projectId || '').trim();
+    const page  = Math.max(1, parseInt(String(req.query.page  || '1'),  10));
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '24'), 10)));
+    const skip  = (page - 1) * limit;
+
+    const cacheKey = `meta:${requestedProductId || requestedProjectId || '__all__'}:${page}:${limit}`;
+    const cached = getServerCache(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'private, max-age=300, stale-while-revalidate=600');
+      res.setHeader('X-Cache', 'HIT');
+      res.json({ success: true, data: cached, meta: { page, limit, total: cached.length } });
+      return;
+    }
+
+    let filter: Record<string, any> = {};
+    if (requestedProductId) {
+      // Only return templates that belong to this product — never inject global gallery templates.
+      filter = { productId: requestedProductId };
+    } else if (requestedProjectId) {
+      // Also check productId for backward compatibility with templates saved before projectId was introduced.
+      // NOTE: do NOT restrict by isGlobal here — a project-owned template that is also
+      // marked public should still appear in its own project's template list.
+      const isValidObjId = isValidObjectId(requestedProjectId);
+      if (isValidObjId) {
+        filter = {
+          $or: [
+            { projectId: requestedProjectId },
+            { productId: new mongoose.Types.ObjectId(requestedProjectId) },
+          ],
+        };
+      } else {
+        filter = { projectId: requestedProjectId };
+      }
+    } else {
+      // Gallery: only return global/public templates.
+      filter = { isGlobal: true };
+    }
+
+    const [total, rawTemplates] = await Promise.all([
+      ProductTemplate.countDocuments(filter),
+      ProductTemplate.find(filter)
+        .select(META_PROJECTION)
+        .sort({ updatedAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+    ]);
+
+    const data = rawTemplates.map((t: any) => {
+      const result: any = { ...t };
+      // Sanitize preview fields — strip base64 data URIs from list payloads
+      if (typeof result.preview_image === 'string' && result.preview_image.startsWith('data:')) {
+        result.preview_image = null;
+      }
+      if (typeof result.previewImageUrl === 'string' && result.previewImageUrl.startsWith('data:')) {
+        result.previewImageUrl = null;
+      }
+      return result;
+    });
+
+    setServerCache(cacheKey, data);
+
+    res.setHeader('Cache-Control', 'private, max-age=300, stale-while-revalidate=600');
+    res.setHeader('X-Cache', 'MISS');
+    res.json({ success: true, data, meta: { page, limit, total } });
+  } catch (error) {
+    const err = error as Error;
+    console.error('[templates] GET /api/templates/meta failed', { error: err.message });
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 router.get('/', async (req: Request, res: Response) => {
   try {
     const requestedProductId = String(req.query.productId || '').trim();
@@ -260,45 +375,122 @@ router.get('/', async (req: Request, res: Response) => {
       query: req.query,
     });
 
-    // Fetch templates by projectId or isGlobal (optional global flag)
+    // Cache key based on the query parameters
+    const cacheKey = requestedProductId
+      ? `productId:${requestedProductId}`
+      : requestedProjectId
+        ? `projectId:${requestedProjectId}`
+        : '__all__';
+
+    // 1. Check in-memory server cache first (fastest path)
+    const cached = getServerCache(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'private, max-age=300, stale-while-revalidate=600');
+      res.setHeader('X-Cache', 'HIT');
+      res.json({ success: true, data: cached, meta: { total: cached.length } });
+      return;
+    }
+
+    // 2. For the unfiltered gallery call, try the pre-warmed gallery-cache.json file
+    if (cacheKey === '__all__') {
+      const fileCached = readGalleryCacheFile();
+      if (fileCached) {
+        setServerCache(cacheKey, fileCached);
+        res.setHeader('Cache-Control', 'private, max-age=300, stale-while-revalidate=600');
+        res.setHeader('X-Cache', 'FILE');
+        res.json({ success: true, data: fileCached, meta: { total: fileCached.length } });
+        return;
+      }
+    }
+
+    // 3. Try the lightweight TemplateGalleryMeta collection first — it has no designData
+    //    and has proper indexes so queries return in <100 ms even on Atlas M0.
+    let metaFilter: Record<string, any> = {};
+    if (requestedProductId) {
+      // Only return templates that belong to this product — never inject global gallery templates.
+      metaFilter = { productId: requestedProductId };
+    } else if (requestedProjectId) {
+      // Return templates that belong to this project.
+      // Also check productId for backward compatibility with older templates that were
+      // saved using productId = <project_id> before the projectId field was introduced.
+      // NOTE: do NOT restrict by isGlobal — a project template marked as public should
+      // still appear in its own project.
+      const isValidObjId = isValidObjectId(requestedProjectId);
+      if (isValidObjId) {
+        metaFilter = {
+          $or: [
+            { projectId: requestedProjectId },
+            { productId: new mongoose.Types.ObjectId(requestedProjectId) },
+          ],
+        };
+      } else {
+        metaFilter = { projectId: requestedProjectId };
+      }
+    } else {
+      // Gallery (no filter): only show global/public templates.
+      metaFilter = { isGlobal: true };
+    }
+
+    try {
+      const metaDocs = await TemplateGalleryMeta
+        .find(metaFilter)
+        .sort({ updatedAt: -1 })
+        .lean();
+
+      if (metaDocs.length > 0) {
+        // Remap templateId → _id so the frontend receives the canonical ProductTemplate ObjectId.
+        const remapped = metaDocs.map((t: any) => {
+          const result: any = { ...t, _id: (t.templateId ?? t._id).toString() };
+          if (typeof result.preview_image   === 'string' && result.preview_image.startsWith('data:'))   result.preview_image = null;
+          if (typeof result.previewImageUrl === 'string' && result.previewImageUrl.startsWith('data:')) result.previewImageUrl = null;
+          return result;
+        });
+
+        console.log('[templates] Served from TemplateGalleryMeta', { count: remapped.length, cacheKey });
+        setServerCache(cacheKey, remapped);
+        res.setHeader('Cache-Control', 'private, max-age=300, stale-while-revalidate=600');
+        res.setHeader('X-Cache', 'META');
+        res.json({ success: true, data: remapped, meta: { total: remapped.length } });
+        return;
+      }
+    } catch (metaErr) {
+      console.warn('[templates] TemplateGalleryMeta query failed, falling back to ProductTemplate:', (metaErr as Error).message);
+    }
+
+    // 4. Fallback: query ProductTemplate directly (slower — designData excluded via projection)
     let filter: Record<string, any> = {};
     if (requestedProductId) {
-      filter = {
-        $or: [
-          { productId: requestedProductId },
-          { isGlobal: true }
-        ]
-      };
+      // Only return templates that belong to this product — never inject global gallery templates.
+      filter = { productId: requestedProductId };
     } else if (requestedProjectId) {
-      filter = {
-        $or: [
-          { projectId: requestedProjectId },
-          { isGlobal: true }
-        ]
-      };
+      // Also check productId for backward compatibility (old templates saved with productId = project id).
+      // NOTE: do NOT restrict by isGlobal — a project-owned template marked public must
+      // still appear in its own project's template list.
+      const isValidObjId = isValidObjectId(requestedProjectId);
+      if (isValidObjId) {
+        filter = {
+          $or: [
+            { projectId: requestedProjectId },
+            { productId: new mongoose.Types.ObjectId(requestedProjectId) },
+          ],
+        };
+      } else {
+        filter = { projectId: requestedProjectId };
+      }
+    } else {
+      // Gallery (no filter): only return global/public templates — never show project-specific ones.
+      filter = { isGlobal: true };
     }
-    // Use lean() to avoid exceeding MongoDB M0's 32 MB in-memory limit when
-    // templates contain large canvasJSON / base64 preview images.
-    const rawTemplates = await ProductTemplate.find(filter).lean();
-    const templates = rawTemplates.slice().sort(
-      (a: any, b: any) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-    );
+    const rawTemplates = await ProductTemplate
+      .find(filter)
+      .select('-designData')
+      .sort({ updatedAt: -1 })
+      .lean();
 
     // Strip large binary fields from list responses.
-    // • canvasJSON inside designData — fetched individually by GET /:id when needed.
-    // • base64 data-URL preview images — they should have been persisted to disk;
-    //   a base64 string in preview_image means the template predates the file-save
-    //   pipeline. Strip it from the list response so the payload stays small; the
-    //   individual GET /:id still returns the full value.
-    const stripped = templates.map((t: any) => {
+    // • base64 data-URL preview images — strip so payload stays small.
+    const stripped = rawTemplates.map((t: any) => {
       const result: any = { ...t };
-
-      // Strip canvasJSON from inside designData
-      if (result.designData && typeof result.designData === 'object') {
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { canvasJSON: _cj, canvasJson: _cj2, ...restDesignData } = result.designData;
-        result.designData = restDesignData;
-      }
 
       // Replace base64 preview fields with null so the thumbnail <img> gets a
       // 404 (graceful broken-image) rather than rendering a massive inline data URL.
@@ -317,6 +509,17 @@ router.get('/', async (req: Request, res: Response) => {
       ids: stripped.map((template: any) => String(template._id)),
     });
 
+    // Store in server cache for subsequent requests
+    setServerCache(cacheKey, stripped);
+
+    // For the global gallery: also refresh the gallery-cache.json file so the
+    // next cold-start (or TTL expiry) doesn't hit MongoDB again.
+    if (cacheKey === '__all__') {
+      setImmediate(() => { warmGalleryCache().catch(() => {}); });
+    }
+
+    res.setHeader('Cache-Control', 'private, max-age=300, stale-while-revalidate=600');
+    res.setHeader('X-Cache', 'MISS');
     res.json({
       success: true,
       data: stripped,
@@ -408,6 +611,7 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
   try {
     const {
       productId,
+      projectId: explicitProjectId,
       userId,
       title,
       templateName,
@@ -424,6 +628,14 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       isPublic,
     } = req.body;
 
+    // When an explicit projectId is provided, use it — this ensures templates created
+    // from within a project are stored with projectId (not productId) so the project-
+    // scoped GET /api/templates?projectId=xxx query can find them correctly.
+    const resolvedProjectId = String(explicitProjectId || '').trim();
+    const resolvedProductId = String(productId || '').trim();
+    // At least one must be provided for the template to be associated with something.
+    const ownerRef = resolvedProjectId || resolvedProductId;
+
     const file = (req as Request & { file?: Express.Multer.File }).file;
     const uploadedImageUrl = file ? await persistMulterFile(file.path, file.filename) : '';
     const resolvedTemplateName = String(title || templateName || '').trim();
@@ -432,30 +644,47 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       resolvedTemplateName.replace(/\s+/g, '_') || 'preview',
     );
 
-    if (!productId || !resolvedTemplateName || !normalizedPreview) {
-      res.status(400).json({ success: false, error: 'productId, title/templateName, and image are required' });
+    if (!resolvedTemplateName || !normalizedPreview) {
+      res.status(400).json({ success: false, error: 'title/templateName and image are required' });
       return;
     }
-    const isProductObjectId = isValidObjectId(productId);
 
     if (userId && !isValidObjectId(String(userId))) {
       res.status(400).json({ success: false, error: 'Invalid userId' });
       return;
     }
 
-    if (isProductObjectId) {
-      const productExists = await Product.exists({ _id: productId });
-      const projectExists = productExists ? null : await Project.exists({ _id: productId });
+    // Validate the ownerRef exists (project takes priority)
+    if (resolvedProjectId && isValidObjectId(resolvedProjectId)) {
+      const projectExists = await Project.exists({ _id: resolvedProjectId });
+      if (!projectExists) {
+        res.status(404).json({ success: false, error: 'Project not found for template mapping' });
+        return;
+      }
+    } else if (resolvedProductId && isValidObjectId(resolvedProductId)) {
+      const productExists = await Product.exists({ _id: resolvedProductId });
+      const projectExists = productExists ? null : await Project.exists({ _id: resolvedProductId });
       if (!productExists && !projectExists) {
         res.status(404).json({ success: false, error: 'Product or Project not found for template mapping' });
         return;
       }
     }
 
+    const isProductObjectId = !resolvedProjectId && isValidObjectId(resolvedProductId);
+
     // Pre-check: avoid E11000 by detecting the duplicate before attempting to save
-    if (isProductObjectId) {
+    if (resolvedProjectId) {
       const existing = await ProductTemplate.findOne({
-        productId,
+        projectId: resolvedProjectId,
+        templateName: resolvedTemplateName,
+      }).lean();
+      if (existing) {
+        res.status(200).json({ success: true, data: { ...existing, alreadyExists: true } });
+        return;
+      }
+    } else if (isProductObjectId) {
+      const existing = await ProductTemplate.findOne({
+        productId: resolvedProductId,
         templateName: resolvedTemplateName,
       }).lean();
       if (existing) {
@@ -464,8 +693,20 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       }
     }
 
+    // Determine how to store the owner reference.
+    // projectId takes explicit priority (project-scoped template).
+    // Falls back to productId for actual product templates.
+    // If neither is set (e.g., standalone gallery duplicate), no owner field is set.
+    const ownerFields = resolvedProjectId
+      ? { projectId: resolvedProjectId }
+      : isProductObjectId
+        ? { productId: resolvedProductId }
+        : resolvedProductId
+          ? { projectId: resolvedProductId }   // non-ObjectId project ref stored as string
+          : {};                                  // standalone global template (no owner)
+
     const template = new ProductTemplate({
-      ...(isProductObjectId ? { productId } : { projectId: String(productId) }),
+      ...ownerFields,
       createdBy: userId ? new mongoose.Types.ObjectId(String(userId)) : undefined,
       isGlobal: [true, 'true', 1, '1'].includes(isGlobal)
         || [true, 'true', 1, '1'].includes(isPublic),
@@ -481,7 +722,7 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
     });
 
     console.log('[templates] Saving template', {
-      productId,
+      ownerRef,
       templateName: template.templateName,
       collection: 'producttemplates',
       database: mongoose.connection.name,
@@ -493,6 +734,28 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       templateName: savedTemplate.templateName,
       createdAt: savedTemplate.createdAt,
     });
+
+    // Keep TemplateGalleryMeta in sync for fast gallery/project reads (non-blocking).
+    TemplateGalleryMeta.findOneAndUpdate(
+      { templateId: savedTemplate._id },
+      {
+        templateId: savedTemplate._id,
+        productId: savedTemplate.productId,
+        projectId: savedTemplate.projectId != null ? String(savedTemplate.projectId) : undefined,
+        templateName: savedTemplate.templateName,
+        description: savedTemplate.description,
+        category: savedTemplate.category,
+        previewImageUrl: savedTemplate.previewImageUrl,
+        preview_image: savedTemplate.preview_image,
+        designFileUrl: savedTemplate.designFileUrl,
+        isGlobal: savedTemplate.isGlobal ?? false,
+        isActive: savedTemplate.isActive ?? true,
+        tags: savedTemplate.tags,
+      },
+      { upsert: true }
+    ).catch(() => {});
+
+    invalidateServerCache();
 
     emitRealtimeEvent({
       type: 'template:created',
@@ -509,12 +772,14 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
     if (err.code === 11000) {
       // Find the existing template and return it so the caller can use it
       try {
-        const { productId, title, templateName } = req.body;
+        const { productId, projectId: bodyProjectId, title, templateName } = req.body;
         const resolvedName = String(title || templateName || '').trim();
-        const existing = await ProductTemplate.findOne({
-          productId,
-          templateName: resolvedName,
-        }).lean();
+        const resolvedProjId = String(bodyProjectId || '').trim();
+        const existing = await ProductTemplate.findOne(
+          resolvedProjId
+            ? { projectId: resolvedProjId, templateName: resolvedName }
+            : { productId, templateName: resolvedName }
+        ).lean();
         // Embed alreadyExists inside data so templateApi handleResponse passes it through
         res.status(200).json({ success: true, data: { ...(existing ?? {}), alreadyExists: true } });
         return;
@@ -576,6 +841,27 @@ router.put('/:id', async (req: Request, res: Response) => {
     });
 
     if (template) {
+      // Keep TemplateGalleryMeta in sync (non-blocking).
+      TemplateGalleryMeta.findOneAndUpdate(
+        { templateId: template._id },
+        {
+          templateId: template._id,
+          productId: template.productId,
+          projectId: template.projectId != null ? String(template.projectId) : undefined,
+          templateName: template.templateName,
+          description: template.description,
+          category: template.category,
+          previewImageUrl: template.previewImageUrl,
+          preview_image: template.preview_image,
+          designFileUrl: template.designFileUrl,
+          isGlobal: template.isGlobal ?? false,
+          isActive: template.isActive ?? true,
+          tags: template.tags,
+        },
+        { upsert: true }
+      ).catch(() => {});
+
+      invalidateServerCache();
       emitRealtimeEvent({
         type: 'template:updated',
         templateId: String(template._id),
@@ -612,6 +898,8 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
     await ProductTemplate.deleteOne({ _id: id });
     await TemplateGalleryMeta.deleteOne({ templateId: existing._id }).catch(() => {});
+
+    invalidateServerCache();
 
     emitRealtimeEvent({
       type: 'template:deleted',
@@ -800,7 +1088,7 @@ export async function warmGalleryCache(): Promise<void> {
       return true;
     });
     const data = unique.map((t: any) => ({ ...t, _id: t.templateId ?? t._id }));
-    const cache = { data, expiresAt: Date.now() + 5 * 60 * 1000 };
+    const cache = { data, expiresAt: Date.now() + 30 * 60 * 1000 }; // 30 minutes
     const dir = path.dirname(CACHE_FILE);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(CACHE_FILE, JSON.stringify(cache), 'utf-8');

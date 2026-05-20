@@ -2086,14 +2086,28 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [createHistorySnapshot, performRedo, performUndo, pushUndoSnapshot]);
 
-    // ── Resize when config dims change ──────────────────────────────────────
+    // ── Resize when viewport/zoom changes ───────────────────────────────────
+    // Only updates canvas element size and viewport transform.
+    // Background rescaling is NOT done here — zoom is handled by the viewport
+    // transform itself; recalculating scale here would overwrite a correctly
+    // loaded background with the wrong fit mode (e.g. "contain" after a
+    // template whose background was saved in "cover" mode is loaded).
     useEffect(() => {
       const fc = fabricRef.current;
       if (!fc) return;
       fc.setDimensions({ width: viewportCanvasPxW, height: viewportCanvasPxH });
       fc.setViewportTransform([displayScale, 0, 0, displayScale, 0, 0]);
-      
-      // Rescale current background media (image/SVG) to match new canvas size
+      fc.requestRenderAll();
+    }, [viewportCanvasPxW, viewportCanvasPxH, displayScale]);
+
+    // ── Rescale background when canvas MODEL dimensions change ───────────────
+    // This fires only when the canvas size itself changes (e.g. A4 → A3),
+    // NOT on zoom (zoom only changes displayScale / viewportCanvasPxW/H).
+    // Using the correct bgFitModeRef ensures cover/contain is preserved.
+    useEffect(() => {
+      const fc = fabricRef.current;
+      if (!fc) return;
+
       const bgObject = getCanvasBackgroundObject(fc);
       if (bgObject) {
         placeBackgroundObject(
@@ -2105,8 +2119,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           bgOffsetRef.current.y
         );
       }
-      
-      // Rescale SVG background using cover or contain scaling
+
       if (bgSVGRef.current) {
         placeBackgroundObject(
           bgSVGRef.current,
@@ -2117,9 +2130,9 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
           bgOffsetRef.current.y
         );
       }
-      
-      fc.renderAll();
-    }, [canvasPxW, canvasPxH, viewportCanvasPxW, viewportCanvasPxH, displayScale, getCanvasBackgroundObject, placeBackgroundObject]);
+
+      fc.requestRenderAll();
+    }, [canvasPxW, canvasPxH, getCanvasBackgroundObject, placeBackgroundObject]);
 
     // ── Margin guides ───────────────────────────────────────────────────────
     const drawMargins = useCallback(() => {
@@ -2962,6 +2975,22 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             onBgChangeRef.current?.("none");
           }
 
+          // Restore background fit mode and offset so that canvas-resize rescaling
+          // (e.g. switching page size) uses the same cover/contain mode that was
+          // in effect when the template was saved.
+          const storedFitMode = (json as any)._bgFitMode;
+          if (storedFitMode === "cover" || storedFitMode === "contain") {
+            bgFitModeRef.current = storedFitMode;
+          } else {
+            bgFitModeRef.current = "contain";
+          }
+          const storedOffset = (json as any)._bgOffset;
+          if (storedOffset && typeof storedOffset.x === "number") {
+            bgOffsetRef.current = { x: storedOffset.x, y: storedOffset.y };
+          } else {
+            bgOffsetRef.current = { x: 0, y: 0 };
+          }
+
           ignoreSaveRef.current = false;
           undoStackRef.current = [createHistorySnapshot(fc)];
           redoStackRef.current = [];
@@ -2977,6 +3006,8 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         );
         json._elements = extractElementMetadata(fc);
         json._bgString = bgStringRef.current;
+        json._bgFitMode = bgFitModeRef.current;
+        json._bgOffset = { x: bgOffsetRef.current.x, y: bgOffsetRef.current.y };
         return json;
       },
 

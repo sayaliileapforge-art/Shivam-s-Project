@@ -10,12 +10,9 @@ import "./id-card.css";
  */
 function normalizeUploadUrl(url: string): string {
   if (!url) return url;
-  const isLocalDev = typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
-  if (!isLocalDev) return url;
-  // In local dev, strip only localhost absolute origins so Vite proxy can handle them.
-  // Keep external hosts (e.g. Hostinger) unchanged.
-  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/uploads\//i.test(url)) {
-    return url.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/uploads\//i, '/uploads/');
+  // Strip any absolute origin from upload paths → relative /uploads/ proxy
+  if (/^https?:\/\/[^\/]+\/uploads\//i.test(url)) {
+    return url.replace(/^https?:\/\/[^\/]+\/uploads\//i, '/uploads/');
   }
   return url;
 }
@@ -28,37 +25,8 @@ const GRID_PAGE_SIZE = 6;
 export interface CachedTemplateData {
   config: ResolvedTemplateConfig;
   dynamicTexts: DynamicTextObject[];
-  /** Background image src extracted directly from the canvas JSON (not the
-   *  full rendered thumbnail).  Used when rendering with real data so the
-   *  thumbnail's baked-in placeholder text doesn't show behind the overlay. */
-  canvasBgImageSrc: string;
 }
 const _tmplCache = new Map<string, CachedTemplateData>();
-
-/** Extract only the background image src from canvasJSON (not the full thumbnail). */
-function extractCanvasBackgroundImageSrc(template: ProjectTemplate): string {
-  if (!template.canvasJSON) return "";
-  try {
-    const parsed = JSON.parse(template.canvasJSON) as Record<string, unknown>;
-    const getCanvas = (): Record<string, unknown> | null => {
-      if (parsed.canvas && typeof parsed.canvas === "object") return parsed.canvas as Record<string, unknown>;
-      if (Array.isArray(parsed.pages)) {
-        const first = parsed.pages[0] as { canvas?: unknown } | undefined;
-        return (first?.canvas && typeof first.canvas === "object") ? first.canvas as Record<string, unknown> : null;
-      }
-      return null;
-    };
-    const canvas = getCanvas();
-    if (!canvas) return "";
-    const bgObject = (canvas.backgroundImage as Record<string, unknown> | undefined) ?? {};
-    const bgSrc = String(bgObject.src ?? "").trim();
-    if (!bgSrc) return "";
-    const resolved = resolveProfileImageUrl(bgSrc) || bgSrc;
-    return normalizeUploadUrl(resolved);
-  } catch {
-    return "";
-  }
-}
 
 export function getTemplateCached(template: ProjectTemplate): CachedTemplateData {
   const key = `${template.id}:${template.canvasJSON?.length ?? 0}:${template.thumbnail ? template.thumbnail.slice(0, 16) : ""}`;
@@ -67,7 +35,6 @@ export function getTemplateCached(template: ProjectTemplate): CachedTemplateData
   const result: CachedTemplateData = {
     config: resolveTemplateConfig(template),
     dynamicTexts: extractDynamicTextObjects(template),
-    canvasBgImageSrc: extractCanvasBackgroundImageSrc(template),
   };
   if (_tmplCache.size >= 30) {
     // Evict oldest entry to keep memory bounded
@@ -167,7 +134,7 @@ function normalizeTemplateSlug(raw: string): SupportedTemplateSlug | "" {
   if (value === "template_1" || value === "template1") return "template_1";
   if (value === "template_2" || value === "template2") return "template_2";
   if (value === "template_3" || value === "template3") return "template_3";
-  if (/template[\s_-]*1|id[\s_-]*card|classic|pvc/.test(value)) return "template_1";
+  if (/template[\s_-]*1|id[\s_-]*card|classic/.test(value)) return "template_1";
   if (/template[\s_-]*2|certificate|minimal/.test(value)) return "template_2";
   if (/template[\s_-]*3|copy|poster|modern/.test(value)) return "template_3";
   return "";
@@ -239,46 +206,31 @@ export function studentHasPhoto(record: ProjectDataRecord): boolean {
  */
 const TEMPLATE_VAR_ALIASES: Record<string, string[]> = {
   // name / full name
-  fullname:       ["Name", "name", "fullName", "FullName", "studentName", "StudentName", "full_name", "FULL_NAME"],
-  name:           ["Name", "name", "fullName", "FullName", "studentName"],
-  studentname:    ["Name", "name", "studentName", "StudentName"],
+  fullname:     ["Name", "name", "fullName", "FullName", "studentName", "StudentName", "full_name", "FULL_NAME"],
+  name:         ["Name", "name", "fullName", "FullName", "studentName"],
+  studentname:  ["Name", "name", "studentName", "StudentName"],
   // class / section
-  classname:      ["Class", "class", "className", "ClassName", "standard", "Standard"],
-  class:          ["Class", "class", "className", "standard", "Standard"],
-  section:        ["Section", "section", "Stream", "stream", "Division", "div"],
-  classsection:   ["Class", "class", "Section", "section"],
+  classname:    ["Class", "class", "className", "ClassName", "standard", "Standard"],
+  class:        ["Class", "class", "className", "standard", "Standard"],
+  section:      ["Section", "section", "Stream", "stream", "Division", "div"],
+  classsection: ["Class", "class", "Section", "section"],
   // parents
-  fathername:     ["Father Name", "fatherName", "FatherName", "father_name", "Father"],
-  mothername:     ["Mother Name", "motherName", "MotherName", "mother_name", "Mother"],
-  fathermobile:   ["Father Mobile", "fatherMobile", "FatherMobile", "father_mobile", "Father Mobile Number", "father_mobile_number"],
-  mothermobile:   ["Mother Mobile", "motherMobile", "MotherMobile", "mother_mobile", "Mother Mobile Number", "mother_mobile_number"],
+  fathername:   ["Father Name", "fatherName", "FatherName", "father_name", "Father"],
+  mothername:   ["Mother Name", "motherName", "MotherName", "mother_name", "Mother"],
+  fathermobile: ["Father Mobile", "fatherMobile", "FatherMobile", "father_mobile", "Father Mobile Number"],
+  mothermobile: ["Mother Mobile", "motherMobile", "MotherMobile", "mother_mobile", "Mother Mobile Number"],
   // contact / address
-  address:        ["Address", "address", "addr", "Village", "village", "City", "city", "Permanent Address", "permanent_address"],
-  phone:          ["Phone", "phone", "Mobile", "mobile", "Contact", "contact", "Father Mobile Number", "Mother Mobile Number"],
-  mobile:         ["Mobile", "mobile", "Phone", "phone", "Contact", "contact", "Father Mobile Number", "fathermobilenumber", "Father Mobile"],
-  mobileno:       ["Mobile", "mobile", "Phone", "phone", "Contact", "Father Mobile Number"],
-  contact:        ["Contact", "contact", "Mobile", "mobile", "Phone", "phone"],
+  address:      ["Address", "address", "addr", "Village", "village", "City", "city"],
+  phone:        ["Phone", "phone", "Mobile", "mobile", "Contact", "contact"],
+  mobile:       ["Mobile", "mobile", "Phone", "phone", "Contact"],
   // admission
-  admissionno:    ["Admission Number", "admissionNo", "AdmissionNo", "admission_no", "Admission No", "Admn No", "rollNo", "Roll No"],
-  admissionnumber:["Admission Number", "admissionNo", "AdmissionNo", "admission_no"],
-  rollno:         ["Roll No", "rollNo", "roll_no", "admissionNo", "Admission Number"],
-  // organisation / school
-  companyname:    ["Company Name", "companyName", "CompanyName", "company_name", "School Name", "schoolName", "SchoolName", "school_name", "Organisation", "organization", "Institute", "institution"],
-  company:        ["Company Name", "companyName", "CompanyName", "School Name", "schoolName"],
-  schoolname:     ["School Name", "schoolName", "SchoolName", "school_name", "Company Name", "companyName"],
-  institutename:  ["Institute", "institution", "School Name", "schoolName", "Company Name"],
-  // designation / role
-  designation:    ["Designation", "designation", "Role", "role", "Position", "position", "Post", "post"],
-  // signature field (usually an image field)
-  signature:      ["Signature", "signature", "sign", "Sign"],
+  admissionno:  ["Admission Number", "admissionNo", "AdmissionNo", "admission_no", "Admission No", "Admn No", "rollNo", "Roll No"],
+  admissionnumber: ["Admission Number", "admissionNo", "AdmissionNo", "admission_no"],
+  rollno:       ["Roll No", "rollNo", "roll_no", "admissionNo", "Admission Number"],
   // misc
-  dob:            ["DOB", "dob", "Date of Birth", "dateOfBirth", "birthDate", "Date Of Birth"],
-  dateofbirth:    ["Date of Birth", "DOB", "dob", "dateOfBirth", "birthDate"],
-  schoolcode:     ["School Code", "schoolCode", "school_code", "SchoolCode"],
-  gender:         ["Gender", "gender", "Sex", "sex"],
-  bloodgroup:     ["Blood Group", "bloodGroup", "blood_group", "BloodGroup", "Blood"],
-  house:          ["House", "house", "School House", "schoolHouse"],
-  stream:         ["Stream", "stream", "Section", "section", "Division"],
+  dob:          ["DOB", "dob", "Date of Birth", "dateOfBirth", "birthDate"],
+  schoolcode:   ["School Code", "schoolCode", "school_code", "SchoolCode"],
+  gender:       ["Gender", "gender", "Sex", "sex"],
 };
 
 /**
@@ -381,8 +333,7 @@ function extractTemplateObjects(template: ProjectTemplate): Array<Record<string,
 
 function getTemplateBackground(template: ProjectTemplate, slug: SupportedTemplateSlug): string {
   if (template.thumbnail && template.thumbnail.trim()) {
-    const resolved = resolveProfileImageUrl(template.thumbnail.trim()) || template.thumbnail.trim();
-    return normalizeUploadUrl(resolved);
+    return resolveProfileImageUrl(template.thumbnail.trim()) || template.thumbnail.trim();
   }
   if (template.canvasJSON) {
     try {
@@ -393,10 +344,7 @@ function getTemplateBackground(template: ProjectTemplate, slug: SupportedTemplat
       const rootCanvas = (parsed.canvas as Record<string, unknown> | undefined) || pageCanvas || {};
       const bgObject = (rootCanvas.backgroundImage as Record<string, unknown> | undefined) || {};
       const bgSrc = String(bgObject.src || "").trim();
-      if (bgSrc) {
-        const resolved = resolveProfileImageUrl(bgSrc) || bgSrc;
-        return normalizeUploadUrl(resolved);
-      }
+      if (bgSrc) return resolveProfileImageUrl(bgSrc) || bgSrc;
     } catch {
       // ignore malformed JSON
     }
@@ -525,30 +473,23 @@ export function IdCard({
   template,
   precomputedConfig,
   precomputedDynTexts,
-  precomputedCanvasBgImageSrc,
 }: {
   student: ProjectDataRecord;
   template: ProjectTemplate | null;
   /** Pre-computed by the parent grid — avoids per-card JSON.parse. */
   precomputedConfig?: ResolvedTemplateConfig;
   precomputedDynTexts?: DynamicTextObject[];
-  /** Canvas-extracted background (without baked-in placeholder text). */
-  precomputedCanvasBgImageSrc?: string;
 }) {
   // Use parent-supplied pre-computed data when available (normal path inside
   // IdCardGrid).  Fall back to computing here for standalone usage.
-  const { config, dynamicTexts, canvasBgImageSrc } = useMemo(() => {
+  const { config, dynamicTexts } = useMemo(() => {
     if (precomputedConfig && precomputedDynTexts) {
-      return {
-        config: precomputedConfig,
-        dynamicTexts: precomputedDynTexts,
-        canvasBgImageSrc: precomputedCanvasBgImageSrc ?? "",
-      };
+      return { config: precomputedConfig, dynamicTexts: precomputedDynTexts };
     }
     return template
       ? getTemplateCached(template)
-      : { config: resolveTemplateConfig(null), dynamicTexts: [] as DynamicTextObject[], canvasBgImageSrc: "" };
-  }, [template, precomputedConfig, precomputedDynTexts, precomputedCanvasBgImageSrc]);
+      : { config: resolveTemplateConfig(null), dynamicTexts: [] as DynamicTextObject[] };
+  }, [template, precomputedConfig, precomputedDynTexts]);
 
   const name = getRecordField(student, "name") || "-";
   const admissionNo = getRecordField(student, "admissionNo") || "-";
@@ -571,12 +512,6 @@ export function IdCard({
   // static fields so the same data is never drawn twice (no overlap).
   const hasCanvasText = dynamicTexts.length > 0;
 
-  // When rendering with real data, prefer the canvas-extracted background image
-  // over the full rendered thumbnail (which has placeholder text baked in).
-  // This ensures the card shows actual student values without the placeholder
-  // text from the thumbnail bleeding through.
-  const effectiveBg = (hasCanvasText && canvasBgImageSrc) ? canvasBgImageSrc : config.background;
-
   const photoStyle: CSSProperties = {
     position: "absolute",
     zIndex: 5,
@@ -588,8 +523,9 @@ export function IdCard({
       {/* Background image — lowest layer */}
       <img
         className="bg"
-        src={effectiveBg}
+        src={config.background}
         alt=""
+        crossOrigin="anonymous"
         draggable={false}
         loading="lazy"
         style={{ zIndex: 0 }}
@@ -609,6 +545,7 @@ export function IdCard({
           className="photo"
           src={photoUrl}
           alt={name}
+          crossOrigin="anonymous"
           loading="lazy"
           style={photoStyle}
           onError={(e) => {
@@ -666,10 +603,10 @@ export function IdCard({
             color: obj.color,
             textAlign: obj.textAlign,
             margin: 0,
-            lineHeight: 1.2,
-            whiteSpace: "normal",
-            wordBreak: "break-word",
+            lineHeight: 1.15,
+            whiteSpace: "nowrap",
             overflow: "hidden",
+            textOverflow: "ellipsis",
           }}
         >
           {mapData(obj.text, student)}
@@ -700,20 +637,15 @@ export function IdCardGrid({
 
   // Pre-compute template config + dynamic texts ONCE for all cards in this grid.
   // Without this, each IdCard would independently call JSON.parse(canvasJSON).
-  const { precomputedConfig, precomputedDynTexts, precomputedCanvasBgImageSrc } = useMemo(() => {
+  const { precomputedConfig, precomputedDynTexts } = useMemo(() => {
     if (!template) {
       return {
         precomputedConfig: resolveTemplateConfig(null),
         precomputedDynTexts: [] as DynamicTextObject[],
-        precomputedCanvasBgImageSrc: "",
       };
     }
     const cached = getTemplateCached(template);
-    return {
-      precomputedConfig: cached.config,
-      precomputedDynTexts: cached.dynamicTexts,
-      precomputedCanvasBgImageSrc: cached.canvasBgImageSrc,
-    };
+    return { precomputedConfig: cached.config, precomputedDynTexts: cached.dynamicTexts };
   }, [template]);
 
   // Compute visible slice before conditional returns (hooks rule).
@@ -749,7 +681,6 @@ export function IdCardGrid({
             template={template}
             precomputedConfig={precomputedConfig}
             precomputedDynTexts={precomputedDynTexts}
-            precomputedCanvasBgImageSrc={precomputedCanvasBgImageSrc}
           />
         ))}
       </div>

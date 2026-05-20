@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback, useRef } from "react";
+import { memo, useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import {
   Search, Globe, Star, Clock, Heart, ChevronLeft,
@@ -6,7 +6,7 @@ import {
   MoreVertical, Pencil, Copy, Trash2, Info,
 } from "lucide-react";
 import { cn } from "../components/ui/utils";
-import { getTemplates, createTemplate, getTemplateById, readTemplateFromLocalCache, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { getTemplates, createTemplate, getTemplateById, readTemplateFromLocalCache, resolveTemplatePreview, getGalleryCacheData, type TemplateRecord } from "../../lib/templateApi";
 import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
@@ -108,7 +108,7 @@ interface TemplateCardProps {
   isGenerating?: boolean;
 }
 
-function TemplateCard({
+const TemplateCard = memo(function TemplateCard({
   template: t, onUse, onPreview, isFavorite, onToggleFavorite,
   projectId, isAttaching, onDuplicate, onDelete, isDuplicating, onImgError, isGenerating,
 }: TemplateCardProps) {
@@ -123,38 +123,6 @@ function TemplateCard({
   useEffect(() => { setImgError(false); }, [previewSrc]);
   const displayCategory = deriveDisplayCategory(t);
   const size = deriveSize(t);
-
-  // Detect blank/all-white preview images that loaded successfully (200 OK)
-  // but contain no visible content (e.g. canvas rendered without images).
-  // Treat these the same as a load error so they're queued for regeneration.
-  const handleImgLoad = useCallback(
-    (e: React.SyntheticEvent<HTMLImageElement>) => {
-      const img = e.currentTarget;
-      if (!img.naturalWidth || !img.naturalHeight) return;
-      try {
-        const SAMPLE = 20;
-        const c = document.createElement("canvas");
-        c.width = SAMPLE; c.height = SAMPLE;
-        const ctx = c.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(img, 0, 0, SAMPLE, SAMPLE);
-        const { data } = ctx.getImageData(0, 0, SAMPLE, SAMPLE);
-        let nonWhite = 0;
-        for (let i = 0; i < data.length; i += 4) {
-          const [r, g, b, a] = [data[i], data[i + 1], data[i + 2], data[i + 3]];
-          if (a > 20 && (r < 235 || g < 235 || b < 235)) nonWhite++;
-        }
-        if (nonWhite < 5) {
-          // Image is essentially blank — treat as broken and regenerate
-          setImgError(true);
-          onImgError?.(t._id);
-        }
-      } catch {
-        // CORS or canvas error — leave as-is
-      }
-    },
-    [onImgError, t._id],
-  );
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -177,7 +145,6 @@ function TemplateCard({
             loading="lazy"
             decoding="async"
             className="h-full w-full object-contain transition-transform duration-200 group-hover:scale-105"
-            onLoad={handleImgLoad}
             onError={() => { setImgError(true); onImgError?.(t._id); }}
           />
         ) : isGenerating ? (
@@ -309,7 +276,16 @@ function TemplateCard({
       </div>
     </div>
   );
-}
+}, (prev, next) =>
+  prev.template._id === next.template._id &&
+  prev.template.preview_image === next.template.preview_image &&
+  prev.template.previewImageUrl === next.template.previewImageUrl &&
+  prev.isFavorite === next.isFavorite &&
+  prev.isAttaching === next.isAttaching &&
+  prev.isDuplicating === next.isDuplicating &&
+  prev.isGenerating === next.isGenerating &&
+  prev.projectId === next.projectId
+);
 
 // ─── Delete Confirm Modal ─────────────────────────────────────────────────────
 
@@ -425,21 +401,29 @@ export function TemplateGallery() {
   const [searchParams] = useSearchParams();
   const projectId = searchParams.get("projectId");
 
-  const [templates, setTemplates]   = useState<TemplateRecord[]>([]);
-  const [loading, setLoading]       = useState(false);
+  const [templates, setTemplates]   = useState<TemplateRecord[]>(() => getGalleryCacheData() ?? []);
+  const [loading, setLoading]       = useState(() => getGalleryCacheData() === null);
   const [error, setError]           = useState("");
   const realtimeRefreshRef = useRef<number | null>(null);
   const lastFetchTimeRef   = useRef<number>(0);
-  const pollingIntervalRef = useRef<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const retryTimerRef      = useRef<number | null>(null);
+  // Track whether any template data has ever been loaded (cache or fetch).
+  // Used to suppress the loading skeleton on re-visits.
+  const hasDataRef = useRef(getGalleryCacheData() !== null);
 
   // Sidebar filters
   const [selectedCategories, setSelectedCategories] = useState<string[]>(["all"]);
   const [selectedSizes, setSelectedSizes]           = useState<string[]>(["all"]);
   const [orientation, setOrientation]               = useState<OrientationType>("all");
 
-  // Top-bar filters
+  // Top-bar filters — query uses a debounced value so filtering runs only after the user pauses typing
   const [query, setQuery]                         = useState("");
+  const [debouncedQuery, setDebouncedQuery]       = useState("");
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedQuery(query), 300);
+    return () => window.clearTimeout(t);
+  }, [query]);
   const [dropdownSize, setDropdownSize]           = useState("all");
   const [dropdownCategory, setDropdownCategory]   = useState("all");
   const [dropdownOrientation, setDropdownOrientation] = useState("all");
@@ -465,16 +449,24 @@ export function TemplateGallery() {
     if (!isRetry && now - lastFetchTimeRef.current < 500) return;
     lastFetchTimeRef.current = now;
 
+    // Cancel any in-flight request before starting a new one.
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
+
     // Cancel any pending auto-retry before starting a fresh request.
     if (retryTimerRef.current !== null) {
       window.clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
 
-    setLoading(true);
+    // Only show skeleton when there is nothing to display yet.
+    // If we already have data (from cache or a prior fetch), update silently.
+    if (!hasDataRef.current) setLoading(true);
     setError("");
-    getTemplates()
+    getTemplates({ signal })
       .then((data) => {
+        if (signal.aborted) return;
         // Deduplicate by _id and name — the backend already deduplicates by name,
         // but an extra client-side guard protects against duplicate API calls.
         const seenIds   = new Set<string>();
@@ -487,12 +479,14 @@ export function TemplateGallery() {
           seenNames.add(nameKey);
           return true;
         });
+        hasDataRef.current = true;
         setTemplates(unique);
         setError("");
       })
       .catch((err) => {
+        if (signal.aborted) return;
         const msg = (err as Error).message ?? "Failed to load templates";
-        // On timeout, auto-retry once after 10 s with a friendly message instead of
+        // On timeout, auto-retry once after 3 s with a friendly message instead of
         // showing a hard error and making the user click Retry manually.
         if (msg.includes('timed out')) {
           setError("Server is waking up… retrying in 3 s.");
@@ -505,7 +499,7 @@ export function TemplateGallery() {
           setError(msg);
         }
       })
-      .finally(() => setLoading(false));
+      .finally(() => { if (!signal.aborted) setLoading(false); });
   }, []);
 
   useEffect(() => {
@@ -532,6 +526,7 @@ export function TemplateGallery() {
         window.clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
       }
+      abortControllerRef.current?.abort();
       unsubscribe();
     };
   }, [fetchTemplates]);
@@ -588,9 +583,9 @@ export function TemplateGallery() {
     const effOrient   = dropdownOrientation !== "all" ? dropdownOrientation as OrientationType : orientation;
 
     return list.filter((t) => {
-      if (query.trim()) {
+      if (debouncedQuery.trim()) {
         const hay = [t.templateName, t.category, ...(t.tags ?? []), deriveDisplayCategory(t)].join(" ").toLowerCase();
-        if (!hay.includes(query.trim().toLowerCase())) return false;
+        if (!hay.includes(debouncedQuery.trim().toLowerCase())) return false;
       }
       if (!effCats.includes("all")) {
         if (!effCats.includes(deriveDisplayCategory(t))) return false;
@@ -601,7 +596,7 @@ export function TemplateGallery() {
       if (effOrient !== "all" && deriveOrientation(t) !== effOrient) return false;
       return true;
     });
-  }, [query, selectedCategories, selectedSizes, orientation, dropdownSize, dropdownCategory, dropdownOrientation]);
+  }, [debouncedQuery, selectedCategories, selectedSizes, orientation, dropdownSize, dropdownCategory, dropdownOrientation]);
 
   const tabFiltered = useMemo(() => {
     let list = activeTemplates;
@@ -616,11 +611,11 @@ export function TemplateGallery() {
   const totalPages     = Math.max(1, Math.ceil(tabFiltered.length / ITEMS_PER_PAGE));
   const pagedTemplates = tabFiltered.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE);
 
-  // Reset page on filter change
+  // Reset page on filter change — include debouncedQuery (not raw query) so page only resets after typing stops
   useEffect(() => { setCurrentPage(1); },
-    [query, selectedCategories, selectedSizes, orientation, activeTab, dropdownSize, dropdownCategory, dropdownOrientation]);
+    [debouncedQuery, selectedCategories, selectedSizes, orientation, activeTab, dropdownSize, dropdownCategory, dropdownOrientation]);
 
-  const handleUseTemplate = async (t: TemplateRecord) => {
+  const handleUseTemplate = useCallback(async (t: TemplateRecord) => {
     if (projectId) {
       // Attach mode: clone the global template into the project
       setAttachingTemplateId(t._id);
@@ -635,7 +630,7 @@ export function TemplateGallery() {
           // Non-fatal: attach proceeds with empty designData if fetch fails
         }
         const result = await createTemplate({
-          productId: projectId,
+          projectId: projectId,
           templateName: t.templateName,
           preview_image: resolveTemplatePreview(t, { fallbackToPlaceholder: false }),
           category: (t.category as any) || "Other",
@@ -679,12 +674,13 @@ export function TemplateGallery() {
     navigate(`/designer-studio?templateId=${t._id}`, {
       state: { preloadedTemplate: cachedFull ?? t },
     });
-  };
+  }, [projectId, navigate, setRecentlyUsed]);
 
-  const toggleFavorite = (id: string) =>
-    setFavorites((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+  const toggleFavorite = useCallback((id: string) =>
+    setFavorites((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]),
+  []);
 
-  const handleDuplicate = async (t: TemplateRecord) => {
+  const handleDuplicate = useCallback(async (t: TemplateRecord) => {
     setDuplicatingTemplateId(t._id);
     try {
       const copy = await createTemplate({
@@ -703,7 +699,7 @@ export function TemplateGallery() {
     } finally {
       setDuplicatingTemplateId(null);
     }
-  };
+  }, []);
 
   const handleDeleteConfirm = async () => {
     if (!deleteTarget) return;

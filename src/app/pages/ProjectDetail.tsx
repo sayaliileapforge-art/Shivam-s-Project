@@ -8,6 +8,7 @@ import {
   Filter, MoreHorizontal, UserCircle, FileSpreadsheet, Settings2, Users, GripVertical,
   Crop, Wand2, RotateCcw, ImageIcon, UserPlus, FileDown, Archive, Camera, Loader2,
   QrCode, UserRound, AlertTriangle, Globe, ChevronDown, LayoutGrid,
+  ChevronLeft, ChevronRight, Minus, Maximize2, GitBranch,
 } from "lucide-react";
 import JSZip from "jszip";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -54,7 +55,7 @@ import {
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
-import { createTemplate, getTemplateById, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { createTemplate, getTemplateById, resolveTemplatePreview, getProjectTemplateCacheData, invalidateTemplateCache, setProjectTemplateCacheData, type TemplateRecord } from "../../lib/templateApi";
 import { matchImages } from "../../lib/imageMatchEngine";
 import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
@@ -683,6 +684,9 @@ export function ProjectDetail() {
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [previewForm, setPreviewForm] = useState<PreviewGenerationForm>(emptyPreviewForm);
+  const [previewPageIndex, setPreviewPageIndex] = useState(0);
+  const [previewZoom, setPreviewZoom] = useState(50);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
 
   // Template dialog state
@@ -695,8 +699,16 @@ export function ProjectDetail() {
   const [bgGeneratedPreviews, setBgGeneratedPreviews] = useState<Record<string, string>>({});
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("details");
-  const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>([]);
-  const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(false);
+  const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>(() => {
+    // Serve stale-while-revalidate: show cached data instantly if available
+    if (!id) return [];
+    const cached = getProjectTemplateCacheData(id);
+    return cached ? cached.map(mapApiTemplateToProjectTemplate) : [];
+  });
+  const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(() => {
+    if (!id) return false;
+    return getProjectTemplateCacheData(id) === null;
+  });
   const [remoteTemplatesError, setRemoteTemplatesError] = useState("");
   const [remoteTemplatesVersion, setRemoteTemplatesVersion] = useState(0);
   const [selectedFullTemplate, setSelectedFullTemplate] = useState<TemplateRecord | null>(null);
@@ -742,8 +754,15 @@ export function ProjectDetail() {
       return;
     }
 
+    // Skip fetch if cache is still fresh (version 0 = initial mount with no forced refresh)
+    if (remoteTemplatesVersion === 0 && getProjectTemplateCacheData(id) !== null) {
+      return;
+    }
+
     const requestUrl = `${API_BASE}/templates?projectId=${encodeURIComponent(id)}`;
-    setRemoteTemplatesLoading(true);
+    // Only show skeleton when we have no templates to display yet — avoids
+    // blanking out cached data while a background refresh is in progress.
+    setRemoteTemplatesLoading((prev) => (remoteTemplates.length === 0 ? true : prev));
     setRemoteTemplatesError("");
 
     fetch(requestUrl)
@@ -758,6 +777,9 @@ export function ProjectDetail() {
       })
       .then((items) => {
         if (!mounted) return;
+        // Populate the frontend cache for this project
+        setProjectTemplateCacheData(id, items);
+
         const mapped = items.map(mapApiTemplateToProjectTemplate);
         const deduped = Array.from(new Map(mapped.map((t) => [t.id, t])).values());
         setRemoteTemplates(deduped);
@@ -1262,7 +1284,7 @@ export function ProjectDetail() {
     setIsTemplateSaving(true);
     try {
       const remoteTemplate = await createTemplate({
-        productId: id,
+        projectId: id,
         templateName: localTemplate.templateName,
         preview_image: thumb,
         category: "Other",
@@ -2141,6 +2163,25 @@ export function ProjectDetail() {
     previewForm.cardHeightMm,
   ]);
 
+  // Auto-fit zoom whenever dialog opens or sheet dimensions change
+  useEffect(() => {
+    if (!isGeneratePreviewOpen) return;
+    // Use rAF so the container has been painted and has a measurable size
+    const rafId = requestAnimationFrame(() => {
+      const container = previewContainerRef.current;
+      if (!container) return;
+      const availableW = container.clientWidth - 32; // 16px padding each side
+      if (availableW <= 0) return;
+      // Fit by WIDTH only — the page scrolls vertically like a real document viewer.
+      // This keeps cards large and readable instead of shrinking to fit the full page height.
+      const widthZoom = Math.floor((availableW / printLayout.sheetWidthPx) * 100);
+      // Cap at 100% to avoid over-zooming on wide viewports; floor at 25%
+      const fitZoom = Math.min(widthZoom, 100);
+      setPreviewZoom(Math.max(25, Math.round(fitZoom / 5) * 5));
+    });
+    return () => cancelAnimationFrame(rafId);
+  }, [isGeneratePreviewOpen, printLayout.sheetWidthPx, printLayout.sheetHeightPx]);
+
   const handleOpenGeneratePreview = () => {
     if (!selectedRecords.length) return;
 
@@ -2844,8 +2885,8 @@ export function ProjectDetail() {
               <div className="flex items-center justify-between">
                 <CardTitle>Project Templates</CardTitle>
                 <div className="flex gap-2">
-                  <Button size="sm" variant="outline" className="gap-2" onClick={() => previewTemplates.length > 0 && setPreviewTemplate(previewTemplates[0])} disabled={previewTemplates.length === 0}>
-                    <Download className="h-4 w-4" />Generate Preview
+                  <Button size="sm" variant="outline" className="gap-2" onClick={() => navigate(`/projects/${id}/rule-builder`)}>
+                    <GitBranch className="h-4 w-4" />Rule Builder
                   </Button>
                   <Button size="sm" variant="outline" className="gap-2" onClick={() => navigate(`/template-gallery?projectId=${encodeURIComponent(id ?? "")}`)}>
                     <LayoutGrid className="h-4 w-4" />Open Template Gallery
@@ -3931,483 +3972,428 @@ export function ProjectDetail() {
           <Dialog open={isGeneratePreviewOpen} onOpenChange={(open) => {
             if (isGeneratingPreview) return;
             setIsGeneratePreviewOpen(open);
-            if (!open) setPreviewError("");
+            if (!open) { setPreviewError(""); setPreviewPageIndex(0); }
           }}>
-            <DialogContent className="sm:max-w-[620px]">
-              <DialogHeader>
-                <DialogTitle>Generate Preview</DialogTitle>
+            <DialogContent className="!w-[90vw] !max-w-none !h-[90vh] !p-0 !gap-0 flex flex-col overflow-hidden">
+              {/* ── Header ── */}
+              <DialogHeader className="flex-shrink-0 px-5 py-3 border-b bg-background">
+                <div className="flex items-center gap-3">
+                  <div>
+                    <DialogTitle className="text-base font-semibold leading-tight">Generate Preview</DialogTitle>
+                    <p className="text-xs text-muted-foreground">
+                      {selectedRecords.length} selected record(s)
+                    </p>
+                  </div>
+                </div>
               </DialogHeader>
-              <div className="space-y-4 py-1">
-                <p className="text-sm text-muted-foreground">
-                  Generate preview for {selectedRecords.length} selected record(s).
-                </p>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label>Page size</Label>
-                    <Select
-                      value={previewForm.pageSize}
-                      onValueChange={(value) => {
-                        const size = value as PreviewPageSize;
-                        setPreviewForm((prev) => {
-                          if (size === "Custom") {
-                            return { ...prev, pageSize: size };
-                          }
-                          const dims = PAGE_SIZE_DIMENSIONS[size];
-                          return {
-                            ...prev,
-                            pageSize: size,
-                            sheetWidthMm: String(dims.width),
-                            sheetHeightMm: String(dims.height),
-                          };
-                        });
-                      }}
-                    >
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select page size" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="A4">A4</SelectItem>
-                        <SelectItem value="A3">A3</SelectItem>
-                        <SelectItem value="Letter">Letter</SelectItem>
-                        <SelectItem value="Legal">Legal</SelectItem>
-                        <SelectItem value="Custom">Custom</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
+              {/* ── Body: split layout ── */}
+              <div className="flex flex-1 overflow-hidden min-h-0">
 
-                  <div className="space-y-1.5">
-                    <Label>Select template</Label>
-                    <Select
-                      value={previewForm.templateId || "__none__"}
-                      onValueChange={(value) => {
-                        const selectedTemplate = galleryTemplateOptions.find(
-                          (template) => resolveTemplateLookupId(template) === value || template.id === value
-                        );
-                        const selectedLookupId = selectedTemplate ? resolveTemplateLookupId(selectedTemplate) : value;
-                        setPreviewForm((prev) => ({
-                          ...prev,
-                          templateId: value === "__none__" ? "" : selectedLookupId,
-                          templateType: selectedTemplate?.templateType || prev.templateType,
-                        }));
-                      }}
-                    >
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select a template" />
-                      </SelectTrigger>
-                      <SelectContent className="max-h-[300px]">
-                        <SelectItem value="__none__">Select a template</SelectItem>
-                        {remoteTemplatesLoading ? (
-                          <SelectItem value="__loading__" disabled>
-                            Loading templates...
-                          </SelectItem>
-                        ) : galleryTemplateOptions.length === 0 ? (
-                          <SelectItem value="__empty__" disabled>
-                            No templates available
-                          </SelectItem>
-                        ) : (
-                          galleryTemplateOptions.map((template) => (
-                            <SelectItem key={template.id} value={resolveTemplateLookupId(template)}>
-                              {template.templateName}
-                            </SelectItem>
-                          ))
-                        )}
-                      </SelectContent>
-                    </Select>
-                    {remoteTemplatesError ? (
-                      <p className="text-xs text-destructive mt-1">{remoteTemplatesError}</p>
-                    ) : null}
-                    {!remoteTemplatesLoading && galleryTemplateOptions.length > 0 && (
-                      <p className="text-xs text-muted-foreground mt-1">
-                        {galleryTemplateOptions.length} templates available
-                      </p>
-                    )}
-                  </div>
+                {/* ─────────────── LEFT PANEL (30%) ─────────────── */}
+                <div className="w-[30%] min-w-[270px] flex-shrink-0 flex flex-col border-r overflow-hidden bg-background">
+                  <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
 
-                  {/* Field-based Template Mapping Toggle */}
-                  <div className="sm:col-span-2 space-y-2 p-3 border rounded-lg bg-muted/30">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <Label className="text-sm font-medium cursor-pointer">Use Field-Based Template Assignment</Label>
-                        <Switch
-                          checked={previewForm.useFieldBasedMapping}
-                          onCheckedChange={(checked) =>
-                            setPreviewForm((prev) => ({
-                              ...prev,
-                              useFieldBasedMapping: checked,
-                            }))
-                          }
+                    {/* 1. Output Setup */}
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold flex-shrink-0">1</span>
+                        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Output Setup</h3>
+                      </div>
+                      <div className="space-y-2">
+                        <div className="space-y-1">
+                          <Label className="text-xs">Page Size</Label>
+                          <Select
+                            value={previewForm.pageSize}
+                            onValueChange={(value) => {
+                              const size = value as PreviewPageSize;
+                              setPreviewForm((prev) => {
+                                if (size === "Custom") return { ...prev, pageSize: size };
+                                const dims = PAGE_SIZE_DIMENSIONS[size];
+                                return { ...prev, pageSize: size, sheetWidthMm: String(dims.width), sheetHeightMm: String(dims.height) };
+                              });
+                            }}
+                          >
+                            <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Select page size" /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="A4">A4 (210 × 297 mm)</SelectItem>
+                              <SelectItem value="A3">A3 (297 × 420 mm)</SelectItem>
+                              <SelectItem value="Letter">Letter (216 × 279 mm)</SelectItem>
+                              <SelectItem value="Legal">Legal (216 × 356 mm)</SelectItem>
+                              <SelectItem value="Custom">Custom</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Orientation</Label>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <Button
+                              type="button"
+                              variant={previewForm.orientation === "portrait" ? "default" : "outline"}
+                              className="h-7 text-xs"
+                              onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
+                            >
+                              Portrait
+                            </Button>
+                            <Button
+                              type="button"
+                              variant={previewForm.orientation === "landscape" ? "default" : "outline"}
+                              className="h-7 text-xs"
+                              onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
+                            >
+                              Landscape
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="h-px bg-border" />
+
+                    {/* 2. PDF Settings */}
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold flex-shrink-0">2</span>
+                        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">PDF Settings</h3>
+                      </div>
+
+                      {/* Page Settings card */}
+                      <div className="rounded-md border bg-card p-3 space-y-2">
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-5 h-5 rounded bg-blue-100 dark:bg-blue-950 flex items-center justify-center flex-shrink-0">
+                            <FileText className="h-2.5 w-2.5 text-blue-600 dark:text-blue-400" />
+                          </div>
+                          <span className="text-xs font-medium">Page Settings</span>
+                          <span className="ml-auto text-[10px] text-muted-foreground">{previewForm.sheetWidthMm}×{previewForm.sheetHeightMm} mm</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="space-y-1">
+                            <Label className="text-[10px] text-muted-foreground">Size (mm)</Label>
+                            <div className="flex gap-1">
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">W</Label>
+                                <Input type="number" value={previewForm.sheetWidthMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">H</Label>
+                                <Input type="number" value={previewForm.sheetHeightMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                            </div>
+                          </div>
+                          <div className="space-y-1">
+                            <Label className="text-[10px] text-muted-foreground">Margins (mm)</Label>
+                            <div className="flex gap-1">
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">H</Label>
+                                <Input type="number" value={previewForm.pageMarginLeftMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">V</Label>
+                                <Input type="number" value={previewForm.pageMarginTopMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Card Settings card */}
+                      <div className="rounded-md border bg-card p-3 space-y-2">
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-5 h-5 rounded bg-emerald-100 dark:bg-emerald-950 flex items-center justify-center flex-shrink-0">
+                            <LayoutGrid className="h-2.5 w-2.5 text-emerald-600 dark:text-emerald-400" />
+                          </div>
+                          <span className="text-xs font-medium">Card Settings</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="space-y-1">
+                            <Label className="text-[10px] text-muted-foreground">Card Size (mm)</Label>
+                            <div className="flex gap-1">
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">W</Label>
+                                <Input type="number" value={previewForm.cardWidthMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, cardWidthMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">H</Label>
+                                <Input type="number" value={previewForm.cardHeightMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, cardHeightMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                            </div>
+                          </div>
+                          <div className="space-y-1">
+                            <Label className="text-[10px] text-muted-foreground">Gap (mm)</Label>
+                            <div className="flex gap-1">
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">H</Label>
+                                <Input type="number" value={previewForm.columnMarginMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                              <div className="flex-1">
+                                <Label className="text-[9px] text-muted-foreground">V</Label>
+                                <Input type="number" value={previewForm.rowMarginMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Summary Stats — 2×2 compact grid */}
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <div className="rounded-md border bg-muted/30 px-2 py-1.5 text-center">
+                          <p className="text-[9px] text-muted-foreground uppercase tracking-wide">Fits/page</p>
+                          <p className="text-xs font-bold">{printLayout.columns}×{printLayout.rows}</p>
+                        </div>
+                        <div className="rounded-md border bg-muted/30 px-2 py-1.5 text-center">
+                          <p className="text-[9px] text-muted-foreground uppercase tracking-wide">Cards</p>
+                          <p className="text-xs font-bold">{printLayout.cardsPerPage}</p>
+                        </div>
+                        <div className="rounded-md border bg-muted/30 px-2 py-1.5 text-center">
+                          <p className="text-[9px] text-muted-foreground uppercase tracking-wide">Pages</p>
+                          <p className="text-xs font-bold">{Math.ceil(selectedRecords.length / printLayout.cardsPerPage)}</p>
+                        </div>
+                        <div className="rounded-md border bg-muted/30 px-2 py-1.5 text-center">
+                          <p className="text-[9px] text-muted-foreground uppercase tracking-wide">Records</p>
+                          <p className="text-xs font-bold">{selectedRecords.length}</p>
+                        </div>
+                      </div>
+
+                    </div>
+
+                    <div className="h-px bg-border" />
+
+                    {/* 3. File */}
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold flex-shrink-0">3</span>
+                        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">File</h3>
+                      </div>
+                      <div className="space-y-1">
+                        <Label className="text-xs">Output File Name</Label>
+                        <Input
+                          value={previewForm.fileName}
+                          onChange={(e) => setPreviewForm((prev) => ({ ...prev, fileName: e.target.value }))}
+                          placeholder="Enter file name"
+                          className="h-8 text-xs"
                         />
                       </div>
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      Assign different templates based on data field values (e.g., Section A → Template 1, Section B → Template 2).
-                      <span className="block mt-1">
-                        Non-matching records use the main selected template by default.
-                      </span>
-                    </p>
-                  </div>
 
-                  {/* Field-based Mapping Configuration */}
-                  {previewForm.useFieldBasedMapping && (
-                    <div className="sm:col-span-2 space-y-3 p-3 border rounded-lg">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-sm font-medium">Template Mappings</Label>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-7 text-xs gap-1"
-                          onClick={() => {
-                            const newMapping: TemplateMappingRule = {
-                              id: `mapping-${Date.now()}`,
-                              fieldName: "",
-                              fieldValue: "",
-                              templateId: "",
-                            };
-                            setPreviewForm((prev) => ({
-                              ...prev,
-                              templateMappings: [...prev.templateMappings, newMapping],
-                            }));
-                          }}
-                        >
-                          <Plus className="h-3 w-3" /> Add Mapping
-                        </Button>
+                    {previewError && (
+                      <p className="text-xs text-destructive">{previewError}</p>
+                    )}
+
+                  </div>{/* end scrollable */}
+
+                  {/* Sticky action buttons */}
+                  <div className="border-t px-4 py-3 flex gap-2 flex-shrink-0 bg-background">
+                    <Button
+                      variant="outline"
+                      className="flex-1 h-9 text-sm"
+                      disabled={isGeneratingPreview}
+                      onClick={() => setIsGeneratePreviewOpen(false)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      className="flex-1 h-9 text-sm gap-1.5"
+                      disabled={isGeneratingPreview}
+                      onClick={() => void handleGeneratePreviewPdf()}
+                    >
+                      {isGeneratingPreview
+                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        : <Download className="h-3.5 w-3.5" />}
+                      Generate
+                    </Button>
+                  </div>
+                </div>{/* end left panel */}
+
+                {/* ─────────────── RIGHT PANEL (70%) ─────────────── */}
+                {(() => {
+                  const totalPreviewPages = Math.max(1, Math.ceil(selectedRecords.length / printLayout.cardsPerPage));
+                  const safePageIndex = Math.min(previewPageIndex, totalPreviewPages - 1);
+                  const pageRecords = selectedRecords.slice(
+                    safePageIndex * printLayout.cardsPerPage,
+                    (safePageIndex + 1) * printLayout.cardsPerPage
+                  );
+                  return (
+                    <div className="flex-1 flex flex-col overflow-hidden">
+
+                      {/* Preview toolbar */}
+                      <div className="flex items-center justify-between px-5 py-2.5 border-b bg-background flex-shrink-0">
+                        <span className="text-sm font-semibold">Live Preview</span>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8"
+                            onClick={() => setPreviewZoom((z) => Math.max(25, z - 25))}
+                            disabled={previewZoom <= 25}
+                          >
+                            <Minus className="h-3.5 w-3.5" />
+                          </Button>
+                          <span className="text-sm font-mono min-w-[3.5rem] text-center select-none tabular-nums">
+                            {previewZoom}%
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8"
+                            onClick={() => setPreviewZoom((z) => Math.min(200, z + 25))}
+                            disabled={previewZoom >= 200}
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </Button>
+                          <div className="w-px h-5 bg-border mx-1.5" />
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 text-xs gap-1.5"
+                            onClick={() => {
+                              const container = previewContainerRef.current;
+                              if (!container) { setPreviewZoom(90); return; }
+                              const w = container.clientWidth - 32;
+                              const wz = Math.floor((w / printLayout.sheetWidthPx) * 100);
+                              setPreviewZoom(Math.max(25, Math.round(Math.min(wz, 100) / 5) * 5));
+                            }}
+                          >
+                            <Maximize2 className="h-3.5 w-3.5" />
+                            Fit
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 text-xs gap-1.5"
+                            onClick={() => setPreviewZoom(100)}
+                          >
+                            <LayoutGrid className="h-3.5 w-3.5" />
+                            Grid
+                          </Button>
+                        </div>
                       </div>
 
-                      {previewForm.templateMappings.length === 0 ? (
-                        <p className="text-xs text-muted-foreground italic">No mappings added yet. Click "Add Mapping" to start.</p>
-                      ) : (
-                        <div className="space-y-2">
-                          {previewForm.templateMappings.map((mapping, idx) => (
-                            <div key={mapping.id} className="flex items-end gap-2 p-2 border rounded bg-background">
-                              <div className="flex-1 space-y-1">
-                                <Label className="text-xs">Field</Label>
-                                <Select
-                                  value={mapping.fieldName}
-                                  onValueChange={(value) => {
-                                    setPreviewForm((prev) => ({
-                                      ...prev,
-                                      templateMappings: prev.templateMappings.map((m) =>
-                                        m.id === mapping.id ? { ...m, fieldName: value } : m
-                                      ),
-                                    }));
-                                  }}
-                                >
-                                  <SelectTrigger className="h-8 text-xs">
-                                    <SelectValue placeholder="Select field" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    {dataFields.map((field) => (
-                                      <SelectItem key={field.key} value={field.key}>
-                                        {field.label}
-                                      </SelectItem>
-                                    ))}
-                                  </SelectContent>
-                                </Select>
-                              </div>
+                      {/* Thumbnails + main preview */}
+                      <div className="flex flex-1 overflow-hidden min-h-0">
 
-                              <div className="flex-1 space-y-1">
-                                <Label className="text-xs">Value</Label>
-                                <Input
-                                  type="text"
-                                  value={mapping.fieldValue}
-                                  onChange={(e) => {
-                                    setPreviewForm((prev) => ({
-                                      ...prev,
-                                      templateMappings: prev.templateMappings.map((m) =>
-                                        m.id === mapping.id ? { ...m, fieldValue: e.target.value } : m
-                                      ),
-                                    }));
-                                  }}
-                                  placeholder="e.g., 'A' or 'Class 10A'"
-                                  className="h-8 text-xs"
-                                />
-                              </div>
-
-                              <div className="flex-1 space-y-1">
-                                <Label className="text-xs">Template</Label>
-                                <Select
-                                  value={mapping.templateId}
-                                  onValueChange={(value) => {
-                                    const selectedTemplate = galleryTemplateOptions.find((template) => resolveTemplateLookupId(template) === value || template.id === value);
-                                    const selectedLookupId = selectedTemplate ? resolveTemplateLookupId(selectedTemplate) : value;
-                                    setPreviewForm((prev) => ({
-                                      ...prev,
-                                      templateMappings: prev.templateMappings.map((m) =>
-                                        m.id === mapping.id ? { ...m, templateId: selectedLookupId } : m
-                                      ),
-                                    }));
-                                  }}
-                                >
-                                  <SelectTrigger className="h-8 text-xs">
-                                    <SelectValue placeholder="Select template" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    {galleryTemplateOptions.map((template) => (
-                                      <SelectItem key={template.id} value={resolveTemplateLookupId(template)}>
-                                        <span className="truncate text-xs">{template.templateName}</span>
-                                      </SelectItem>
-                                    ))}
-                                  </SelectContent>
-                                </Select>
-                              </div>
-
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8 text-destructive hover:text-destructive"
-                                onClick={() => {
-                                  setPreviewForm((prev) => ({
-                                    ...prev,
-                                    templateMappings: prev.templateMappings.filter((m) => m.id !== mapping.id),
-                                  }));
-                                }}
+                        {/* Page thumbnails sidebar */}
+                        <div className="w-[100px] border-r bg-muted/40 overflow-y-auto py-2.5 px-2 flex flex-col gap-2 flex-shrink-0">
+                          {Array.from({ length: totalPreviewPages }, (_, i) => (
+                            <button
+                              key={i}
+                              type="button"
+                              onClick={() => setPreviewPageIndex(i)}
+                              title={`Page ${i + 1}`}
+                              className={`w-full rounded-md overflow-hidden border-2 transition-all ${
+                                safePageIndex === i
+                                  ? "border-primary ring-1 ring-primary/30 bg-primary/5"
+                                  : "border-transparent hover:border-muted-foreground/30 hover:bg-background/80"
+                              }`}
+                            >
+                              <div
+                                className={`w-full flex items-center justify-center text-[9px] font-semibold bg-white shadow-sm ${
+                                  safePageIndex === i ? "text-primary" : "text-muted-foreground"
+                                }`}
+                                style={{ aspectRatio: `${previewForm.sheetWidthMm} / ${previewForm.sheetHeightMm}` }}
                               >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </Button>
-                            </div>
+                                {i + 1}
+                              </div>
+                            </button>
                           ))}
                         </div>
-                      )}
 
-                      <div className="pt-2 border-t space-y-1.5">
-                        <Label className="text-xs font-medium">Fallback Template</Label>
-                        <p className="text-xs text-muted-foreground">
-                          Used for records that don't match any mapping rules
-                        </p>
-                        <Select
-                          value={previewForm.fallbackTemplateId || "__none__"}
-                          onValueChange={(value) => {
-                            const selectedTemplate = galleryTemplateOptions.find((template) => resolveTemplateLookupId(template) === value || template.id === value);
-                            const selectedLookupId = selectedTemplate ? resolveTemplateLookupId(selectedTemplate) : value;
-                            setPreviewForm((prev) => ({
-                              ...prev,
-                              fallbackTemplateId: value === "__none__" ? "" : selectedLookupId,
-                            }));
-                          }}
+                        {/* Main preview area */}
+                        <div
+                          ref={previewContainerRef}
+                          className="flex-1 overflow-auto bg-slate-100/80 dark:bg-slate-900/40 flex items-start justify-center"
+                          style={{ padding: "16px" }}
                         >
-                          <SelectTrigger className="h-8 text-xs">
-                            <SelectValue placeholder="Select fallback template" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="__none__">Select a template</SelectItem>
-                            {galleryTemplateOptions.map((template) => (
-                              <SelectItem key={template.id} value={resolveTemplateLookupId(template)}>
-                                <span className="truncate text-xs">{template.templateName}</span>
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                    </div>
-                  )}
+                          {!selectedGenerateTemplate ? (
+                            <div className="flex flex-col items-center justify-center h-full min-h-[300px] text-center gap-3 w-full">
+                              <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center">
+                                <FileText className="h-5 w-5 text-muted-foreground" />
+                              </div>
+                              <p className="text-sm text-muted-foreground">Select a template to see preview</p>
+                            </div>
+                          ) : selectedFullTemplateLoading ? (
+                            <div className="flex flex-col items-center justify-center h-full min-h-[300px] gap-3 w-full">
+                              <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                              <p className="text-sm text-muted-foreground">Loading template design…</p>
+                            </div>
+                          ) : (
+                            /* Outer div matches the visual (scaled) size so layout flow is correct */
+                            <div
+                              style={{
+                                width: `${printLayout.sheetWidthPx * previewZoom / 100}px`,
+                                height: `${printLayout.sheetHeightPx * previewZoom / 100}px`,
+                                flexShrink: 0,
+                                position: "relative",
+                              }}
+                            >
+                              {/* Inner div applies the CSS transform from top-left origin */}
+                              <div
+                                style={{
+                                  transform: `scale(${previewZoom / 100})`,
+                                  transformOrigin: "top left",
+                                  position: "absolute",
+                                  top: 0,
+                                  left: 0,
+                                  width: `${printLayout.sheetWidthPx}px`,
+                                  height: `${printLayout.sheetHeightPx}px`,
+                                }}
+                              >
+                                <div
+                                  className="bg-white shadow-2xl"
+                                  style={{
+                                    width: `${printLayout.sheetWidthPx}px`,
+                                    minHeight: `${printLayout.sheetHeightPx}px`,
+                                    padding: `${printLayout.marginTopPx}px ${printLayout.marginLeftPx}px`,
+                                    boxSizing: "border-box",
+                                  }}
+                                >
+                                  <IdCardGrid
+                                    students={pageRecords}
+                                    template={selectedGenerateTemplate}
+                                    containerClassName="p-0"
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
 
-                  <div className="sm:col-span-2 space-y-1.5">
-                    <Label>Rendered template preview</Label>
-                    {selectedFullTemplateLoading ? (
-                      <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
-                        <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                        Loading template design...
-                      </div>
-                    ) : previewForm.useFieldBasedMapping && selectedRecords.length > 0 ? (
-                      <div className="space-y-2">
-                        <IdCardGrid students={selectedRecords.slice(0, 1)} template={enrichTemplateWithCanvas(getTemplateForRecord(selectedRecords[0]))} />
+                      </div>{/* end thumbnails + main */}
+
+                      {/* Pagination footer */}
+                      <div className="border-t bg-background px-5 py-2.5 flex items-center justify-between flex-shrink-0">
                         <p className="text-xs text-muted-foreground">
-                          Showing first record with its mapped template. PDF will apply field-based templates to all {selectedRecords.length} record(s).
+                          {totalPreviewPages} pages &bull; {selectedRecords.length} records
                         </p>
+                        <div className="flex items-center gap-1.5">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            disabled={safePageIndex <= 0}
+                            onClick={() => setPreviewPageIndex((p) => Math.max(0, p - 1))}
+                          >
+                            <ChevronLeft className="h-4 w-4" />
+                          </Button>
+                          <span className="text-sm font-medium min-w-[110px] text-center tabular-nums">
+                            Page {safePageIndex + 1} of {totalPreviewPages}
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            disabled={safePageIndex >= totalPreviewPages - 1}
+                            onClick={() => setPreviewPageIndex((p) => Math.min(totalPreviewPages - 1, p + 1))}
+                          >
+                            <ChevronRight className="h-4 w-4" />
+                          </Button>
+                        </div>
                       </div>
-                    ) : !selectedGenerateTemplate ? (
-                      <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
-                        Select a template to see preview
-                      </div>
-                    ) : (
-                      <>
-                        <IdCardGrid students={selectedRecords.slice(0, 1)} template={selectedGenerateTemplate} />
-                        {selectedRecords.length > 1 && (
-                          <p className="text-xs text-muted-foreground mt-1">
-                            Showing 1 of {selectedRecords.length} student(s). PDF will include all.
-                          </p>
-                        )}
-                      </>
-                    )}
-                  </div>
 
-                  {selectedGenerateTemplateDiagnostics?.fallbackMessage && (
-                    <div className="sm:col-span-2">
-                      <p className="text-xs text-destructive">
-                        {selectedGenerateTemplateDiagnostics.fallbackMessage}
-                      </p>
                     </div>
-                  )}
+                  );
+                })()}
 
-                  <div className="space-y-1.5">
-                    <Label>Orientation</Label>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        type="button"
-                        variant={previewForm.orientation === "portrait" ? "default" : "outline"}
-                        className="h-9 flex-1"
-                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
-                      >
-                        Portrait
-                      </Button>
-                      <Button
-                        type="button"
-                        variant={previewForm.orientation === "landscape" ? "default" : "outline"}
-                        className="h-9 flex-1"
-                        onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
-                      >
-                        Landscape
-                      </Button>
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <Label>Template type</Label>
-                    <Select
-                      value={previewForm.templateType}
-                      onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, templateType: value as ProjectTemplate["templateType"] }))}
-                    >
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select template type" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="id_card">ID Card</SelectItem>
-                        <SelectItem value="certificate">Certificate</SelectItem>
-                        <SelectItem value="poster">Poster</SelectItem>
-                        <SelectItem value="custom">Custom</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <Label>Is sample</Label>
-                    <Select value={previewForm.isSample} onValueChange={(value) => setPreviewForm((prev) => ({ ...prev, isSample: value as "yes" | "no" }))}>
-                      <SelectTrigger className="h-9">
-                        <SelectValue placeholder="Select" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="yes">Yes</SelectItem>
-                        <SelectItem value="no">No</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-
-                  <div className="space-y-1.5 sm:col-span-2">
-                    <Label>File name</Label>
-                    <Input
-                      value={previewForm.fileName}
-                      onChange={(event) => setPreviewForm((prev) => ({ ...prev, fileName: event.target.value }))}
-                      placeholder="Enter file name"
-                      className="h-9"
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-1 pt-1">
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Page Size</p>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    <div className="space-y-1.5">
-                      <Label>Page width (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.sheetWidthMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Page height (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.sheetHeightMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Page margin horizontal (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.pageMarginLeftMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginLeftMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Page margin vertical (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.pageMarginTopMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, pageMarginTopMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="space-y-1 pt-1">
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Card Size</p>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    <div className="space-y-1.5">
-                      <Label>Card width (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.cardWidthMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, cardWidthMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Card height (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.cardHeightMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, cardHeightMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Card margin horizontal (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.columnMarginMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, columnMarginMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>Card margin vertical (mm)</Label>
-                      <Input
-                        type="number"
-                        value={previewForm.rowMarginMm}
-                        onChange={(event) => setPreviewForm((prev) => ({ ...prev, rowMarginMm: event.target.value }))}
-                        className="h-9"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                {previewError && (
-                  <p className="text-sm text-destructive">{previewError}</p>
-                )}
-              </div>
-              <div className="flex gap-3 pt-1">
-                <Button
-                  variant="outline"
-                  className="flex-1"
-                  disabled={isGeneratingPreview}
-                  onClick={() => setIsGeneratePreviewOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button className="flex-1 gap-1.5" disabled={isGeneratingPreview} onClick={() => void handleGeneratePreviewPdf()}>
-                  {isGeneratingPreview
-                    ? <Loader2 className="h-4 w-4 animate-spin" />
-                    : <Download className="h-4 w-4" />}
-                  Generate preview
-                </Button>
-              </div>
+              </div>{/* end body split */}
             </DialogContent>
           </Dialog>
 

@@ -1,5 +1,6 @@
-import 'dotenv/config';
+﻿import 'dotenv/config';
 import express from 'express';
+import compression from 'compression';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
@@ -49,6 +50,7 @@ const allowedOrigins = new Set([
 ]);
 
 // Middleware
+app.use(compression());
 const apiCorsMiddleware = cors({
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.has(origin)) {
@@ -63,7 +65,7 @@ app.use('/api', apiCorsMiddleware);
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-// Serve uploads from backend/public/uploads/ — consistent with uploads route.
+// Serve uploads from backend/public/uploads/ â€” consistent with uploads route.
 // UPLOADS_DIR env var lets VPS deployments point to a persistent directory that
 // survives redeploys and container restarts (e.g. /var/data/uploads or a mounted volume).
 const uploadsDir = process.env.UPLOADS_DIR?.trim()
@@ -133,8 +135,8 @@ app.use('/api/realtime', realtimeRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/imports', importsRoutes);
 
-// Bull Board queue monitoring dashboard — http://localhost:5000/admin/queues
-// ⚠️  Protect with auth middleware in production.
+// Bull Board queue monitoring dashboard â€” http://localhost:5000/admin/queues
+// âš ï¸  Protect with auth middleware in production.
 app.use('/admin/queues', bullBoardRouter);
 
 // API 404 handler
@@ -175,14 +177,14 @@ async function startServer() {
     // exist), but subsequent starts are instant (indexes already exist).
     try {
       await ProductTemplate.createIndexes();
-      console.log('✓ ProductTemplate indexes ready');
+      console.log('âœ“ ProductTemplate indexes ready');
     } catch (idxErr) {
       console.warn('! Index creation failed (non-fatal):', (idxErr as Error).message);
     }
 
     // --- AUTO SEED LOGIC: Insert default templates if none exist ---
     const templateCount = await ProductTemplate.countDocuments();
-    console.log(`✓ ProductTemplate count: ${templateCount}`);
+    console.log(`âœ“ ProductTemplate count: ${templateCount}`);
     if (templateCount === 0) {
       await ProductTemplate.insertMany([
         {
@@ -194,25 +196,26 @@ async function startServer() {
           tags: ['default'],
         }
       ]);
-      console.log('✓ Seeded default ProductTemplate');
+      console.log('âœ“ Seeded default ProductTemplate');
     }
 
-    // --- MIGRATION: promote root templates (no projectId) to isGlobal=true ---
-    // This ensures the Gallery shows all templates that aren't scoped to a specific project.
-    // Safe to run on every startup — only updates documents that need it.
+    // --- MIGRATION: promote TRUE orphan templates (no owner at all) to isGlobal=true ---
+    // Only templates with NEITHER productId NOR projectId are true gallery templates.
+    // Templates with productId set are project-scoped (productId was used as project ref
+    // in older code) and must NOT be promoted to global automatically.
     try {
       const promoted = await ProductTemplate.updateMany(
-        { projectId: null, isGlobal: { $ne: true } },
+        { productId: null, projectId: null, isGlobal: { $ne: true } },
         { $set: { isGlobal: true } },
       );
       if (promoted.modifiedCount > 0) {
-        console.log(`✓ Promoted ${promoted.modifiedCount} root template(s) to isGlobal=true`);
+        console.log(`âœ“ Promoted ${promoted.modifiedCount} orphan template(s) to isGlobal=true`);
       }
     } catch (migErr) {
-      console.warn('! Could not promote root templates to global (non-fatal):', (migErr as Error).message);
+      console.warn('! Could not promote orphan templates to global (non-fatal):', (migErr as Error).message);
     }
 
-    // Kick off gallery cache warmup in the background — it runs the slow Atlas document
+    // Kick off gallery cache warmup in the background â€” it runs the slow Atlas document
     // read after the server is already accepting traffic (non-blocking startup).
     // The first gallery request may still be slow if it arrives before the warmup finishes,
     // but the amber-banner + auto-retry in the frontend handles that gracefully.
@@ -221,7 +224,7 @@ async function startServer() {
       if (typeof warmGalleryCache === 'function') {
         warmGalleryCache().catch(() => {});
       } else {
-        console.warn('! warmGalleryCache not yet available — gallery cache will be warmed on next request.');
+        console.warn('! warmGalleryCache not yet available â€” gallery cache will be warmed on next request.');
       }
     });
 
@@ -233,7 +236,7 @@ async function startServer() {
         const totalTemplates = await ProductTemplate.countDocuments();
         const existingMetaCount = await TemplateGalleryMeta.countDocuments();
         if (existingMetaCount >= totalTemplates) {
-          console.log(`✓ TemplateGalleryMeta already populated (${existingMetaCount} records)`);
+          console.log(`âœ“ TemplateGalleryMeta already populated (${existingMetaCount} records)`);
           return;
         }
         console.log(`[migration] Populating TemplateGalleryMeta (${existingMetaCount}/${totalTemplates} done)...`);
@@ -265,12 +268,12 @@ async function startServer() {
               { upsert: true, new: false }
             );
             upserted++;
-            console.log(`[migration] ✓ [${upserted}/${totalTemplates}] ${t.templateName}`);
+            console.log(`[migration] âœ“ [${upserted}/${totalTemplates}] ${t.templateName}`);
           } catch (docErr) {
-            console.warn(`[migration] ✗ ${t.templateName}: ${(docErr as Error).message}`);
+            console.warn(`[migration] âœ— ${t.templateName}: ${(docErr as Error).message}`);
           }
         }
-        console.log(`✓ TemplateGalleryMeta migration done: ${upserted}/${totalTemplates} upserted`);
+        console.log(`âœ“ TemplateGalleryMeta migration done: ${upserted}/${totalTemplates} upserted`);
       } catch (migErr) {
         console.warn('! TemplateGalleryMeta migration failed (non-fatal):', (migErr as Error).message);
       }
@@ -282,20 +285,20 @@ async function startServer() {
       console.warn('! PostgreSQL auth config not found. Auth endpoints require PostgreSQL configuration.');
     }
     app.listen(PORT, () => {
-      console.log(`\n✓ Backend server running on http://localhost:${PORT}`);
+      console.log(`\nâœ“ Backend server running on http://localhost:${PORT}`);
       if (hasPostgresConfig()) {
-        console.log('✓ PostgreSQL auth database connected successfully');
+        console.log('âœ“ PostgreSQL auth database connected successfully');
       }
-      console.log(`✓ Serving uploads from: ${uploadsDir}`);
-      console.log(`✓ Serving images from: ${uploadsDir}`);
+      console.log(`âœ“ Serving uploads from: ${uploadsDir}`);
+      console.log(`âœ“ Serving images from: ${uploadsDir}`);
       if (fs.existsSync(frontendIndexPath)) {
-        console.log(`✓ Serving frontend build from: ${frontendDistDir}`);
+        console.log(`âœ“ Serving frontend build from: ${frontendDistDir}`);
       }
       if (studentPhotosDir && fs.existsSync(path.resolve(studentPhotosDir))) {
-        console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
+        console.log(`âœ“ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
       }
-      console.log(`✓ Uploads URL base: http://localhost:${PORT}/uploads/`);
-      console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n  - /api/auth\n  - /api/preview\n`);
+      console.log(`âœ“ Uploads URL base: http://localhost:${PORT}/uploads/`);
+      console.log(`âœ“ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n  - /api/auth\n  - /api/preview\n`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);

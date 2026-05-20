@@ -124,6 +124,32 @@ export async function deleteRule(ruleId: string): Promise<void> {
   await handleResponse<void>(res);
 }
 
+// ─── Project Rule Session ─────────────────────────────────────────────────────
+
+export interface CsvFieldMeta {
+  key: string;
+  label: string;
+  type: 'text' | 'image' | 'barcode';
+}
+
+export interface ProjectRuleSession {
+  rules: PrintRule[];
+  csvRows: Record<string, string>[];
+  csvMeta: {
+    fileName: string;
+    totalRecords: number;
+    lastUpdated: string;
+    fields: CsvFieldMeta[];
+  } | null;
+}
+
+export async function getProjectRuleSession(projectId: string): Promise<ProjectRuleSession> {
+  const res = await fetch(`${RULES_BASE}/session/${encodeURIComponent(projectId)}`, {
+    cache: 'no-store',
+  });
+  return handleResponse<ProjectRuleSession>(res);
+}
+
 // ─── Condition evaluation (runs in the browser against CSV rows) ──────────────
 
 export function evaluateCondition(condition: Condition, row: Record<string, string>): boolean {

@@ -60,6 +60,7 @@ export function Layout() {
     return location.pathname.startsWith(pathname);
   };
   const isDesignerRoute = location.pathname.startsWith("/designer-studio");
+  const isFullScreenWorkflow = isDesignerRoute || location.pathname.includes("/rule-builder");
 
   const toggleDarkMode = () => {
     setDarkMode(!darkMode);
@@ -222,9 +223,9 @@ export function Layout() {
             }
           }
         `}</style>
-        <div data-sidebar-main="true">
+        <div data-sidebar-main="true" className={isFullScreenWorkflow ? "flex flex-col h-screen overflow-hidden" : ""}>
           {/* Top Bar */}
-        <header className="sticky top-0 z-40 border-b bg-card px-4 py-3 shadow-sm lg:px-6">
+        <header className={`border-b bg-card px-4 py-3 shadow-sm lg:px-6 ${isFullScreenWorkflow ? "flex-shrink-0 z-40" : "sticky top-0 z-40"}`}>
           <div className="flex flex-wrap items-center justify-between gap-3">
             {/* Left Section: mobile menu + search */}
             <div className="flex w-full items-center gap-3 lg:w-auto lg:flex-1">
@@ -343,7 +344,7 @@ export function Layout() {
         </header>
 
         {/* Page Content */}
-        <main className={isDesignerRoute ? "h-[calc(100vh-4rem)] overflow-hidden" : "p-4 lg:p-6"}>
+        <main className={isFullScreenWorkflow ? "flex-1 flex flex-col overflow-hidden min-h-0 p-0" : "p-4 lg:p-6"}>
           <Outlet />
         </main>
         </div>

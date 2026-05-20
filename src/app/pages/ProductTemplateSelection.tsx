@@ -14,7 +14,7 @@ import {
   DialogTitle,
 } from '../components/ui/dialog';
 import { fetchProductById } from '../../lib/productApi';
-import { getTemplatesByProductId, resolveTemplatePreview, saveSelectedTemplate, type TemplateRecord } from '../../lib/templateApi';
+import { getTemplatesByProductId, getProjectTemplateCacheData, setProjectTemplateCacheData, resolveTemplatePreview, saveSelectedTemplate, type TemplateRecord } from '../../lib/templateApi';
 import { useRbac } from '../../lib/rbac';
 import type { Product } from '../../lib/productStore';
 
@@ -43,7 +43,10 @@ export function ProductTemplateSelection() {
   const { user } = useRbac();
 
   const [product, setProduct] = useState<Product | null>(null);
-  const [templates, setTemplates] = useState<TemplateRecord[]>([]);
+  const [templates, setTemplates] = useState<TemplateRecord[]>(() => {
+    // Render immediately from cache if available — skips skeleton entirely
+    return productId ? (getProjectTemplateCacheData(productId) ?? []) : [];
+  });
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState<string>('All');
   const [favorites, setFavorites] = useState<string[]>(() => readIds(FAVORITE_KEY));
@@ -51,11 +54,25 @@ export function ProductTemplateSelection() {
   const [page, setPage] = useState(1);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [selectionDialogOpen, setSelectionDialogOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => !productId || getProjectTemplateCacheData(productId) === null);
   const [error, setError] = useState<string>('');
 
   useEffect(() => {
     if (!productId) return;
+    // Skip fetch if we already have valid cached data
+    if (getProjectTemplateCacheData(productId) !== null) {
+      // Kick off a background refresh without showing skeleton
+      setError('');
+      Promise.all([
+        fetchProductById(productId),
+        getTemplatesByProductId(productId),
+      ]).then(([productData, templateData]) => {
+        setProduct(productData);
+        setTemplates(templateData);
+        setProjectTemplateCacheData(productId, templateData);
+      }).catch(() => { /* silent background refresh failure */ });
+      return;
+    }
     setLoading(true);
     setError('');
 
@@ -66,6 +83,7 @@ export function ProductTemplateSelection() {
       .then(([productData, templateData]) => {
         setProduct(productData);
         setTemplates(templateData);
+        setProjectTemplateCacheData(productId, templateData);
       })
       .catch((err) => {
         setError((err as Error).message || 'Failed to load templates');
