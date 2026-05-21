@@ -266,9 +266,9 @@ export function mapRowToRecord(
 
   for (const field of fields) {
     // Photos are set exclusively via bulk photo upload — never imported from CSV.
-    // Skipping here ensures a bare filename or URL in a "Photo" / "Image" column
-    // cannot resolve to an existing file on disk and silently show a photo.
-    if (field.key === 'photo') continue;
+    // Also block "link" which is a generic URL column that many school CSVs use
+    // to store external photo URLs (e.g. edumid.com image links).
+    if (field.key === 'photo' || field.key === 'link') continue;
 
     const mappedColumn = mapping[field.key];
     if (!isMappedColumn(mappedColumn)) continue;

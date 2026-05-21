@@ -530,22 +530,21 @@ const mapApiProjectToUi = (p: any) => {
 };
 
 const getRecordPhoto = (rec: ProjectDataRecord): string => {
+  // Only look at standard photo-specific fields.
+  // Do NOT fall back to generic fields like rec.link — those are URL fields
+  // that may contain non-photo URLs (social links, external refs, etc.)
+  // and must not be auto-displayed as student photos.
   const candidate =
     rec.profilePic
     ?? rec.profilepic
-    ?? rec.link
     ?? rec.photoUrl
     ?? rec.photo_url
     ?? rec.imageUrl
     ?? rec.image_url
     ?? rec.photo
     ?? rec.Photo
-    ?? rec.image
-    ?? rec.Image
     ?? rec.avatar
-    ?? rec.Avatar
-    ?? rec.picture
-    ?? rec.Picture;
+    ?? rec.Avatar;
   return typeof candidate === "string" ? candidate : "";
 };
 
@@ -1473,7 +1472,7 @@ export function ProjectDetail() {
         headers.forEach((h, idx) => {
           // Never import the photo field from CSV — photos are set only via bulk upload.
           const normalizedKey = h.toLowerCase().replace(/[\s_-]/g, '');
-          const isPhotoKey = ['photo', 'image', 'picture', 'profilepic', 'avatar', 'profilepicture', 'profileimage', 'studentphoto', 'photourl', 'imageurl', 'pictureurl'].includes(normalizedKey);
+          const isPhotoKey = ['photo', 'link', 'image', 'picture', 'profilepic', 'avatar', 'profilepicture', 'profileimage', 'studentphoto', 'photourl', 'imageurl', 'pictureurl'].includes(normalizedKey);
           if (isPhotoKey) return;
           rec[h] = vals[idx] ?? "";
         });
