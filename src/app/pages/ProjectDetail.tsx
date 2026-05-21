@@ -566,7 +566,7 @@ function isPhotoFieldKey(key: string): boolean {
 function deriveDataFieldsFromRecords(records: ProjectDataRecord[]): ProjectDataField[] {
   const seen = new Set<string>();
   const fields: ProjectDataField[] = [];
-  const ignoredKeys = new Set(["id", "projectId", "category", "groupId"]);
+  const ignoredKeys = new Set(["id", "projectId", "category", "groupId", "_photoFilename"]);
 
   for (const record of records) {
     for (const key of Object.keys(record)) {
@@ -1473,7 +1473,15 @@ export function ProjectDetail() {
           // Never import the photo field from CSV — photos are set only via bulk upload.
           const normalizedKey = h.toLowerCase().replace(/[\s_-]/g, '');
           const isPhotoKey = ['photo', 'link', 'image', 'picture', 'profilepic', 'avatar', 'profilepicture', 'profileimage', 'studentphoto', 'photourl', 'imageurl', 'pictureurl'].includes(normalizedKey);
-          if (isPhotoKey) return;
+          if (isPhotoKey) {
+            // Preserve bare filenames for exact bulk-upload matching.
+            // Discard full URLs (http://…) — they are external links, not filenames.
+            const raw = (vals[idx] ?? '').trim();
+            if (raw && !raw.includes('://') && !raw.startsWith('/') && normalizedKey !== 'link') {
+              rec['_photoFilename'] = raw;
+            }
+            return;
+          }
           rec[h] = vals[idx] ?? "";
         });
         return rec;

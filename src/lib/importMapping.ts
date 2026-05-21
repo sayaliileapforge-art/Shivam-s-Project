@@ -265,10 +265,26 @@ export function mapRowToRecord(
   const rec: Record<string, string> = {};
 
   for (const field of fields) {
-    // Photos are set exclusively via bulk photo upload — never imported from CSV.
-    // Also block "link" which is a generic URL column that many school CSVs use
-    // to store external photo URLs (e.g. edumid.com image links).
-    if (field.key === 'photo' || field.key === 'link') continue;
+    // Photos are never directly displayed from CSV — photos are set only via bulk
+    // photo upload.  However, if the CSV contains a photo filename column (e.g.
+    // "profilePic" = "10827-80_000_SHIVANSHI DEVI_.jpg"), we preserve that bare
+    // filename as "_photoFilename" so the bulk-upload matcher can do an exact
+    // filename comparison instead of falling back to name decomposition.
+    // Full URLs (http://…) and paths starting with '/' are NOT stored because
+    // they would have come from a previous upload and are meaningless here.
+    if (field.key === 'photo') {
+      const mappedColumn = mapping[field.key];
+      if (isMappedColumn(mappedColumn)) {
+        const raw = sanitizeCell(row[mappedColumn] ?? '');
+        if (raw && !raw.includes('://') && !raw.startsWith('/')) {
+          rec['_photoFilename'] = raw;
+        }
+      }
+      continue;
+    }
+    // "link" is a generic URL column many school CSVs export; it is never useful
+    // for photo matching and should always be discarded.
+    if (field.key === 'link') continue;
 
     const mappedColumn = mapping[field.key];
     if (!isMappedColumn(mappedColumn)) continue;

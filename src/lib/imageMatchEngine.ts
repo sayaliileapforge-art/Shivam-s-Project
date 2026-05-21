@@ -150,7 +150,10 @@ function similarity(a: string, b: string): number {
 
 type AnyRecord = Record<string, unknown>;
 
-const META_KEYS = new Set(['id', 'projectId', 'category', 'photo', 'barcode']);
+// Keys that are internal / display-only and must NOT participate in ID value scans.
+// '_photoFilename' is the bare photo filename stored at import time for exact
+// bulk-upload matching; it must not be mistaken for a school-code or roll-number.
+const META_KEYS = new Set(['id', 'projectId', 'category', 'photo', 'barcode', '_photoFilename']);
 
 /**
  * Read a field from a record by trying multiple key spellings.
@@ -365,8 +368,12 @@ export interface ImageFile {
  */
 function getPhotoColumnValue(rec: AnyRecord): string {
   const photoKeys = [
+    // Internal key written at CSV import time — exact bare filename, always wins.
+    '_photoFilename',
+    // Legacy direct-field spellings (direct CSV drop stores original header names).
+    'profilePic', 'profilepic', 'ProfilePic',
     'Profile Picture', 'profile_picture', 'ProfilePicture', 'profilePicture',
-    'Profile Pic', 'profile_pic', 'ProfilePic',
+    'Profile Pic', 'profile_pic',
     'Photo', 'photo', 'Photo File', 'photo_file', 'PhotoFile', 'photoFile',
     'Filename', 'filename', 'File Name', 'file_name', 'FileName',
     'Photo Filename', 'photo_filename', 'Image', 'image', 'Image File', 'image_file',
