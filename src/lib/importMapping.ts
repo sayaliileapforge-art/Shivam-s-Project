@@ -65,7 +65,7 @@ export const FIELD_ALIAS_BY_KEY: Record<string, string[]> = {
   admissionNo: ["admission no", "admission number", "admissionnumber", "admission id", "admissionid", "adm no", "admno", "admission_number"],
   rollNo: ["roll no", "roll number", "rollno", "roll_number"],
   name: ["name", "full name", "student name", "first name", "firstname", "full_name"],
-  photo: ["student photo", "photo", "profile pic", "profile picture", "profilepic", "link", "photo url", "photo_url", "student_photo", "image", "image url", "image_url", "avatar", "profile image", "profile_image", "picture", "picture url", "picture_path", "picture_url", "profile_picture"],
+  photo: ["student photo", "photo", "profile pic", "profile picture", "profilepic", "photo url", "photo_url", "student_photo", "image", "image url", "image_url", "avatar", "profile image", "profile_image", "picture", "picture url", "picture_path", "picture_url", "profile_picture"],
   classCourse: ["class", "class course", "course", "classcourse", "grade", "class_course", "std", "standard"],
   section: ["section", "stream", "semester", "section stream", "stream semester", "sec", "section_stream_semester", "div", "division"],
   dob: ["date of birth", "dob", "birthdate", "birth date", "dateofbirth", "date_of_birth", "born"],

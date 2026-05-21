@@ -1110,9 +1110,17 @@ export function ProjectDetail() {
 
   const refresh = () => setVersion((v) => v + 1);
 
+  // Generation counter — incremented every time the user explicitly mutates records
+  // (Delete All, CSV import, apply bulk images, etc.).  The hydrateFromBackend effect
+  // snapshots this value before its async fetch and aborts applying the result if the
+  // counter has advanced, preventing stale backend data from overwriting user changes.
+  const hydrateGenerationRef = useRef(0);
+
   // Keep data records durable in both local storage and backend.
   const persistDataRecords = useCallback((records: ProjectDataRecord[]) => {
     if (!id) return;
+    // Bump generation so any in-flight hydrateFromBackend fetch knows to discard its result.
+    hydrateGenerationRef.current += 1;
     saveDataRecords(id, dataCategory, records);
     setDataRecords(records);
     void saveProjectRecords(id, dataCategory, records).then((ok) => {
@@ -1126,10 +1134,20 @@ export function ProjectDetail() {
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
+    // Snapshot the generation at the time the effect fires.  If persistDataRecords is
+    // called while the fetch is in-flight, the counter will differ and we skip applying.
+    const generation = hydrateGenerationRef.current;
 
     const hydrateFromBackend = async () => {
       const remote = await fetchProjectRecords(id, dataCategory);
+      // Abort if the component unmounted or if the user made changes while we were fetching.
       if (cancelled || remote === null) return;
+      if (hydrateGenerationRef.current !== generation) {
+        // User has mutated records (Delete All / CSV import / apply photos) since this
+        // fetch started — applying stale backend data would overwrite their changes.
+        console.info('[ProjectDetail] hydrateFromBackend: skipping stale result (generation mismatch)');
+        return;
+      }
 
       const normalized: ProjectDataRecord[] = remote.map((record, idx) => {
         const rawId = String((record as Record<string, unknown>).id ?? "").trim();
@@ -2401,7 +2419,13 @@ export function ProjectDetail() {
   // ── Delete All student/staff Data ──
   const handleDeleteAllData = () => {
     if (!id) return;
+    // Strip photo / barcode URLs from every record before clearing, so any
+    // in-flight hydrateFromBackend that finishes just after this returns clean
+    // records rather than records with stale photo URLs.
     persistDataRecords([]);
+    // Also evict photo files from the uploads directory isn't done here
+    // (they stay on disk) — but the DB records are fully replaced with an
+    // empty array, so no photo URLs will survive in the backend.
     setDataSelectedIds(new Set());
     setIsDeleteAllOpen(false);
   };
