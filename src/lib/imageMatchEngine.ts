@@ -215,6 +215,13 @@ interface FileParts {
  *   e.g.  145_3_Yash_Katiyar.jpg
  *         145_3_Aaradhya_Kumari_Katiyar.jpg  (middle ignored for partial match)
  *
+ * Also handles compound school codes where the code contains a hyphen/separator
+ * that the tokenizer splits into two parts, placing the actual admission number
+ * at index 2.  e.g. 10827-80_000_SHIVANSHI DEVI_.jpg
+ *   tokens = ['10827','80','000','shivanshi','devi']
+ *   Without fix: rollOrAdmNo='80' (wrong), firstName='' (digits stripped from '000')
+ *   With fix:    rollOrAdmNo='000' (real adm no), firstName='shivanshi'
+ *
  * Normalisation:
  *   - Extensions stripped
  *   - IDs: collapse all non-alphanumeric, strip trailing .0 artifacts
@@ -228,11 +235,22 @@ function decompose(filename: string): FileParts {
   const tokens = basename.toLowerCase().match(/[a-z0-9]+/g) ?? [];
 
   const schoolCode  = normalizeId(tokens[0] ?? '');
-  const rollOrAdmNo = normalizeId(tokens[1] ?? '');
+  let rollOrAdmNo   = normalizeId(tokens[1] ?? '');
+  let rawNameParts  = tokens.slice(2);
 
-  const rawNameParts = tokens.slice(2);
-  const firstName  = normalizeName(rawNameParts[0] ?? '');
-  const lastName   = normalizeName(rawNameParts.length > 1 ? rawNameParts[rawNameParts.length - 1] : '');
+  // Detect compound school codes (e.g. "10827-80") where the tokenizer splits
+  // the code at the hyphen/separator.  The tell-tale sign is that
+  // rawNameParts[0] is all-digits (a numeric admission/roll number that was
+  // pushed one position right by the extra code fragment).
+  // In that case, treat rawNameParts[0] as the real admission number and
+  // shift name extraction to start from rawNameParts[1].
+  if (rawNameParts.length > 0 && /^\d+$/.test(rawNameParts[0])) {
+    rollOrAdmNo  = normalizeId(rawNameParts[0]);
+    rawNameParts = rawNameParts.slice(1);
+  }
+
+  const firstName    = normalizeName(rawNameParts[0] ?? '');
+  const lastName     = normalizeName(rawNameParts.length > 1 ? rawNameParts[rawNameParts.length - 1] : '');
   const nameFragment = normalizeName(rawNameParts.join(' '));   // full name, digits stripped
 
   const hasId = schoolCode.length > 0 && rollOrAdmNo.length > 0;
