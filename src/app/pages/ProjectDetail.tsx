@@ -50,6 +50,7 @@ import {
   uploadImages,
   fetchProjectRecords,
   saveProjectRecords,
+  deleteProjectRecords,
   API_BASE,
 } from "../../lib/apiService";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
@@ -2419,15 +2420,17 @@ export function ProjectDetail() {
   // ── Delete All student/staff Data ──
   const handleDeleteAllData = () => {
     if (!id) return;
-    // Strip photo / barcode URLs from every record before clearing, so any
-    // in-flight hydrateFromBackend that finishes just after this returns clean
-    // records rather than records with stale photo URLs.
-    persistDataRecords([]);
-    // Also evict photo files from the uploads directory isn't done here
-    // (they stay on disk) — but the DB records are fully replaced with an
-    // empty array, so no photo URLs will survive in the backend.
+    // Bump generation so any in-flight hydrateFromBackend discards its stale result.
+    hydrateGenerationRef.current += 1;
+    // Clear local state immediately (optimistic update).
+    saveDataRecords(id, dataCategory, []);
+    setDataRecords([]);
     setDataSelectedIds(new Set());
     setIsDeleteAllOpen(false);
+    // Backend: delete DB records AND remove photo files from the uploads directory.
+    void deleteProjectRecords(id, dataCategory).then((ok) => {
+      if (!ok) console.warn('[ProjectDetail] deleteProjectRecords: backend cleanup may have failed; photo files may remain on disk.');
+    });
   };
 
   const handleStageChange = async (stage: string) => {

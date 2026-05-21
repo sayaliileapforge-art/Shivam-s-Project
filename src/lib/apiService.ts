@@ -500,6 +500,32 @@ export async function saveProjectRecords(
 }
 
 /**
+ * Delete ALL records for a project + category from the database AND remove their
+ * associated photo files from the server's uploads directory.
+ * Called when the user clicks "Delete All Student Records".
+ */
+export async function deleteProjectRecords(
+  projectId: string,
+  category: string
+): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `${API_BASE}/projects/${encodeURIComponent(projectId)}/records?category=${encodeURIComponent(category)}`,
+      { method: 'DELETE' }
+    );
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      console.error('[apiService] deleteProjectRecords failed:', response.status, body);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.warn('[apiService] deleteProjectRecords error:', error);
+    return false;
+  }
+}
+
+/**
  * Update the photo URL of a single record without replacing the whole collection.
  * Useful for updating individual record photos after a single-image upload.
  */

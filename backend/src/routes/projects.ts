@@ -1,8 +1,50 @@
 import { Router, Request, Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import mongoose from 'mongoose';
 import Project from '../models/Project';
 import ProductTemplate from '../models/ProductTemplate';
 import DataRecord from '../models/DataRecord';
+
+/**
+ * Resolve the absolute filesystem path for an uploaded photo URL.
+ * Returns null for external/CDN URLs, non-uploads paths, or unsafe traversal attempts.
+ *
+ * Handles both formats:
+ *   http://72.62.241.170/uploads/file.jpg  →  <uploadsBase>/file.jpg
+ *   /uploads/assets/file.jpg               →  <uploadsBase>/assets/file.jpg
+ *   /uploads/file.jpg                      →  <uploadsBase>/file.jpg
+ */
+function resolveUploadFilePath(url: string, uploadsBase: string): string | null {
+  if (!url) return null;
+  let relPath = '';
+  if (/^https?:\/\//i.test(url)) {
+    try {
+      relPath = new URL(url).pathname; // e.g. "/uploads/file.jpg"
+    } catch {
+      return null;
+    }
+  } else {
+    relPath = url;
+  }
+
+  relPath = relPath.replace(/\\/g, '/');
+  if (relPath.startsWith('/uploads/')) {
+    relPath = relPath.slice('/uploads/'.length); // "file.jpg" or "assets/file.jpg"
+  } else if (relPath.startsWith('uploads/')) {
+    relPath = relPath.slice('uploads/'.length);
+  } else {
+    return null; // not an uploads path
+  }
+
+  if (!relPath) return null;
+
+  // Safety: reject path traversal
+  const resolved = path.resolve(uploadsBase, relPath);
+  if (!resolved.startsWith(path.resolve(uploadsBase))) return null;
+
+  return resolved;
+}
 
 const router = Router();
 
@@ -232,6 +274,68 @@ router.patch('/:id/records/photo', async (req: Request, res: Response) => {
     );
 
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+/**
+ * DELETE /api/projects/:id/records?category=xxx
+ * Deletes all data records for a project + category AND removes associated
+ * photo files from the uploads directory on disk.
+ *
+ * This is called when the user clicks "Delete All Student Records" so that
+ * stale photo files don't linger on disk and reappear unexpectedly.
+ */
+router.delete('/:id/records', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const category = req.query.category ? String(req.query.category) : '';
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      res.status(400).json({ success: false, error: 'Invalid project id' });
+      return;
+    }
+
+    const projectId = new mongoose.Types.ObjectId(id);
+
+    // Collect all photo URLs before deleting records
+    const existing = await DataRecord.find({ projectId, category }).lean();
+    const photoUrls: string[] = [];
+    for (const rec of existing) {
+      const photo = (rec.variables as Record<string, unknown>)?.photo;
+      if (photo && typeof photo === 'string' && photo.trim()) {
+        photoUrls.push(photo.trim());
+      }
+    }
+
+    // Delete all DB records for this project + category
+    await DataRecord.deleteMany({ projectId, category });
+
+    // Delete associated photo files from disk
+    const uploadsBase = process.env.UPLOADS_DIR?.trim()
+      ? path.resolve(process.env.UPLOADS_DIR)
+      : path.resolve(__dirname, '../../public/uploads');
+
+    let photosDeleted = 0;
+    let photosSkipped = 0;
+    for (const url of photoUrls) {
+      const filePath = resolveUploadFilePath(url, uploadsBase);
+      if (!filePath) { photosSkipped++; continue; }
+      try {
+        await fs.promises.unlink(filePath);
+        photosDeleted++;
+        console.log(`[records] Deleted photo file: ${filePath}`);
+      } catch (err: any) {
+        if (err.code !== 'ENOENT') {
+          console.warn(`[records] Could not delete ${filePath}: ${err.message}`);
+        }
+        photosSkipped++;
+      }
+    }
+
+    console.log(`[records] DELETE project=${id} category=${category} — removed ${existing.length} records, deleted ${photosDeleted} photo files, skipped ${photosSkipped}`);
+    res.json({ success: true, recordsDeleted: existing.length, photosDeleted });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });
   }
