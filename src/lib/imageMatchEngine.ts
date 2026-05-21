@@ -368,11 +368,19 @@ function getPhotoColumnValue(rec: AnyRecord): string {
   ];
   for (const k of photoKeys) {
     const v = rec[k];
-    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+    if (v !== undefined && v !== null) {
+      const s = String(v).trim();
+      // Skip full URLs — they are display values, not useful for exact filename matching.
+      // Only a bare filename (e.g. "101_Yash.jpg") belongs in the photo index.
+      if (s && !s.includes('://') && !s.startsWith('/')) return s;
+    }
   }
   const photoPattern = /^(profile\s*pic(ture)?|photo|photo\s*file|photo\s*filename|filename|file\s*name|image|image\s*file)$/i;
   for (const [k, v] of Object.entries(rec)) {
-    if (photoPattern.test(k.trim()) && v) return String(v).trim();
+    if (photoPattern.test(k.trim()) && v) {
+      const s = String(v).trim();
+      if (s && !s.includes('://') && !s.startsWith('/')) return s;
+    }
   }
   return '';
 }
@@ -415,8 +423,10 @@ export function matchImages(
     });
 
     // ── Priority 0: Exact photo-filename column match ─────────────────────
-    // When the CSV has a Photo/Filename column, ONLY accept exact filename
-    // matches (both sides normalised via normalizePhotoKey).
+    // When the CSV has a Photo/Filename column, prefer exact filename matches.
+    // If the exact match fails (different encoding, slightly different name, URL
+    // stored instead of filename, etc.) fall through to decomposition matching
+    // so the image still has a chance to be matched by name/ID.
     if (hasPhotoColumn) {
       const exactRec = photoIndex.get(lookupKey) ?? null;
       if (exactRec) {
@@ -432,37 +442,13 @@ export function matchImages(
           matchType:       'exact_filename',
         });
         console.debug('[imageMatch] Exact filename match', { filename: img.name, student: recName });
-      } else {
-        const indexKeys  = Array.from(photoIndex.keys());
-        const noExt      = lookupKey.replace(/\.[^.]+$/, '');
-        const nearMatch  = indexKeys.find(k => k.replace(/\.[^.]+$/, '') === noExt);
-        const nearest    = indexKeys.find(k => {
-          if (Math.abs(k.length - lookupKey.length) > 3) return false;
-          let diffs = 0;
-          for (let ci = 0; ci < Math.max(k.length, lookupKey.length); ci++) {
-            if (k[ci] !== lookupKey[ci]) diffs++;
-            if (diffs > 3) return false;
-          }
-          return diffs > 0;
-        });
-        console.warn(
-          `[imageMatch] ✗ UNMATCHED "${img.name}"\n` +
-          `  lookup key      : "${lookupKey}"\n` +
-          `  key char codes  : [${[...lookupKey].slice(0, 40).map(c => c.charCodeAt(0)).join(',')}]\n` +
-          `  photoIndex size : ${photoIndex.size}\n` +
-          `  sample keys     : [${indexKeys.slice(0, 6).map(k => `"${k}"`).join(', ')}]` +
-          (nearMatch ? `\n  ext-only near-match: "${nearMatch}"` : '') +
-          (nearest   ? `\n  char-diff near-match: "${nearest}"` : '')
-        );
-        unmatched.push({
-          filename:           img.name,
-          normalizedFilename: lookupKey,
-          reason: nearMatch
-            ? `Filename matches but extension differs: CSV has "${nearMatch}", ZIP has "${lookupKey}" — check file extension`
-            : `No record has Profile Picture / Photo = "${img.name}" (exact match required)`,
-        });
+        continue;  // ← claimed; skip decomposition
       }
-      continue;
+      // Exact filename lookup missed — fall through to decomposition below.
+      console.warn(
+        `[imageMatch] Exact filename lookup missed "${img.name}" (lookupKey: "${lookupKey}") — ` +
+        `trying decomposition fallback`
+      );
     }
 
     // Score all records; keep only candidates that meet the threshold
