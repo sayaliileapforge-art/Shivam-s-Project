@@ -265,6 +265,11 @@ export function mapRowToRecord(
   const rec: Record<string, string> = {};
 
   for (const field of fields) {
+    // Photos are set exclusively via bulk photo upload — never imported from CSV.
+    // Skipping here ensures a bare filename or URL in a "Photo" / "Image" column
+    // cannot resolve to an existing file on disk and silently show a photo.
+    if (field.key === 'photo') continue;
+
     const mappedColumn = mapping[field.key];
     if (!isMappedColumn(mappedColumn)) continue;
     rec[field.key] = sanitizeCell(row[mappedColumn]);

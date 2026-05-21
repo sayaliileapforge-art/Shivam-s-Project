@@ -1470,7 +1470,13 @@ export function ProjectDetail() {
           projectId,
           category,
         };
-        headers.forEach((h, idx) => { rec[h] = vals[idx] ?? ""; });
+        headers.forEach((h, idx) => {
+          // Never import the photo field from CSV — photos are set only via bulk upload.
+          const normalizedKey = h.toLowerCase().replace(/[\s_-]/g, '');
+          const isPhotoKey = ['photo', 'image', 'picture', 'profilepic', 'avatar', 'profilepicture', 'profileimage', 'studentphoto', 'photourl', 'imageurl', 'pictureurl'].includes(normalizedKey);
+          if (isPhotoKey) return;
+          rec[h] = vals[idx] ?? "";
+        });
         return rec;
       });
       saveDataFields(projectId, category, newFields);
