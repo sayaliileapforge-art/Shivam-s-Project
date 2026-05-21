@@ -1859,8 +1859,15 @@ export function ProjectDetail() {
     setBulkImageResults(null);
 
     try {
-      // Upload images to the server
-      const imageUrls = await uploadImages(imageFiles);
+      // Upload images to the server — retry once on transient server errors (e.g. backend restart)
+      let imageUrls: string[];
+      try {
+        imageUrls = await uploadImages(imageFiles);
+      } catch (uploadErr) {
+        // Wait 3 seconds and retry once
+        await new Promise((res) => setTimeout(res, 3000));
+        imageUrls = await uploadImages(imageFiles);
+      }
       const loaded = imageFiles.map((file, idx) => ({
         file,
         imageUrl: imageUrls[idx] || '/uploads/assets/default.jpg'

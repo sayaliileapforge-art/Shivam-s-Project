@@ -386,6 +386,10 @@ export async function uploadImages(files: File[]): Promise<string[]> {
     body: form,
   });
 
+  if (!response.ok && response.headers.get('content-type')?.includes('text/html')) {
+    throw new Error(`Server returned HTTP ${response.status} (HTML) — backend may be restarting. Please try again.`);
+  }
+
   // Backend returns { success, urls } directly — no `data` wrapper
   const json = await response.json() as { success: boolean; urls?: string[]; error?: string };
   if (!json.success || !Array.isArray(json.urls)) {
