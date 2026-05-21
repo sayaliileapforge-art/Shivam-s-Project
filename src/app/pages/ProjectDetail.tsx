@@ -4554,7 +4554,7 @@ export function ProjectDetail() {
 
                     {/* ── UNMATCHED ── */}
                     {bulkImageResults.unmatched.length > 0 && (
-                      <details className="rounded-lg border border-muted bg-muted/30 overflow-hidden">
+                      <details open className="rounded-lg border border-muted bg-muted/30 overflow-hidden">
                         <summary className="flex items-center gap-1.5 px-3 py-2.5 cursor-pointer select-none text-sm font-medium text-muted-foreground [list-style:none] [&::-webkit-details-marker]:hidden">
                           <X className="h-4 w-4 shrink-0" />
                           <span>{bulkImageResults.unmatched.length} file{bulkImageResults.unmatched.length !== 1 ? 's' : ''} unmatched</span>
@@ -4564,7 +4564,7 @@ export function ProjectDetail() {
                           {bulkImageResults.unmatched.map((u, i) => (
                             <li key={i}>
                               <p className="font-medium text-foreground/80 truncate">📄 {u.filename}</p>
-                              <p className="text-[11px] pl-3 text-muted-foreground mt-0.5">↳ {u.reason}</p>
+                              <p className="text-[11px] pl-3 text-muted-foreground mt-0.5 break-all select-all">↳ {u.reason}</p>
                             </li>
                           ))}
                         </ul>

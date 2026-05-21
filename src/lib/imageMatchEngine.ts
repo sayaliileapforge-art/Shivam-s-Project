@@ -296,13 +296,18 @@ function scoreRecord(rec: AnyRecord, fp: FileParts): Candidate | null {
 
     if (schoolMatch && idMatch) return { rec, score: SCORE_EXACT_ID, matchType: 'exact_id' };
 
-    // Value-scan fallback: check if BOTH values appear anywhere in the record
+    // Value-scan fallback: check if BOTH values appear anywhere in the record.
+    // Also handles compound school codes (e.g. "10827-80" normalized to "1082780")
+    // by accepting a prefix-or-exact match for schoolCode.
     const vals = Object.entries(rec)
       .filter(([k]) => !META_KEYS.has(k))
       .map(([, v]) => normalizeId(String(v ?? '')))
       .filter((v) => v.length > 0 && v.length <= 20);
+    const schoolInVals = vals.some(
+      (v) => v === fp.schoolCode || v.startsWith(fp.schoolCode) || fp.schoolCode.startsWith(v)
+    );
     if (
-      vals.includes(fp.schoolCode) &&
+      schoolInVals &&
       vals.includes(fp.rollOrAdmNo) &&
       fp.schoolCode !== fp.rollOrAdmNo
     ) return { rec, score: SCORE_EXACT_ID, matchType: 'exact_id' };
@@ -393,6 +398,13 @@ export function matchImages(
   const duplicates: DuplicateImage[] = [];
   const unmatched:  UnmatchedImage[] = [];
 
+  console.log(`[imageMatch] START — ${imageFiles.length} image(s), ${records.length} record(s)`);
+  if (records.length > 0) {
+    const sample = records[0];
+    console.log('[imageMatch] First record keys:', Object.keys(sample).filter(k => !META_KEYS.has(k)));
+    console.log('[imageMatch] First record name via getName():', getName(sample));
+  }
+
   // userId → filename of the image that claimed it
   const claimedBy = new Map<string, string>();
 
@@ -476,14 +488,18 @@ export function matchImages(
       const sampleKeys = records.length > 0
         ? Object.keys(records[0]).filter((k) => !META_KEYS.has(k)).slice(0, 6).join(', ')
         : 'no records loaded';
+      const firstRecordName = records.length > 0 ? normalizeName(getName(records[0])) : '';
       unmatched.push({
         filename:           img.name,
         normalizedFilename: normalizeId(img.name),
-        reason: fp.hasId
-          ? `No match for school="${fp.schoolCode}" id="${fp.rollOrAdmNo}". Available columns: [${sampleKeys}]`
-          : `No match for name "${fp.firstName} ${fp.lastName}". Available columns: [${sampleKeys}]`,
+        reason: `[searched ${records.length} records] No match for ` +
+          (fp.hasId
+            ? `school="${fp.schoolCode}" id="${fp.rollOrAdmNo}" name="${fp.nameFragment}"`
+            : `name "${fp.firstName} ${fp.lastName}" fragment="${fp.nameFragment}"`) +
+          (firstRecordName ? ` | first-record-name="${firstRecordName}"` : '') +
+          ` | cols: [${sampleKeys}]`,
       });
-      console.debug('[imageMatch] No candidates', { filename: img.name });
+      console.warn('[imageMatch] No candidates', { filename: img.name, records: records.length, fp });
       continue;
     }
 
