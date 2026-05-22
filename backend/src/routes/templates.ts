@@ -828,6 +828,17 @@ router.put('/:id', async (req: Request, res: Response) => {
       previewImageUrl: normalizedPreview || undefined,
     };
 
+    // Safety guard: if this template belongs to a specific project it is a
+    // project-private copy and must never become a global gallery template,
+    // regardless of what the client sends.
+    const templateProjectId = existingTemplate.projectId
+      ? String(existingTemplate.projectId).trim()
+      : "";
+    if (templateProjectId) {
+      updatePayload.isGlobal = false;
+      updatePayload.isPublic = false;
+    }
+
     console.log('[templates] Updating template', {
       _id: id,
       database: mongoose.connection.name,

@@ -287,7 +287,10 @@ export async function createTemplate(input: TemplateSaveInput): Promise<Template
   });
 
   const result = await handleResponse<TemplateRecord>(response);
-  invalidateTemplateCache(input.productId?.length === 24 ? undefined : input.productId);
+  // Prefer projectId for targeted invalidation; fall back to legacy productId logic.
+  const cacheKey = input.projectId
+    ?? (input.productId?.length === 24 ? undefined : input.productId);
+  invalidateTemplateCache(cacheKey);
   return result;
 }
 

@@ -2,6 +2,9 @@ import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import PDFDocument from 'pdfkit';
 import ProductTemplate from '../models/ProductTemplate';
+import PrintRule from '../models/PrintRule';
+import Project from '../models/Project';
+import Client from '../models/Client';
 import fs from 'fs';
 import path from 'path';
 
@@ -83,6 +86,21 @@ interface PreviewRequestBody {
       fieldValue?: string;
       templateId?: string;
     }>;
+    /**
+     * Rule-based mode: pre-computed per-record template assignments.
+     * Key = global record index (0-based), value = MongoDB template ID.
+     * When present, overrides templateMappings matching for that record.
+     */
+    perRecordTemplateAssignments?: Record<string, string>;
+    /**
+     * When true the server fetches and evaluates the project's saved PrintRules
+     * against the actual selectedRecords and builds per-record assignments server-side.
+     * This is more reliable than frontend pre-computation because field-name casing
+     * is handled directly against the records as stored in MongoDB.
+     */
+    useRuleBasedMapping?: boolean;
+    /** Project ID used for server-side rule lookup when useRuleBasedMapping=true */
+    projectId?: string;
   };
   template?: TemplatePayload;
 }
@@ -106,10 +124,10 @@ function sanitizeFileName(name: string | undefined): string {
 }
 
 function parseDataUrl(src: string): Buffer | null {
-  const match = src.match(/^data:image\/(png|jpe?g);base64,(.+)$/i);
+  const match = src.match(/^data:image\/[^;]+;base64,(.+)$/i);
   if (!match) return null;
   try {
-    return Buffer.from(match[2], 'base64');
+    return Buffer.from(match[1], 'base64');
   } catch {
     return null;
   }
@@ -485,33 +503,50 @@ const BACKEND_VAR_ALIASES: Record<string, string[]> = {
   gender:          ['Gender', 'gender', 'Sex', 'sex'],
   bloodgroup:      ['Blood Group', 'bloodGroup', 'blood_group', 'BloodGroup'],
   house:           ['House', 'house', 'School House', 'schoolHouse'],
+  schoolhouse:     ['School House', 'schoolHouse', 'school_house', 'House', 'house', 'ColorGroup', 'color_group', 'Group', 'group'],
   stream:          ['Stream', 'stream', 'Section', 'section', 'Division', 'Section / Stream / Section'],
 };
+
+/** Convert Excel serial date numbers (e.g. 42064.00011574) to DD/MM/YYYY strings. */
+function convertExcelDate(val: string): string {
+  const n = Number(val);
+  if (Number.isFinite(n) && n > 40000 && n < 60000) {
+    const d = new Date((n - 25569) * 86400 * 1000);
+    const dd = d.getUTCDate().toString().padStart(2, '0');
+    const mm = (d.getUTCMonth() + 1).toString().padStart(2, '0');
+    return `${dd}/${mm}/${d.getUTCFullYear()}`;
+  }
+  return val;
+}
+
+const DOB_NORMS = new Set(['dob', 'dateofbirth', 'birthdate', 'dateofbirth']);
 
 function mapDataForRecord(text: string, record: Record<string, unknown>): string {
   return text.replace(/\{\{([^}]+)\}\}/g, (_match: string, rawKey: string): string => {
     const key = rawKey.trim();
+    const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const isDob = DOB_NORMS.has(norm);
+    const post = (v: string) => (isDob && v ? convertExcelDate(v) : v);
 
     // 1. Direct exact-key lookup
     const direct = String(record[key] ?? '').trim();
-    if (direct) return direct;
+    if (direct) return post(direct);
 
     // 2. Alias table lookup
-    const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
     const candidates = BACKEND_VAR_ALIASES[norm] ?? [];
     for (const alias of candidates) {
       const val = String(record[alias] ?? '').trim();
-      if (val) return val;
+      if (val) return post(val);
       const entry = Object.entries(record).find(([k]) => k.toLowerCase() === alias.toLowerCase());
       const entryVal = String(entry?.[1] ?? '').trim();
-      if (entryVal) return entryVal;
+      if (entryVal) return post(entryVal);
     }
 
     // 3. Fuzzy fallback: normalised key matches normalised record key
     const fuzzy = Object.entries(record).find(
       ([k]) => k.toLowerCase().replace(/[^a-z0-9]/g, '') === norm
     );
-    return fuzzy ? String(fuzzy[1] ?? '').trim() : '';
+    return post(fuzzy ? String(fuzzy[1] ?? '').trim() : '');
   });
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -872,6 +907,7 @@ interface CanvasTextObject {
   textBackgroundColor: string;  // highlight colour behind text; '' = none
   stroke: string;               // text outline colour; '' = none
   strokeWidth: number;          // outline width in canvas pixels; 0 = none
+  variableKey: string;          // canvas object's variableKey for direct record lookup
 }
 
 interface CanvasPhotoArea {
@@ -879,12 +915,29 @@ interface CanvasPhotoArea {
   top: number;
   width: number;
   height: number;
+  angle: number;           // rotation in degrees (0 = upright)
+  opacity: number;         // 0–1
+  placeholderSrc: string;  // data URL of the default silhouette/avatar in the canvas
+  rx: number;              // border-radius x in effective canvas px (0 = square)
+  clipRadius: number;      // > 0 when a circular clipPath is applied (radius in effective canvas px)
+}
+
+interface CanvasStaticImage {
+  src: string;     // data URL (base64) or absolute URL
+  left: number;   // canvas px, top-left
+  top: number;
+  width: number;   // effective width in canvas px
+  height: number;  // effective height in canvas px
+  angle: number;
+  opacity: number;
 }
 
 interface CanvasRenderInfo {
   canvasWidthPx: number;
   canvasHeightPx: number;
+  backgroundColor: string;        // solid fill colour (e.g. '#ffffff'); '' = none
   backgroundImageSrc: string;
+  staticImages: CanvasStaticImage[];  // non-photo design images (icons, logos)
   textObjects: CanvasTextObject[];
   photoAreas: CanvasPhotoArea[];
   hasDynamicText: boolean;
@@ -960,12 +1013,17 @@ function extractCanvasRenderInfo(
     const bgImageObj = (canvasNode.backgroundImage ?? {}) as Record<string, unknown>;
     const backgroundImageSrc = String(bgImageObj.src ?? '').trim();
 
+    // Background colour (e.g. '#ffffff' or 'rgb(...)'); empty string when absent.
+    const bgRaw = canvasNode.background;
+    const backgroundColor = typeof bgRaw === 'string' && bgRaw && bgRaw !== 'transparent' ? bgRaw : '';
+
     const rawObjects = Array.isArray(canvasNode.objects)
       ? (canvasNode.objects as Record<string, unknown>[])
       : [];
 
     const textObjects: CanvasTextObject[] = [];
     const photoAreas: CanvasPhotoArea[] = [];
+    const staticImages: CanvasStaticImage[] = [];
 
     /**
      * Recursively walks Fabric.js canvas objects and extracts text/photo info.
@@ -1044,8 +1102,46 @@ function extractCanvasRenderInfo(
         ).toLowerCase().replace(/[^a-z0-9]/g, '');
         const isPhotoField = ['photo', 'photourl', 'profilepic', 'image', 'avatar', 'picture', 'studentphoto'].includes(varKey);
 
-        if ((type === 'image' || isPhotoField) && effectiveWidth > 0 && effectiveHeight > 0) {
-          photoAreas.push({ left: objLeft, top: objTop, width: effectiveWidth, height: effectiveHeight });
+        if (type === 'image') {
+          if (isPhotoField && effectiveWidth > 0 && effectiveHeight > 0) {
+            // Photo placeholder — student photo will be drawn here.
+            // Extract clipPath info for circular or rounded-rect clipping.
+            const cpObj = (obj.clipPath ?? null) as Record<string, unknown> | null;
+            let clipRadius = 0;
+            if (cpObj) {
+              const cpType = String(cpObj.type ?? '').toLowerCase();
+              if (cpType === 'circle') {
+                clipRadius = Number(cpObj.radius ?? 0) * totalScaleX;
+              } else if (cpType === 'ellipse') {
+                clipRadius = Math.min(Number(cpObj.rx ?? 0), Number(cpObj.ry ?? 0)) * totalScaleX;
+              }
+            }
+            photoAreas.push({
+              left: objLeft,
+              top: objTop,
+              width: effectiveWidth,
+              height: effectiveHeight,
+              angle: angle,
+              opacity: Number.isFinite(Number(obj.opacity)) ? Math.min(1, Math.max(0, Number(obj.opacity))) : 1,
+              placeholderSrc: String(obj.src ?? '').trim(),
+              rx: Number(obj.rx ?? 0) * totalScaleX,
+              clipRadius,
+            });
+          } else if (effectiveWidth > 0 && effectiveHeight > 0) {
+            // Static design image (icon, logo, decoration) — render from data URL
+            const imgSrc = String(obj.src ?? '').trim();
+            if (imgSrc) {
+              staticImages.push({
+                src: imgSrc,
+                left: objLeft,
+                top: objTop,
+                width: effectiveWidth,
+                height: effectiveHeight,
+                angle: Number(obj.angle ?? 0),
+                opacity: Number.isFinite(Number(obj.opacity)) ? Math.min(1, Math.max(0, Number(obj.opacity))) : 1,
+              });
+            }
+          }
           continue;
         }
 
@@ -1120,6 +1216,7 @@ function extractCanvasRenderInfo(
             textBackgroundColor,
             stroke,
             strokeWidth,
+            variableKey: String(obj.variableKey ?? obj.__fieldKey ?? obj.fieldKey ?? '').trim(),
           });
         }
       }
@@ -1130,7 +1227,9 @@ function extractCanvasRenderInfo(
     return {
       canvasWidthPx,
       canvasHeightPx,
+      backgroundColor,
       backgroundImageSrc,
+      staticImages,
       textObjects,
       photoAreas,
       hasDynamicText: textObjects.some((t) => t.hasVariables),
@@ -1183,10 +1282,11 @@ function renderCardFromCanvas(
   canvasInfo: CanvasRenderInfo,
   record: Record<string, unknown>,
   bgImage: unknown | null,
-  fallbackImage: unknown | null,
+  _fallbackImage: unknown | null,   // no longer used — thumbnail causes placeholder artifacts
   studentPhotoImage: unknown | null,
+  staticImageObjects?: Array<{ img: unknown; info: CanvasStaticImage }>,
 ): void {
-  const { canvasWidthPx, canvasHeightPx, textObjects, photoAreas } = canvasInfo;
+  const { canvasWidthPx, canvasHeightPx, textObjects, photoAreas, backgroundColor, staticImages } = canvasInfo;
   if (!canvasWidthPx || !canvasHeightPx) return;
 
   // Scale factors: canvas pixels → card mm
@@ -1201,35 +1301,103 @@ function renderCardFromCanvas(
   doc.stroke();
   doc.restore();
 
-  // 2. Background: prefer the canvas bg image; fall back to the full thumbnail
-  const backgroundToDraw = bgImage ?? fallbackImage;
-  if (backgroundToDraw) {
+  // 2. Background: canvas background image (if any) or solid colour.
+  // We NEVER use the thumbnail here — it shows Designer Studio variable placeholders
+  // as text, causing duplicated/overlapping text when we overlay the actual data.
+  if (bgImage) {
     try {
-      doc.image(backgroundToDraw as Parameters<typeof doc.image>[0], mmToPt(xMm), mmToPt(yMm), {
+      doc.image(bgImage as Parameters<typeof doc.image>[0], mmToPt(xMm), mmToPt(yMm), {
         width:  mmToPt(cardWidthMm),
         height: mmToPt(cardHeightMm),
       });
     } catch { /* ignore – keep generating */ }
+  } else {
+    // Solid background colour (e.g. '#ffffff' for white cards)
+    const fillColor = backgroundColor || '#ffffff';
+    doc.rect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm))
+       .fill(fillColor);
   }
 
-  // 3. Student photo at the first photo-placeholder area
-  if (studentPhotoImage && photoAreas.length > 0) {
-    const area = photoAreas[0];
-    const pxMm = xMm + area.left  * scaleX;
-    const pyMm = yMm + area.top   * scaleY;
+  // 2b. Static design images (icons, logos) — pre-opened from data URLs
+  const allStaticImages = staticImageObjects ?? [];
+  for (const { img, info } of allStaticImages) {
+    const siLeft = xMm + info.left  * scaleX;
+    const siTop  = yMm + info.top   * scaleY;
+    const siW    = info.width  * scaleX;
+    const siH    = info.height * scaleY;
+    if (siW <= 0 || siH <= 0) continue;
+    try {
+      doc.save();
+      if (info.opacity < 1) doc.fillOpacity(info.opacity);
+      if (info.angle !== 0) {
+        const cx = mmToPt(siLeft + siW / 2);
+        const cy = mmToPt(siTop  + siH / 2);
+        doc.rotate(info.angle, { origin: [cx, cy] });
+      }
+      doc.image(img as Parameters<typeof doc.image>[0], mmToPt(siLeft), mmToPt(siTop), {
+        width:  mmToPt(siW),
+        height: mmToPt(siH),
+      });
+      doc.restore();
+    } catch { /* skip unrenderable images */ }
+  }
+
+  // 3. Student photo at each photo-placeholder area (object-fit: cover + clip)
+  for (const area of photoAreas) {
+    const pxMm = xMm + area.left   * scaleX;
+    const pyMm = yMm + area.top    * scaleY;
     const pwMm = area.width  * scaleX;
     const phMm = area.height * scaleY;
-    // Only draw if the area is within the card
-    if (pwMm > 0 && phMm > 0 && pxMm >= xMm - 1 && pyMm >= yMm - 1 &&
-        pxMm < xMm + cardWidthMm + 1 && pyMm < yMm + cardHeightMm + 1) {
+    if (pwMm <= 0 || phMm <= 0) continue;
+
+    // Resolve image to draw: student photo first, then fall back to the
+    // placeholder silhouette that is embedded as a data URL in the canvas.
+    let photoImg: any = studentPhotoImage ?? null;
+    if (!photoImg && area.placeholderSrc) {
       try {
-        doc.image(studentPhotoImage as Parameters<typeof doc.image>[0], mmToPt(pxMm), mmToPt(pyMm), {
-          fit:   [mmToPt(pwMm), mmToPt(phMm)],
-          align: 'center',
-          valign: 'center',
-        });
+        const buf = parseDataUrl(area.placeholderSrc);
+        if (buf) photoImg = (doc as any).openImage(buf);
       } catch { /* ignore */ }
     }
+    if (!photoImg) continue;
+
+    const boxXPt = mmToPt(pxMm);
+    const boxYPt = mmToPt(pyMm);
+    const boxWPt = mmToPt(pwMm);
+    const boxHPt = mmToPt(phMm);
+    const centerXPt = boxXPt + boxWPt / 2;
+    const centerYPt = boxYPt + boxHPt / 2;
+
+    // object-fit: cover — scale so image fills box completely; crop overflow.
+    const imgW = (photoImg.width  as number) || 1;
+    const imgH = (photoImg.height as number) || 1;
+    const coverScale = Math.max(boxWPt / imgW, boxHPt / imgH);
+    const drawW = imgW * coverScale;
+    const drawH = imgH * coverScale;
+    const drawX = boxXPt + (boxWPt - drawW) / 2;
+    const drawY = boxYPt + (boxHPt - drawH) / 2;
+
+    doc.save();
+    try {
+      if (area.opacity < 1) doc.fillOpacity(area.opacity);
+      // Rotate coordinate system around photo box centre (matches Fabric.js angle).
+      if (area.angle !== 0) {
+        doc.rotate(area.angle, { origin: [centerXPt, centerYPt] });
+      }
+      // Clip to placeholder bounds.  circular clipPath > rounded rect > plain rect.
+      const avgScale = (scaleX + scaleY) / 2;
+      if (area.clipRadius > 0) {
+        const rPt = mmToPt(area.clipRadius * avgScale);
+        doc.circle(centerXPt, centerYPt, Math.min(rPt, boxWPt / 2, boxHPt / 2)).clip();
+      } else if (area.rx > 0) {
+        const rrPt = Math.min(mmToPt(area.rx * scaleX), boxWPt / 2, boxHPt / 2);
+        doc.roundedRect(boxXPt, boxYPt, boxWPt, boxHPt, rrPt).clip();
+      } else {
+        doc.rect(boxXPt, boxYPt, boxWPt, boxHPt).clip();
+      }
+      doc.image(photoImg, drawX, drawY, { width: drawW, height: drawH });
+    } catch { /* skip unrenderable photo */ }
+    doc.restore();
   }
 
   // 4. Text objects — clipped to the card boundary with exact designer styling
@@ -1237,8 +1405,16 @@ function renderCardFromCanvas(
   doc.rect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm)).clip();
 
   for (const textObj of textObjects) {
-    // Resolve variable placeholders
-    const resolved  = mapDataForRecord(textObj.text, record);
+    // Resolve variable placeholders.
+    // Priority: variableKey direct lookup → {{VAR}} text substitution
+    let resolved = '';
+    if (textObj.variableKey) {
+      // Try variableKey as a direct record key first, then via alias table
+      resolved = mapDataForRecord(`{{${textObj.variableKey}}}`, record);
+    }
+    if (!resolved) {
+      resolved = mapDataForRecord(textObj.text, record);
+    }
     const isOnlyVars = /^\s*(\{\{[^}]+\}\}\s*)+$/.test(textObj.text);
     if (isOnlyVars && !resolved.trim()) continue;
     const displayText = resolved || (isOnlyVars ? '' : textObj.text);
@@ -1363,6 +1539,10 @@ router.post('/generate', async (req: Request, res: Response) => {
     const useFieldBasedMapping = Boolean(configuration.useFieldBasedMapping);
     const fallbackTemplateId = String(configuration.fallbackTemplateId || '').trim();
     const templateMappings = Array.isArray(configuration.templateMappings) ? configuration.templateMappings : [];
+    const perRecordTemplateAssignments: Record<string, string> = typeof configuration.perRecordTemplateAssignments === 'object' && configuration.perRecordTemplateAssignments !== null
+      ? configuration.perRecordTemplateAssignments as Record<string, string>
+      : {};
+    const hasPerRecordAssignments = Object.keys(perRecordTemplateAssignments).length > 0;
 
     console.debug('[PreviewAPI] incoming request', {
       templateId: requestedTemplateId,
@@ -1371,6 +1551,9 @@ router.post('/generate', async (req: Request, res: Response) => {
       fallbackTemplateId,
       templateMappingsCount: templateMappings.length,
       templateMappings: templateMappings.slice(0, 3), // Log first 3 mappings
+      hasPerRecordAssignments,
+      perRecordAssignmentCount: Object.keys(perRecordTemplateAssignments).length,
+      perRecordAssignmentSample: Object.entries(perRecordTemplateAssignments).slice(0, 5),
     });
 
     if (!selectedRecordIds.length) {
@@ -1394,9 +1577,194 @@ router.post('/generate', async (req: Request, res: Response) => {
       return;
     }
 
+    // ── Server-side rule evaluation ───────────────────────────────────────────
+    // Derive project ID once — used for rule evaluation AND client name injection.
+    const projectIdRaw = String(
+      (configuration as any).projectId ||
+      (selectedRecords.length > 0 ? (selectedRecords[0] as any)?.projectId : '') ||
+      ''
+    ).trim();
+
+    // When useRuleBasedMapping=true the backend fetches the project's saved
+    // PrintRules and evaluates them against the ACTUAL record fields, producing
+    // authoritative per-record template assignments that are reliable regardless
+    // of any field-name casing differences between the Rule Builder CSV and the
+    // project data CSV.
+    const useRuleBasedMapping = Boolean(configuration.useRuleBasedMapping);
+    if (useRuleBasedMapping) {
+      if (projectIdRaw && mongoose.Types.ObjectId.isValid(projectIdRaw)) {
+        try {
+          const rules = await PrintRule.find({
+            projectId: new mongoose.Types.ObjectId(projectIdRaw),
+            isActive: { $ne: false },
+          }).lean();
+
+          if (rules.length > 0) {
+            // Helpers (mirrors ruleBuilderApi.ts frontend logic exactly)
+            const normalizeKey = (k: string): string => k.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+            const buildNormalizedRowForRules = (
+              record: Record<string, unknown>,
+              ruleList: typeof rules
+            ): Record<string, string> => {
+              // Common field-name suffixes that may be present in one source but absent in another
+              // e.g. "className" (condition) vs "Class" (record) → strip "name" → match
+              const FIELD_SUFFIXES = ['name', 'no', 'num', 'number', 'code', 'id'];
+
+              const resolveFieldValue = (normField: string, lookup: Record<string, string>): string | undefined => {
+                // 1. Direct normalized match
+                if (normField in lookup) return lookup[normField];
+                // 2. Condition field has extra suffix → strip it to match a shorter record key
+                //    e.g. "classname" → strip "name" → "class" matches record key "Class"
+                for (const suf of FIELD_SUFFIXES) {
+                  if (normField.length > suf.length + 2 && normField.endsWith(suf)) {
+                    const stripped = normField.slice(0, -suf.length);
+                    if (stripped in lookup) return lookup[stripped];
+                  }
+                }
+                // 3. Record field has extra suffix → condition key is a prefix of the record key
+                //    e.g. condition "class", record key "className" → "classname" starts with "class", extra = "name"
+                for (const [rk, rv] of Object.entries(lookup)) {
+                  if (rk.length > normField.length && rk.startsWith(normField)) {
+                    const extra = rk.slice(normField.length);
+                    if (FIELD_SUFFIXES.includes(extra)) return rv;
+                  }
+                }
+                return undefined;
+              };
+
+              const row: Record<string, string> = {};
+              for (const [k, v] of Object.entries(record)) {
+                // Skip base64 data URLs to keep the row small
+                const str = v == null ? '' : String(v);
+                if (!str.startsWith('data:')) row[k] = str;
+              }
+              const normLookup: Record<string, string> = {};
+              for (const [k, v] of Object.entries(row)) {
+                const nk = normalizeKey(k);
+                if (!(nk in normLookup)) normLookup[nk] = v;
+              }
+              // For every condition field, inject a key that matches the condition's
+              // exact spelling using normalized + suffix-aware lookup.
+              for (const rule of ruleList) {
+                for (const group of rule.conditionGroups) {
+                  for (const condition of group.conditions) {
+                    if (!(condition.field in row)) {
+                      const nf = normalizeKey(condition.field);
+                      const val = resolveFieldValue(nf, normLookup);
+                      if (val !== undefined) row[condition.field] = val;
+                    }
+                  }
+                }
+              }
+              return row;
+            };
+
+            const evalCondition = (
+              cond: { field: string; operator: string; value: string },
+              row: Record<string, string>
+            ): boolean => {
+              const cell = String(row[cond.field] ?? '').trim().toLowerCase();
+              const val = cond.value.trim().toLowerCase();
+              switch (cond.operator) {
+                case 'equals':       return cell === val;
+                case 'not_equals':   return cell !== val;
+                case 'contains':     return cell.includes(val);
+                case 'not_contains': return !cell.includes(val);
+                case 'starts_with':  return cell.startsWith(val);
+                case 'ends_with':    return cell.endsWith(val);
+                case 'is_empty':     return cell === '';
+                case 'is_not_empty': return cell !== '';
+                default:             return true;
+              }
+            };
+
+            const evalRule = (rule: typeof rules[0], row: Record<string, string>): boolean => {
+              if (!rule.conditionGroups.length) return true; // catch-all
+              const groupOp = rule.groupOperator === 'AND' ? 'every' : 'some';
+              return rule.conditionGroups[groupOp]((group) => {
+                if (!group.conditions.length) return true;
+                // OR group: any condition passes
+                if (group.operator === 'OR') {
+                  return group.conditions.some((c) => evalCondition(c, row));
+                }
+                // AND group with smart-OR: conditions sharing the same field are treated
+                // as OR between themselves (a record can never be className=1st AND
+                // className=2nd at the same time), then fields are ANDed together.
+                const fieldMap = new Map<string, typeof group.conditions>();
+                for (const cond of group.conditions) {
+                  const bucket = fieldMap.get(cond.field) ?? [];
+                  bucket.push(cond);
+                  fieldMap.set(cond.field, bucket);
+                }
+                return [...fieldMap.values()].every((bucket) =>
+                  bucket.some((c) => evalCondition(c, row))
+                );
+              });
+            };
+
+            const isCatchAllRule = (rule: typeof rules[0]): boolean =>
+              !rule.conditionGroups.length ||
+              rule.conditionGroups.every((g) => !g.conditions.length);
+
+            // Sort: specific rules (with conditions) first; catch-alls last; then by priority
+            const sortedRules = [...rules]
+              .filter((r) => r.templateId) // skip rules with no template assigned
+              .sort((a, b) => {
+                const ac = isCatchAllRule(a), bc = isCatchAllRule(b);
+                if (ac !== bc) return ac ? 1 : -1;
+                return (a.priority ?? 0) - (b.priority ?? 0);
+              });
+
+            // Evaluate each record and build server-side assignments
+            const serverAssignments: Record<string, string> = {};
+            selectedRecords.forEach((record, idx) => {
+              const row = buildNormalizedRowForRules(record, sortedRules);
+              const matched = sortedRules.find((rule) => evalRule(rule, row));
+              if (matched) {
+                serverAssignments[String(idx)] = String(matched.templateId);
+              }
+            });
+
+            // Server assignments override any frontend-computed assignments
+            Object.assign(perRecordTemplateAssignments, serverAssignments);
+
+            // Build a human-readable summary: template name → record count
+            const assignmentSummary: Record<string, number> = {};
+            for (const [, tmplId] of Object.entries(serverAssignments)) {
+              const rule = sortedRules.find((r) => String(r.templateId) === tmplId);
+              const label = rule?.templateName ?? tmplId;
+              assignmentSummary[label] = (assignmentSummary[label] ?? 0) + 1;
+            }
+
+            // Log rule evaluation result (including what fields the first record has)
+            const firstRecord = selectedRecords[0] || {};
+            const conditionFields = sortedRules.flatMap((r) =>
+              r.conditionGroups.flatMap((g) => g.conditions.map((c) => c.field))
+            );
+            const firstRow = buildNormalizedRowForRules(firstRecord, sortedRules);
+            console.log('[PreviewAPI] server-side rule evaluation result', {
+              rulesFound: sortedRules.length,
+              recordCount: selectedRecords.length,
+              serverAssignedCount: Object.keys(serverAssignments).length,
+              templateAssignmentSummary: assignmentSummary,
+              conditionFields: [...new Set(conditionFields)],
+              firstRecordKeys: Object.keys(firstRecord).filter((k) => !String((firstRecord as any)[k]).startsWith('data:')).slice(0, 20),
+              firstRecordConditionValues: Object.fromEntries(conditionFields.map((f) => [f, firstRow[f] ?? '(not found)'])),
+            });
+          }
+        } catch (ruleErr) {
+          console.warn('[PreviewAPI] server-side rule evaluation failed (non-fatal):', ruleErr);
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const templateIdsToResolve = new Set<string>();
     templateIdsToResolve.add(requestedTemplateId);
-    if (useFieldBasedMapping) {
+    // Use the final (possibly server-updated) perRecordTemplateAssignments
+    const hasFinalPerRecordAssignments = Object.keys(perRecordTemplateAssignments).length > 0;
+    if (useFieldBasedMapping || hasFinalPerRecordAssignments) {
       if (fallbackTemplateId) {
         templateIdsToResolve.add(fallbackTemplateId);
       }
@@ -1405,6 +1773,10 @@ router.post('/generate', async (req: Request, res: Response) => {
         if (mappingTemplateId) {
           templateIdsToResolve.add(mappingTemplateId);
         }
+      }
+      // Add all templates referenced by per-record assignments
+      for (const tmplId of Object.values(perRecordTemplateAssignments)) {
+        if (tmplId) templateIdsToResolve.add(tmplId);
       }
     }
 
@@ -1552,7 +1924,7 @@ router.post('/generate', async (req: Request, res: Response) => {
         );
         canvasRenderInfoByTemplateId.set(templateId, info);
         if (info) {
-          console.debug(`[CanvasRender] Template ${templateId}: canvas=${info.canvasWidthPx}x${info.canvasHeightPx}, texts=${info.textObjects.length}, dynamic=${info.hasDynamicText}, bgSrc=${info.backgroundImageSrc ? 'yes' : 'no'}`);
+          console.debug(`[CanvasRender] Template ${templateId}: canvas=${info.canvasWidthPx}x${info.canvasHeightPx}, texts=${info.textObjects.length}, staticImgs=${info.staticImages.length}, dynamic=${info.hasDynamicText}, bgColor=${info.backgroundColor || 'none'}, bgSrc=${info.backgroundImageSrc ? 'yes' : 'no'}`);
         } else {
           console.warn(`[CanvasRender] Template ${templateId}: failed to parse canvasJSON (layoutJSON length=${resolved.layoutJSON.length})`);
         }
@@ -1603,6 +1975,59 @@ router.post('/generate', async (req: Request, res: Response) => {
       } catch { /* ignore */ }
     });
 
+    // Pre-open static design images (icons, logos) from data URLs — once per template.
+    const canvasStaticImagesByTemplateId = new Map<string, Array<{ img: any; info: CanvasStaticImage }>>();
+    for (const [templateId, canvasInfo] of canvasRenderInfoByTemplateId.entries()) {
+      if (!canvasInfo?.staticImages.length) continue;
+      const opened: Array<{ img: any; info: CanvasStaticImage }> = [];
+      for (const si of canvasInfo.staticImages) {
+        if (!si.src) continue;
+        try {
+          let buf: Buffer | null = null;
+          if (si.src.startsWith('data:')) {
+            const comma = si.src.indexOf(',');
+            if (comma >= 0) buf = Buffer.from(si.src.slice(comma + 1), 'base64');
+          } else {
+            buf = await loadTemplatePreviewBuffer(toAbsoluteAssetUrl(si.src, req));
+          }
+          if (buf) {
+            const img = (doc as any).openImage(buf);
+            if (img) opened.push({ img, info: si });
+          }
+        } catch { /* skip unrenderable static image */ }
+      }
+      canvasStaticImagesByTemplateId.set(templateId, opened);
+    }
+
+    // Fetch project-level metadata (school/organisation name) for {{COMPANY_NAME}} etc.
+    let projectLevelData: Record<string, string> = {};
+    if (projectIdRaw && mongoose.Types.ObjectId.isValid(projectIdRaw)) {
+      try {
+        const project = await Project.findById(projectIdRaw).lean();
+        if (project) {
+          let schoolName = String(project.client || '').trim();
+          if (!schoolName && project.clientId) {
+            const clientDoc = await Client.findById(project.clientId).lean();
+            if (clientDoc) schoolName = String(clientDoc.clientName || '').trim();
+          }
+          if (!schoolName) schoolName = String(project.name || '').trim();
+          if (schoolName) {
+            projectLevelData = {
+              'Company Name': schoolName,
+              'School Name': schoolName,
+              companyName: schoolName,
+              schoolName: schoolName,
+              company_name: schoolName,
+              school_name: schoolName,
+            };
+            console.debug(`[PreviewAPI] injecting school name "${schoolName}" for {{COMPANY_NAME}}`);
+          }
+        }
+      } catch (projErr) {
+        console.warn('[PreviewAPI] could not fetch project/client name (non-fatal):', projErr);
+      }
+    }
+
     // Stream PDF bytes directly to the response — no in-memory buffering.
     // Browser starts receiving data immediately instead of waiting for all
     // pages to be generated.
@@ -1628,7 +2053,11 @@ router.post('/generate', async (req: Request, res: Response) => {
       }
     });
 
-    const resolveTemplateIdForRecord = (record: Record<string, unknown>): string => {
+    const resolveTemplateIdForRecord = (record: Record<string, unknown>, globalRecordIndex: number): string => {
+      // Rule-based mode: use pre-computed per-record assignment if available
+      const assignedId = perRecordTemplateAssignments[String(globalRecordIndex)];
+      if (assignedId) return assignedId;
+
       if (!useFieldBasedMapping || templateMappings.length === 0) {
         return requestedTemplateId;
       }
@@ -1714,14 +2143,19 @@ router.post('/generate', async (req: Request, res: Response) => {
         const yMm = marginTopMm + row * (cardHeightMm + rowMarginMm);
         const student = studentCardData[globalRecordIndex] || resolveStudentCardData(record, req);
         const studentPhotoImage = student.photoUrl ? studentPhotoImageByUrl.get(student.photoUrl) || null : null;
-        const recordTemplateId = resolveTemplateIdForRecord(record);
+        const recordTemplateId = resolveTemplateIdForRecord(record, globalRecordIndex);
         const recordTemplate = resolvedTemplateById.get(recordTemplateId) || resolvedTemplate;
         const recordPreviewImage = previewImageByTemplateId.get(recordTemplateId) || previewImageByTemplateId.get(requestedTemplateId) || null;
 
         const canvasInfo = canvasRenderInfoByTemplateId.get(recordTemplateId) ?? null;
-        if (canvasInfo && canvasInfo.hasDynamicText) {
-          // Canvas-based rendering: substitute all {{VARIABLE}} placeholders
+        // Use canvas-based rendering whenever a parsed canvas layout is available,
+        // regardless of whether it has dynamic {{VARIABLE}} placeholders.
+        // This ensures per-record templates with different designs always render correctly.
+        if (canvasInfo) {
           const canvasBgImage = canvasBgImageByTemplateId.get(recordTemplateId) ?? null;
+          const staticImageObjects = canvasStaticImagesByTemplateId.get(recordTemplateId) ?? [];
+          // Enrich record with project-level data (e.g. school name for {{COMPANY_NAME}})
+          const enrichedRecord = { ...projectLevelData, ...(record as Record<string, unknown>) };
           renderCardFromCanvas(
             doc,
             xMm,
@@ -1729,10 +2163,11 @@ router.post('/generate', async (req: Request, res: Response) => {
             cardWidthMm,
             cardHeightMm,
             canvasInfo,
-            record,
+            enrichedRecord,
             canvasBgImage,
-            recordPreviewImage,
+            null,  // no thumbnail fallback — causes placeholder text artifacts
             studentPhotoImage,
+            staticImageObjects,
           );
         } else {
           renderTemplateCard(recordTemplate.templateSlug as TemplateSlug, {

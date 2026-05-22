@@ -504,6 +504,9 @@ export function DesignerStudio() {
       } catch {
         // Keep existing thumbnail
       }
+      // When editing within a project context, always keep the template
+      // as a private project copy — never expose it in the global gallery.
+      const fsdEffectiveIsPublic = designerContext.projectId ? false : saveIsPublic;
       void updateTemplate(targetId, {
         productId: designerContext.projectId,
         templateName,
@@ -515,8 +518,8 @@ export function DesignerStudio() {
           applicableFor: existingTemplate.applicableFor ?? "",
           canvasJSON: canJSON,
         },
-        isGlobal: saveIsPublic,
-        isPublic: saveIsPublic,
+        isGlobal: fsdEffectiveIsPublic,
+        isPublic: fsdEffectiveIsPublic,
       }).catch((error) => {
         console.warn("[designer] Failed to persist template to MongoDB", error);
       });
@@ -947,7 +950,9 @@ export function DesignerStudio() {
 
         const tmpl = mapTemplateRecordToProjectTemplate(remote);
         setActiveTemplate({ ...tmpl, createdAt: remote.createdAt ?? new Date().toLocaleDateString("en-IN") });
-        setSaveIsPublic(tmpl.isPublic ?? true);
+        // If we're in a project context, the template is a project-private copy;
+        // always treat it as non-public regardless of the original gallery template's flag.
+        setSaveIsPublic(designerContext?.projectId ? false : (tmpl.isPublic ?? true));
 
         const resolvedMargin = resolveTemplateMargin(tmpl as any, DEFAULT_CONFIG.margin);
 
@@ -1169,6 +1174,9 @@ export function DesignerStudio() {
     const remoteId = existingTemplate.remoteId;
     const targetId = isMongoId(remoteId) ? remoteId : (isMongoId(existingTemplate.id) ? existingTemplate.id : null);
     if (targetId) {
+      // When editing within a project context, always keep the template
+      // as a private project copy — never expose it in the global gallery.
+      const effectiveIsPublic = designerContext.projectId ? false : saveIsPublic;
       void updateTemplate(targetId, {
         productId: designerContext.projectId,
         templateName,
@@ -1180,8 +1188,8 @@ export function DesignerStudio() {
           applicableFor: existingTemplate.applicableFor ?? "",
           canvasJSON: canJSON,
         },
-        isGlobal: saveIsPublic,
-        isPublic: saveIsPublic,
+        isGlobal: effectiveIsPublic,
+        isPublic: effectiveIsPublic,
       }).catch((error) => {
         console.warn("[designer] Failed to persist template to MongoDB", error);
       });
@@ -1304,13 +1312,15 @@ export function DesignerStudio() {
     setIsSaving(true);
     try {
       if (existingId && isMongoId(existingId)) {
+        // When saving to a specific project, always keep the copy private.
+        const saveEffectiveIsPublic = projectId ? false : saveIsPublic;
         const updated = await updateTemplate(existingId, {
           projectId: projectId,
           templateName: name,
           preview_image: thumb || "",
           designData,
-          isGlobal: saveIsPublic,
-          isPublic: saveIsPublic,
+          isGlobal: saveEffectiveIsPublic,
+          isPublic: saveEffectiveIsPublic,
         });
 
         const mapped = mapTemplateRecordToProjectTemplate(updated);
@@ -1329,14 +1339,16 @@ export function DesignerStudio() {
         lastPersistedHashRef.current = persistHash;
         toast.success(`Template "${name}" updated`);
       } else {
+        // New templates created from a project context stay private.
+        const createEffectiveIsPublic = projectId ? false : saveIsPublic;
         const created = await createTemplate({
           projectId: projectId,
           templateName: name,
           preview_image: thumb || "",
           category: "Other",
           designData,
-          isGlobal: saveIsPublic,
-          isPublic: saveIsPublic,
+          isGlobal: createEffectiveIsPublic,
+          isPublic: createEffectiveIsPublic,
         });
 
         const mapped = mapTemplateRecordToProjectTemplate(created);

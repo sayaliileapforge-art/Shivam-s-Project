@@ -16,7 +16,7 @@ import { nanoid } from "nanoid";
 import {
   ArrowLeft, Plus, Trash2, ChevronRight, ChevronLeft,
   CheckCircle2, AlertTriangle, Wand2,
-  Eye, EyeOff, Save, RotateCcw, Info, GripVertical,
+  Eye, EyeOff, Save, Info, GripVertical,
   FileSpreadsheet, Layers, Settings2, Play, Loader2,
   MoreVertical, ChevronUp, ChevronDown, ExternalLink,
 } from "lucide-react";
@@ -68,7 +68,7 @@ import {
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Step = 1 | 2 | 3 | 4;
+type Step = 1 | 2 | 3;
 type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean; _id?: string };
 
 interface RuleEntry {
@@ -80,7 +80,6 @@ interface RuleEntry {
   fieldMappings: FieldMapping[];
   groupOperator: "AND" | "OR";
   isDefault: boolean;
-  priority: number;
   active: boolean;
 }
 
@@ -92,7 +91,6 @@ const STEPS: { id: Step; label: string }[] = [
   { id: 1, label: "Upload CSV" },
   { id: 2, label: "Rule Builder" },
   { id: 3, label: "Field Mapping" },
-  { id: 4, label: "Preview & Generate" },
 ];
 
 const OPERATORS: ConditionOperator[] = [
@@ -220,7 +218,6 @@ function buildMappingsWithSchema(
 
 function makeRule(
   template: PreviewTemplateOption | null,
-  priority: number,
   csvColumns: string[],
   schema: FieldSchema[] = [],
 ): RuleEntry {
@@ -230,13 +227,12 @@ function makeRule(
     : autoMapFields(fields, csvColumns);
   return {
     localId: nanoid(),
-    name: template?.templateName ?? `Rule ${priority}`,
+    name: template?.templateName ?? "New Rule",
     template,
     conditionGroups: [],
     fieldMappings: mappings,
     groupOperator: "AND",
     isDefault: false,
-    priority,
     active: true,
   };
 }
@@ -314,7 +310,6 @@ function StepUploadCsv({
   const fileRef = useRef<HTMLInputElement>(null);
   const [isDrag, setIsDrag] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [showReplace, setShowReplace] = useState(false);
 
   const handleFile = async (file: File) => {
     if (!file.name.toLowerCase().endsWith(".csv")) {
@@ -325,7 +320,6 @@ function StepUploadCsv({
     try {
       const parsed = await parseCsvFile(file);
       onCsvLoaded(parsed);
-      setShowReplace(false);
       toast.success(`CSV loaded: ${parsed.rows.length} records, ${parsed.fields.length} columns`);
     } catch {
       toast.error("Failed to parse CSV");
@@ -342,7 +336,7 @@ function StepUploadCsv({
   };
 
   // Already has CSV from project data — show the "data loaded" card
-  if (csv && !showReplace) {
+  if (csv) {
     const updatedAt = savedInfo?.lastUpdated
       ? new Date(savedInfo.lastUpdated).toLocaleString()
       : null;
@@ -365,14 +359,6 @@ function StepUploadCsv({
             )}
           </div>
           <div className="flex flex-col sm:flex-row gap-2 flex-shrink-0">
-            <Button
-              size="sm"
-              variant="outline"
-              className="gap-1.5 text-xs border-emerald-300 hover:border-emerald-400"
-              onClick={() => setShowReplace(true)}
-            >
-              <RotateCcw className="h-3.5 w-3.5" />Replace CSV
-            </Button>
             <Button
               size="sm"
               className="gap-1.5 text-xs"
@@ -455,21 +441,9 @@ function StepUploadCsv({
     );
   }
 
-  // Fresh upload UI (first time, or user clicked "Replace CSV")
+  // Fresh upload UI (no CSV loaded yet)
   return (
     <div className="flex flex-col gap-6 max-w-3xl mx-auto">
-      {showReplace && (
-        <div className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 dark:bg-amber-950/20 px-4 py-3">
-          <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0" />
-          <p className="text-sm text-amber-700 dark:text-amber-400 flex-1">
-            Replacing the CSV will reset all field mappings. Your saved rules and conditions will be preserved.
-          </p>
-          <Button size="sm" variant="ghost" className="text-xs h-7" onClick={() => setShowReplace(false)}>
-            Cancel
-          </Button>
-        </div>
-      )}
-
       <div
         className={`relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-14 text-center transition-all cursor-pointer ${
           isDrag
@@ -655,7 +629,6 @@ function RuleCard({
           )}
         </div>
         <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
-          <span className="text-[10px] text-muted-foreground">Priority: {rule.priority}</span>
           {rule.active ? (
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-950/30">Active</Badge>
           ) : (
@@ -1139,6 +1112,10 @@ function StepRuleBuilder({
     }
   };
 
+  const updateGroupOperator = (groupIdx: number, op: "AND" | "OR") => {
+    patch({ conditionGroups: conditionGroups.map((g, i) => i !== groupIdx ? g : { ...g, operator: op }) });
+  };
+
   const matchedCount = useMemo(() => {
     if (!csv || !selectedRule) return 0;
     return filterRowsByRule({ conditionGroups: selectedRule.conditionGroups, groupOperator: selectedRule.groupOperator }, csv.rows).length;
@@ -1203,7 +1180,7 @@ function StepRuleBuilder({
 
           <div className="border-t px-3 py-2 bg-muted/20">
             <p className="text-[10px] text-muted-foreground leading-relaxed">
-              Templates are matched in priority order from top to bottom.
+              Templates are matched in order from top to bottom.
             </p>
           </div>
         </div>
@@ -1219,26 +1196,6 @@ function StepRuleBuilder({
                   <p className="text-xs text-muted-foreground mt-0.5">Rows matching these conditions will use this template.</p>
                 </div>
                 <div className="flex items-center gap-4 flex-shrink-0">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs text-muted-foreground">Priority</span>
-                    <div className="flex items-center gap-0.5">
-                      <Input
-                        type="number"
-                        min={1}
-                        value={selectedRule.priority}
-                        onChange={(e) => patch({ priority: Math.max(1, parseInt(e.target.value) || 1) })}
-                        className="h-7 w-12 text-xs text-center px-1"
-                      />
-                      <div className="flex flex-col">
-                        <button className="h-3.5 w-5 flex items-center justify-center hover:bg-muted rounded-sm" onClick={() => patch({ priority: Math.max(1, selectedRule.priority - 1) })}>
-                          <ChevronUp className="h-3 w-3" />
-                        </button>
-                        <button className="h-3.5 w-5 flex items-center justify-center hover:bg-muted rounded-sm" onClick={() => patch({ priority: selectedRule.priority + 1 })}>
-                          <ChevronDown className="h-3 w-3" />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">Active</span>
                     <Switch checked={selectedRule.active} onCheckedChange={(v) => patch({ active: v })} className="scale-90" />
@@ -1304,7 +1261,20 @@ function StepRuleBuilder({
                         {group.conditions.map((cond, condIdx) => (
                           <div key={cond.id}>
                             {condIdx > 0 && (
-                              <p className="text-[10px] font-semibold text-muted-foreground text-center my-1">{group.operator}</p>
+                              <div className="flex items-center justify-center my-1.5">
+                                <button
+                                  type="button"
+                                  title={group.operator === 'AND' ? 'Click to switch to OR (match any condition for this field)' : 'Click to switch to AND (all conditions must match)'}
+                                  onClick={() => updateGroupOperator(groupIdx, group.operator === 'AND' ? 'OR' : 'AND')}
+                                  className={
+                                    group.operator === 'OR'
+                                      ? 'text-[10px] font-bold px-2.5 py-0.5 rounded-full border cursor-pointer transition-colors bg-blue-100 border-blue-400 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/50 dark:border-blue-500 dark:text-blue-300'
+                                      : 'text-[10px] font-bold px-2.5 py-0.5 rounded-full border cursor-pointer transition-colors bg-muted border-border text-muted-foreground hover:bg-accent hover:text-foreground'
+                                  }
+                                >
+                                  {group.operator}
+                                </button>
+                              </div>
                             )}
                             <ConditionRow
                               condition={cond}
@@ -1338,7 +1308,7 @@ function StepRuleBuilder({
                     <p className="text-xs font-semibold text-blue-700 dark:text-blue-400 mb-1">How it works</p>
                     <p className="text-xs text-blue-600 dark:text-blue-500">
                       If a CSV row matches all the conditions above, this template will be used.
-                      If multiple templates match, the one with higher priority will be applied.
+                      If multiple rules match, the first matching rule (from top to bottom) will be applied.
                     </p>
                   </div>
                 </div>
@@ -1976,7 +1946,6 @@ export function RuleBuilderWorkflow() {
               fieldMappings,
               groupOperator: r.groupOperator,
               isDefault: r.isDefault,
-              priority: r.priority,
               active: r.isActive,
             };
           });
@@ -1993,8 +1962,8 @@ export function RuleBuilderWorkflow() {
           );
           const allRules: RuleEntry[] = [
             ...restoredRules,
-            ...missingTemplates.map((tpl, idx) =>
-              makeRule(tpl, restoredRules.length + idx + 1, cols, schema),
+            ...missingTemplates.map((tpl) =>
+              makeRule(tpl, cols, schema),
             ),
           ];
 
@@ -2015,7 +1984,7 @@ export function RuleBuilderWorkflow() {
           const orderedTemplates = preferredFirst
             ? [preferredFirst, ...mapped.filter((m) => m !== preferredFirst)]
             : mapped;
-          const seededRules = orderedTemplates.map((tpl, idx) => makeRule(tpl, idx + 1, cols, schema));
+          const seededRules = orderedTemplates.map((tpl) => makeRule(tpl, cols, schema));
           setRules(seededRules);
           setSelectedRuleId(seededRules[0]?.localId ?? null);
           // Stay on step 1 so user sees the banner and clicks "Continue"
@@ -2028,7 +1997,7 @@ export function RuleBuilderWorkflow() {
             const orderedTemplates = preferredFirst
               ? [preferredFirst, ...mapped.filter((m) => m !== preferredFirst)]
               : mapped;
-            const seededRules = orderedTemplates.map((tpl, idx) => makeRule(tpl, idx + 1, [], schema));
+            const seededRules = orderedTemplates.map((tpl) => makeRule(tpl, [], schema));
             setRules(seededRules);
             setSelectedRuleId(seededRules[0]?.localId ?? null);
           }
@@ -2063,9 +2032,8 @@ export function RuleBuilderWorkflow() {
 
   const handleAddRule = () => {
     const cols = csv?.fields.map((f) => f.key) ?? [];
-    const nextPriority = rules.length + 1;
     const template = allTemplates.find((t) => !rules.some((r) => r.template?.id === t.id)) ?? allTemplates[0] ?? null;
-    const newRule = makeRule(template, nextPriority, cols, projectFieldSchema);
+    const newRule = makeRule(template, cols, projectFieldSchema);
     setRules((prev) => [...prev, newRule]);
     setSelectedRuleId(newRule.localId);
   };
@@ -2135,7 +2103,6 @@ export function RuleBuilderWorkflow() {
           groupOperator: rule.groupOperator,
           conditionGroups: rule.conditionGroups,
           fieldMappings: rule.fieldMappings,
-          priority: rule.priority,
           isDefault: rule.isDefault,
         };
         if (rule._id) {
@@ -2147,6 +2114,8 @@ export function RuleBuilderWorkflow() {
         savedCount++;
       }
       toast.success(`${savedCount} rule${savedCount !== 1 ? "s" : ""} saved`);
+      // Navigate back to project after successful save
+      if (projectId) navigate(`/projects/${projectId}`);
     } catch (err) {
       toast.error((err as Error).message || "Failed to save rules");
     } finally {
@@ -2165,18 +2134,12 @@ export function RuleBuilderWorkflow() {
       if (rules.length === 0) { toast.error("Add at least one template rule first"); return; }
       setCompletedSteps((prev) => new Set([...prev, 1, 2])); setStep(3); return;
     }
-    if (target === 4) {
-      if (!csv) { toast.error("Upload a CSV file first"); return; }
-      if (rules.length === 0) { toast.error("Add at least one template rule first"); return; }
-      setCompletedSteps((prev) => new Set([...prev, 1, 2, 3])); setStep(4);
-    }
   };
 
   const canProceed =
     step === 1 ? Boolean(csv) :
     step === 2 ? Boolean(csv && rules.length > 0) :
-    step === 3 ? Boolean(csv && rules.length > 0) :
-    false;
+    Boolean(csv && rules.length > 0);
 
   if (templatesLoading || sessionLoading) {
     return (
@@ -2201,37 +2164,35 @@ export function RuleBuilderWorkflow() {
       )}
 
       <div className="flex-1 flex flex-col overflow-hidden min-h-0 bg-background">
-        {/* Top header */}
+        {/* Top header — single fixed-height row; stepper always inline */}
         <div className="border-b bg-card flex-shrink-0 z-40">
-          <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14 gap-4">
-            <div className="flex items-center gap-3 min-w-0">
-              <Button size="sm" variant="ghost" className="h-8 px-2 gap-1 text-muted-foreground" asChild>
+          <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14 gap-3">
+            {/* Left: back + title */}
+            <div className="flex items-center gap-2 min-w-0 flex-shrink-0">
+              <Button size="sm" variant="ghost" className="h-8 px-2 gap-1 text-muted-foreground flex-shrink-0" asChild>
                 <Link to={`/projects/${projectId}`}>
                   <ArrowLeft className="h-4 w-4" />
                   <span className="hidden sm:inline text-sm">Back</span>
                 </Link>
               </Button>
-              <div className="h-4 w-px bg-border" />
-              <div className="min-w-0">
-                <h1 className="font-semibold text-sm sm:text-base flex items-center gap-1.5">
-                  Rule Builder
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Info className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-                    </TooltipTrigger>
-                    <TooltipContent>Map multiple templates to CSV data using conditions.</TooltipContent>
-                  </Tooltip>
-                </h1>
-                <p className="text-xs text-muted-foreground hidden sm:block">
-                  Map multiple templates to your CSV data using conditions. Each row in your CSV will use the template that matches the defined rules.
-                </p>
-              </div>
+              <div className="h-4 w-px bg-border flex-shrink-0" />
+              <h1 className="font-semibold text-sm whitespace-nowrap flex items-center gap-1">
+                Rule Builder
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Info className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent>Map multiple templates to CSV data using conditions.</TooltipContent>
+                </Tooltip>
+              </h1>
             </div>
 
-            <div className="hidden md:flex flex-shrink-0">
+            {/* Centre: stepper — always visible at all breakpoints */}
+            <div className="flex flex-1 justify-center flex-shrink min-w-0 overflow-hidden">
               <Stepper current={step} completed={completedSteps} />
             </div>
 
+            {/* Right: action buttons */}
             <div className="flex items-center gap-2 flex-shrink-0">
               {step >= 2 && (
                 <Button size="sm" variant="outline" className="h-8 gap-1 text-xs hidden sm:flex"
@@ -2240,21 +2201,19 @@ export function RuleBuilderWorkflow() {
                   Save Rules
                 </Button>
               )}
-              {step < 4 ? (
+              {step < 3 ? (
                 <Button size="sm" className="h-8 gap-1 text-xs" onClick={() => goToStep((step + 1) as Step)} disabled={!canProceed}>
-                  {step === 1 ? "Next: Rule Builder" : step === 2 ? "Next: Field Mapping" : "Preview & Generate"}
+                  <span className="hidden sm:inline">{step === 1 ? "Next: Rule Builder" : "Next: Field Mapping"}</span>
+                  <span className="sm:hidden">Next</span>
                   <ChevronRight className="h-3.5 w-3.5" />
                 </Button>
               ) : (
                 <Button size="sm" className="h-8 gap-1 text-xs" onClick={handleSaveRules} disabled={isSaving || rules.length === 0}>
                   {isSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-                  Save &amp; Finish
+                  <span className="hidden sm:inline">Save &amp; Finish</span>
                 </Button>
               )}
             </div>
-          </div>
-          <div className="md:hidden flex justify-center pb-3">
-            <Stepper current={step} completed={completedSteps} />
           </div>
         </div>
 
@@ -2302,17 +2261,13 @@ export function RuleBuilderWorkflow() {
               />
             </div>
           )}
-          {step === 4 && (
-            <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
-              <StepPreviewGenerate rules={rules} csv={csv} projectId={projectId ?? ""} />
-            </div>
-          )}
+
         </div>
 
         {/* Footer */}
         <div className="border-t bg-card flex-shrink-0">
           <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-2.5 flex items-center justify-between">
-            <Button variant="ghost" size="sm" className="gap-1.5" onClick={() => step > 1 && setStep((s) => (s - 1) as Step)} disabled={step === 1}>
+            <Button variant="ghost" size="sm" className="gap-1.5" onClick={() => step > 1 ? setStep((s) => (s - 1) as Step) : navigate(`/projects/${projectId ?? ''}`)} disabled={false}>
               <ChevronLeft className="h-4 w-4" />Cancel
             </Button>
 
@@ -2331,10 +2286,17 @@ export function RuleBuilderWorkflow() {
                   Save Rules
                 </Button>
               )}
-              <Button size="sm" className="gap-1.5" onClick={() => goToStep((step + 1) as Step)} disabled={!canProceed || step === 4}>
-                {step === 2 ? "Next: Field Mapping" : step === 3 ? "Preview & Generate" : "Next: Rule Builder"}
-                <ChevronRight className="h-4 w-4" />
-              </Button>
+              {step < 3 ? (
+                <Button size="sm" className="gap-1.5" onClick={() => goToStep((step + 1) as Step)} disabled={!canProceed}>
+                  {step === 2 ? "Next: Field Mapping" : "Next: Rule Builder"}
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              ) : (
+                <Button size="sm" className="gap-1.5" onClick={handleSaveRules} disabled={isSaving || rules.length === 0}>
+                  {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                  Save &amp; Finish
+                </Button>
+              )}
             </div>
           </div>
         </div>

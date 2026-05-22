@@ -225,10 +225,10 @@ export function Layout() {
         `}</style>
         <div data-sidebar-main="true" className={isFullScreenWorkflow ? "flex flex-col h-screen overflow-hidden" : ""}>
           {/* Top Bar */}
-        <header className={`border-b bg-card px-4 py-3 shadow-sm lg:px-6 ${isFullScreenWorkflow ? "flex-shrink-0 z-40" : "sticky top-0 z-40"}`}>
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        <header className={`border-b bg-card shadow-sm ${isFullScreenWorkflow ? "flex-shrink-0 z-40 h-14 px-4 lg:px-6" : "sticky top-0 z-40 px-4 py-3 lg:px-6"}`}>
+          <div className={`flex items-center justify-between gap-3 ${isFullScreenWorkflow ? "h-full" : "flex-wrap"}`}>
             {/* Left Section: mobile menu + search */}
-            <div className="flex w-full items-center gap-3 lg:w-auto lg:flex-1">
+            <div className={`flex items-center gap-3 ${isFullScreenWorkflow ? "flex-1 min-w-0" : "w-full lg:w-auto lg:flex-1"}`}>
               <Button
                 variant="ghost"
                 size="icon"
@@ -249,7 +249,7 @@ export function Layout() {
             </div>
 
             {/* Right Section: notifications + theme + profile */}
-            <div className="flex w-full items-center justify-end gap-2 sm:gap-3 lg:w-auto">
+            <div className={`flex items-center justify-end gap-2 sm:gap-3 ${isFullScreenWorkflow ? "flex-shrink-0" : "w-full lg:w-auto"}`}>
               <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon" className="relative">

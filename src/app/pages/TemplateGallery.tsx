@@ -3,9 +3,12 @@ import { useNavigate, useSearchParams } from "react-router";
 import {
   Search, Globe, Star, Clock, Heart, ChevronLeft,
   ChevronRight, RotateCcw, Eye, Plus, X, ChevronDown, ImageOff, Loader2,
-  MoreVertical, Pencil, Copy, Trash2, Info,
+  MoreVertical, Pencil, Copy, Trash2, Info, CheckCircle2, FolderKanban,
 } from "lucide-react";
 import { cn } from "../components/ui/utils";
+import { useRbac } from "../../lib/rbac/RbacContext";
+import { Role } from "../../lib/rbac/roles";
+import { fetchProjects } from "../../lib/apiService";
 import { getTemplates, createTemplate, getTemplateById, readTemplateFromLocalCache, resolveTemplatePreview, getGalleryCacheData, type TemplateRecord } from "../../lib/templateApi";
 import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
@@ -113,6 +116,8 @@ const TemplateCard = memo(function TemplateCard({
   projectId, isAttaching, onDuplicate, onDelete, isDuplicating, onImgError, isGenerating,
 }: TemplateCardProps) {
   const navigate = useNavigate();
+  const { hasRole } = useRbac();
+  const isAdmin = hasRole(Role.SUPER_ADMIN);
   const [imgError, setImgError] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -200,30 +205,34 @@ const TemplateCard = memo(function TemplateCard({
       */}
       {menuOpen && (
         <div className="absolute right-2 top-9 z-[100] min-w-[185px] rounded-xl border border-gray-200 bg-white py-1 shadow-2xl">
-          <button
-            onClick={() => {
-              setMenuOpen(false);
-              localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-                projectId: t.productId || "",
-                templateId: t._id,
-                templateName: t.templateName,
-              }));
-              navigate(`/designer-studio?templateId=${t._id}`);
-            }}
-            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
-          >
-            <Pencil className="h-3.5 w-3.5 text-gray-400" /> Edit Template
-          </button>
-          <button
-            onClick={() => { setMenuOpen(false); onDuplicate(t); }}
-            disabled={isDuplicating}
-            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors disabled:opacity-50"
-          >
-            {isDuplicating
-              ? <Loader2 className="h-3.5 w-3.5 animate-spin text-gray-400" />
-              : <Copy className="h-3.5 w-3.5 text-gray-400" />}
-            {isDuplicating ? "Duplicating…" : "Duplicate Template"}
-          </button>
+          {isAdmin && (
+            <button
+              onClick={() => {
+                setMenuOpen(false);
+                localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+                  projectId: t.productId || "",
+                  templateId: t._id,
+                  templateName: t.templateName,
+                }));
+                navigate(`/designer-studio?templateId=${t._id}`);
+              }}
+              className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+            >
+              <Pencil className="h-3.5 w-3.5 text-gray-400" /> Edit Template
+            </button>
+          )}
+          {isAdmin && (
+            <button
+              onClick={() => { setMenuOpen(false); onDuplicate(t); }}
+              disabled={isDuplicating}
+              className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors disabled:opacity-50"
+            >
+              {isDuplicating
+                ? <Loader2 className="h-3.5 w-3.5 animate-spin text-gray-400" />
+                : <Copy className="h-3.5 w-3.5 text-gray-400" />}
+              {isDuplicating ? "Duplicating…" : "Duplicate Template"}
+            </button>
+          )}
           <button
             onClick={() => { setMenuOpen(false); onToggleFavorite(t._id); }}
             className="flex w-full items-center gap-2.5 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
@@ -237,13 +246,17 @@ const TemplateCard = memo(function TemplateCard({
           >
             <Info className="h-3.5 w-3.5 text-gray-400" /> View Details
           </button>
-          <div className="my-1 border-t border-gray-100" />
-          <button
-            onClick={() => { setMenuOpen(false); onDelete(t); }}
-            className="flex w-full items-center gap-2.5 px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50 transition-colors"
-          >
-            <Trash2 className="h-3.5 w-3.5" /> Delete Template
-          </button>
+          {isAdmin && (
+            <>
+              <div className="my-1 border-t border-gray-100" />
+              <button
+                onClick={() => { setMenuOpen(false); onDelete(t); }}
+                className="flex w-full items-center gap-2.5 px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50 transition-colors"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Delete Template
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -256,15 +269,9 @@ const TemplateCard = memo(function TemplateCard({
         <div className="flex gap-2">
           <button
             onClick={() => onUse(t)}
-            disabled={isAttaching}
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-blue-600 bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 active:bg-blue-800 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-blue-600 bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 active:bg-blue-800 transition-colors"
           >
-            {isAttaching
-              ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Attaching…</>
-              : projectId
-                ? <><Plus className="h-3.5 w-3.5" /> Attach to Project</>
-                : <><Plus className="h-3.5 w-3.5" /> Use Template</>
-            }
+            <Plus className="h-3.5 w-3.5" /> Attach Template
           </button>
           <button
             onClick={() => onPreview(t)}
@@ -286,6 +293,158 @@ const TemplateCard = memo(function TemplateCard({
   prev.isGenerating === next.isGenerating &&
   prev.projectId === next.projectId
 );
+
+// ─── Attach To Project Modal ──────────────────────────────────────────────────
+
+function AttachToProjectModal({
+  template,
+  onClose,
+  onConfirm,
+}: {
+  template: TemplateRecord;
+  onClose: () => void;
+  onConfirm: (projectId: string) => Promise<void>;
+}) {
+  const [projects, setProjects] = useState<any[]>([]);
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [attaching, setAttaching] = useState(false);
+
+  useEffect(() => {
+    fetchProjects().then((data) => {
+      setProjects(data ?? []);
+      setLoadingProjects(false);
+    });
+  }, []);
+
+  const filtered = projects.filter((p) => {
+    const q = search.toLowerCase();
+    return (
+      (p.name ?? "").toLowerCase().includes(q) ||
+      (p.client ?? p.clientName ?? "").toLowerCase().includes(q)
+    );
+  });
+
+  const handleConfirm = async () => {
+    if (!selectedId || attaching) return;
+    setAttaching(true);
+    try {
+      await onConfirm(selectedId);
+    } finally {
+      setAttaching(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="flex w-full max-w-md flex-col rounded-2xl bg-white shadow-2xl"
+        style={{ maxHeight: "80vh" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex shrink-0 items-center justify-between border-b px-5 py-4">
+          <div>
+            <h3 className="font-semibold text-gray-900">Attach Template to Project</h3>
+            <p className="mt-0.5 text-xs text-gray-500 line-clamp-1">"{template.templateName}"</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-lg p-1.5 hover:bg-gray-100 transition-colors"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Search */}
+        <div className="shrink-0 border-b px-5 py-3">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400 pointer-events-none" />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search projects…"
+              className="w-full rounded-lg border border-gray-200 py-2 pl-8 pr-3 text-sm outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            />
+          </div>
+        </div>
+
+        {/* Project list */}
+        <div className="flex-1 overflow-y-auto px-5 py-3 space-y-2 min-h-0">
+          {loadingProjects ? (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
+            </div>
+          ) : filtered.length === 0 ? (
+            <div className="flex flex-col items-center gap-2 py-12 text-gray-400">
+              <FolderKanban className="h-10 w-10" />
+              <p className="text-sm">No projects found</p>
+            </div>
+          ) : (
+            filtered.map((p) => {
+              const pid = p._id || p.id;
+              const isSelected = selectedId === pid;
+              const initial = (p.name ?? "?")[0].toUpperCase();
+              return (
+                <button
+                  key={pid}
+                  onClick={() => setSelectedId(pid)}
+                  className={cn(
+                    "flex w-full items-center gap-3 rounded-xl border p-3 text-left transition-all",
+                    isSelected
+                      ? "border-blue-500 bg-blue-50"
+                      : "border-gray-200 hover:border-gray-300 hover:bg-gray-50",
+                  )}
+                >
+                  <div
+                    className={cn(
+                      "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-sm font-bold",
+                      isSelected ? "bg-blue-500 text-white" : "bg-gray-100 text-gray-600",
+                    )}
+                  >
+                    {initial}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="truncate text-sm font-medium text-gray-900">{p.name}</p>
+                    <p className="truncate text-xs text-gray-500">
+                      {p.client ?? p.clientName ?? ""}
+                      {p.stage ? ` · ${p.stage}` : ""}
+                    </p>
+                  </div>
+                  {isSelected && <CheckCircle2 className="h-4 w-4 shrink-0 text-blue-500" />}
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex shrink-0 justify-end gap-2 border-t px-5 py-4">
+          <button
+            onClick={onClose}
+            disabled={attaching}
+            className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={!selectedId || attaching}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {attaching
+              ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Attaching…</>
+              : <><Plus className="h-3.5 w-3.5" /> Attach Template</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ─── Delete Confirm Modal ─────────────────────────────────────────────────────
 
@@ -442,6 +601,7 @@ export function TemplateGallery() {
   const [duplicatingTemplateId, setDuplicatingTemplateId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget]                   = useState<TemplateRecord | null>(null);
   const [isDeleting, setIsDeleting]                       = useState(false);
+  const [attachModalTemplate, setAttachModalTemplate]     = useState<TemplateRecord | null>(null);
 
   const fetchTemplates = useCallback((isRetry = false) => {
     // Prevent overlapping concurrent fetches (e.g. SSE + polling both firing at once).
@@ -615,66 +775,45 @@ export function TemplateGallery() {
   useEffect(() => { setCurrentPage(1); },
     [debouncedQuery, selectedCategories, selectedSizes, orientation, activeTab, dropdownSize, dropdownCategory, dropdownOrientation]);
 
-  const handleUseTemplate = useCallback(async (t: TemplateRecord) => {
-    if (projectId) {
-      // Attach mode: clone the global template into the project
-      setAttachingTemplateId(t._id);
+  const handleUseTemplate = useCallback((t: TemplateRecord) => {
+    setAttachModalTemplate(t);
+  }, []);
+
+  const handleConfirmAttach = useCallback(async (template: TemplateRecord, selectedProjectId: string) => {
+    setAttachingTemplateId(template._id);
+    try {
+      let fullDesignData: Record<string, any> = {};
       try {
-        // The gallery returns lean meta docs (no designData). Fetch the full
-        // template first so the project copy contains the actual canvas design.
-        let fullDesignData: Record<string, any> = {};
-        try {
-          const full = await getTemplateById(t._id);
-          fullDesignData = (full.designData as Record<string, any>) ?? {};
-        } catch {
-          // Non-fatal: attach proceeds with empty designData if fetch fails
-        }
-        const result = await createTemplate({
-          projectId: projectId,
-          templateName: t.templateName,
-          preview_image: resolveTemplatePreview(t, { fallbackToPlaceholder: false }),
-          category: (t.category as any) || "Other",
-          designData: fullDesignData,
-          isGlobal: false,
-          isPublic: false,
-        }) as any;
-        setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
-        if (result?.alreadyExists) {
-          toast.info(`"${t.templateName}" is already attached to this project.`);
-        } else {
-          toast.success(`"${t.templateName}" attached to project.`);
-        }
-        // Pass the created template via navigation state so ProjectDetail can
-        // display it immediately without waiting for the async DB re-fetch.
-        navigate(`/projects/${projectId}?tab=templates`, {
-          state: { justAttachedTemplate: result },
-        });
-      } catch (err) {
-        toast.error((err as Error).message || "Failed to attach template to project.");
-      } finally {
-        setAttachingTemplateId(null);
+        const full = await getTemplateById(template._id);
+        fullDesignData = (full.designData as Record<string, any>) ?? {};
+      } catch {
+        // Non-fatal: attach proceeds with empty designData if fetch fails
       }
-      return;
+      const result = await createTemplate({
+        projectId: selectedProjectId,
+        templateName: template.templateName,
+        preview_image: resolveTemplatePreview(template, { fallbackToPlaceholder: false }),
+        category: (template.category as any) || "Other",
+        designData: fullDesignData,
+        isGlobal: false,
+        isPublic: false,
+      }) as any;
+      setRecentlyUsed((prev) => [template._id, ...prev.filter((id) => id !== template._id)].slice(0, 20));
+      setAttachModalTemplate(null);
+      if (result?.alreadyExists) {
+        toast.info(`"${template.templateName}" is already attached to this project.`);
+      } else {
+        toast.success(`"${template.templateName}" attached to project.`);
+      }
+      navigate(`/projects/${selectedProjectId}?tab=templates`, {
+        state: { justAttachedTemplate: result },
+      });
+    } catch (err) {
+      toast.error((err as Error).message || "Failed to attach template to project.");
+    } finally {
+      setAttachingTemplateId(null);
     }
-    // Gallery mode: open in Designer Studio
-    setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
-    // Set designer context so DesignerStudio can load the correct template
-    // immediately without relying on stale localStorage from a previous session.
-    localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
-      projectId: '',
-      templateId: t._id,
-      projectName: '',
-      templateName: t.templateName,
-    }));
-    // Check the localStorage template cache first — if this template was loaded
-    // before, we have the full designData instantly. Otherwise navigate immediately
-    // and let DesignerStudio handle fetching (with retry/skip UI).  This removes
-    // the 45 s blocking spinner that previously blocked navigation on Atlas M0.
-    const cachedFull = readTemplateFromLocalCache(t._id);
-    navigate(`/designer-studio?templateId=${t._id}`, {
-      state: { preloadedTemplate: cachedFull ?? t },
-    });
-  }, [projectId, navigate, setRecentlyUsed]);
+  }, [navigate, setRecentlyUsed]);
 
   const toggleFavorite = useCallback((id: string) =>
     setFavorites((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]),
@@ -710,7 +849,7 @@ export function TemplateGallery() {
       setTemplates((prev) => prev.filter((t) => t._id !== deleteTarget._id));
       setFavorites((prev) => prev.filter((id) => id !== deleteTarget._id));
       setRecentlyUsed((prev) => prev.filter((id) => id !== deleteTarget._id));
-      toast.success(`"${deleteTarget.templateName}" deleted.`);
+      toast.error(`"${deleteTarget.templateName}" deleted from gallery.`);
       setDeleteTarget(null);
     } catch (err) {
       toast.error((err as Error).message || "Failed to delete template.");
@@ -747,6 +886,17 @@ export function TemplateGallery() {
 
   return (
     <div className="flex min-h-screen flex-col bg-gray-50">
+      {/* ── Attach To Project Modal ── */}
+      {attachModalTemplate && (
+        <AttachToProjectModal
+          template={attachModalTemplate}
+          onClose={() => setAttachModalTemplate(null)}
+          onConfirm={(selectedProjectId) =>
+            handleConfirmAttach(attachModalTemplate, selectedProjectId)
+          }
+        />
+      )}
+
       {/* ── Delete Confirmation Modal ── */}
       {deleteTarget && (
         <DeleteConfirmModal

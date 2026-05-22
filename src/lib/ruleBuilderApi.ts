@@ -183,10 +183,29 @@ export function evaluateConditionGroup(
   row: Record<string, string>
 ): boolean {
   if (group.conditions.length === 0) return true;
-  if (group.operator === 'AND') {
-    return group.conditions.every((c) => evaluateCondition(c, row));
+
+  // OR group: any condition passes.
+  if (group.operator === 'OR') {
+    return group.conditions.some((c) => evaluateCondition(c, row));
   }
-  return group.conditions.some((c) => evaluateCondition(c, row));
+
+  // AND group — but with "smart OR" for same-field conditions:
+  // When multiple conditions in an AND group reference the SAME field (e.g.
+  // className=1st, className=2nd, className=3rd) a single record can never
+  // satisfy all of them simultaneously. So we treat same-field conditions
+  // within an AND group as OR between themselves, then AND the field groups.
+  //   [className=1st, className=2nd, className=3rd]  →  (1st OR 2nd OR 3rd)
+  //   [className=1st, section=A]                     →  className=1st AND section=A
+  //   [className=1st, className=2nd, section=A]       →  (1st OR 2nd) AND section=A
+  const fieldMap = new Map<string, Condition[]>();
+  for (const cond of group.conditions) {
+    const bucket = fieldMap.get(cond.field) ?? [];
+    bucket.push(cond);
+    fieldMap.set(cond.field, bucket);
+  }
+  return [...fieldMap.values()].every((bucket) =>
+    bucket.some((c) => evaluateCondition(c, row))
+  );
 }
 
 export function evaluateRule(

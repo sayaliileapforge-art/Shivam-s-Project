@@ -22,6 +22,10 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger,
 } from "../components/ui/dialog";
 import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "../components/ui/alert-dialog";
+import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "../components/ui/select";
 import { Switch } from "../components/ui/switch";
@@ -56,10 +60,12 @@ import {
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
 import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
-import { createTemplate, getTemplateById, resolveTemplatePreview, getProjectTemplateCacheData, invalidateTemplateCache, setProjectTemplateCacheData, type TemplateRecord } from "../../lib/templateApi";
+import { createTemplate, getTemplateById, deleteTemplate, resolveTemplatePreview, getProjectTemplateCacheData, invalidateTemplateCache, setProjectTemplateCacheData, type TemplateRecord } from "../../lib/templateApi";
+import { toast } from "sonner";
 import { matchImages } from "../../lib/imageMatchEngine";
 import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
+import { getRulesByProject, evaluateRule, type PrintRule } from "../../lib/ruleBuilderApi";
 
 // ─── Template dialog types ───────────────────────────────────────────────────
 type PageFormat = "a4" | "13x19" | "custom";
@@ -181,6 +187,8 @@ interface PreviewGenerationForm {
   useFieldBasedMapping: boolean;
   templateMappings: TemplateMappingRule[];
   fallbackTemplateId: string;
+  // Rule-based template assignment (from saved Rule Builder rules)
+  useRuleBasedMapping: boolean;
 }
 
 const PAGE_SIZE_DIMENSIONS: Record<Exclude<PreviewPageSize, "Custom">, { width: number; height: number }> = {
@@ -208,6 +216,7 @@ const emptyPreviewForm: PreviewGenerationForm = {
   useFieldBasedMapping: false,
   templateMappings: [],
   fallbackTemplateId: "",
+  useRuleBasedMapping: false,
 };
 
 const previewMappingStorageKey = (projectId: string, category: DataCategory) =>
@@ -687,6 +696,10 @@ export function ProjectDetail() {
   const [previewPageIndex, setPreviewPageIndex] = useState(0);
   const [previewZoom, setPreviewZoom] = useState(50);
   const previewContainerRef = useRef<HTMLDivElement>(null);
+  // Saved Rule Builder rules for this project — used in rule-based Generate Preview
+  const [projectRules, setProjectRules] = useState<PrintRule[]>([]);
+  // Per-record template assignments computed by applying saved rules to selected records
+  const [ruleAssignments, setRuleAssignments] = useState<Record<number, string> | null>(null);
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
 
   // Template dialog state
@@ -698,6 +711,7 @@ export function ProjectDetail() {
   const [brokenTemplatePreviewIds, setBrokenTemplatePreviewIds] = useState<Record<string, true>>({});
   const [bgGeneratedPreviews, setBgGeneratedPreviews] = useState<Record<string, string>>({});
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [confirmDeleteTemplate, setConfirmDeleteTemplate] = useState<PreviewTemplateOption | null>(null);
   const [activeTab, setActiveTab] = useState("details");
   const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>(() => {
     // Serve stale-while-revalidate: show cached data instantly if available
@@ -765,7 +779,11 @@ export function ProjectDetail() {
     setRemoteTemplatesLoading((prev) => (remoteTemplates.length === 0 ? true : prev));
     setRemoteTemplatesError("");
 
-    fetch(requestUrl)
+    // When remoteTemplatesVersion > 0 it means a forced refresh was requested
+    // (e.g. after attaching a template). Bypass the browser's HTTP cache so we
+    // always get the freshest data from the server even if Cache-Control
+    // max-age has not expired yet.
+    fetch(requestUrl, { cache: remoteTemplatesVersion > 0 ? 'no-cache' : 'default' })
       .then(async (response) => {
         const json = await response.json();
         if (!response.ok || json?.success === false) {
@@ -823,6 +841,14 @@ export function ProjectDetail() {
       setRemoteTemplatesVersion((v) => v + 1);
     });
     return unsubscribe;
+  }, [id]);
+
+  // Load saved Rule Builder rules for this project
+  useEffect(() => {
+    if (!id) return;
+    getRulesByProject(id)
+      .then((rules) => setProjectRules(rules.filter((r) => r.isActive !== false)))
+      .catch(() => setProjectRules([]));
   }, [id]);
 
   // Fetch full template data (with canvasJSON) when a template is selected in preview form
@@ -1110,6 +1136,65 @@ export function ProjectDetail() {
 
   const refresh = () => setVersion((v) => v + 1);
 
+  /** Remove a template from this project only — does NOT touch the Template Gallery. */
+  const handleDeleteProjectTemplate = useCallback(async (tmpl: PreviewTemplateOption) => {
+    // Resolve the MongoDB ID (remoteId takes priority; fall back to id if it looks like one).
+    const mongoId =
+      MONGODB_OBJECT_ID_RE.test(String((tmpl as any).remoteId || ""))
+        ? String((tmpl as any).remoteId)
+        : MONGODB_OBJECT_ID_RE.test(String(tmpl.id || ""))
+          ? String(tmpl.id)
+          : "";
+
+    // 1. Optimistically remove from remoteTemplates state so UI updates instantly.
+    setRemoteTemplates((prev) =>
+      prev.filter((t) => {
+        if (t.id === tmpl.id) return false;
+        if (mongoId && t.id === mongoId) return false;
+        if (mongoId && String((t as any).remoteId || "") === mongoId) return false;
+        return true;
+      })
+    );
+
+    // 2. Remove ALL matching localStorage entries — by direct id AND by remoteId.
+    //    Templates added via the Edit flow use 'TMPL-edit-<mongoId>' as their local id
+    //    with remoteId pointing to the same MongoDB document. Both must be purged so
+    //    they don't reappear from localStorage on the next render.
+    const allLocal = loadAllProjectTemplates();
+    const idsToDelete = new Set<string>();
+    idsToDelete.add(tmpl.id);
+    if (mongoId) idsToDelete.add(mongoId);
+    allLocal.forEach((t) => {
+      if (mongoId && String((t as any).remoteId || "") === mongoId) idsToDelete.add(t.id);
+      if (t.templateName === tmpl.templateName && t.projectId === tmpl.projectId) idsToDelete.add(t.id);
+    });
+    idsToDelete.forEach((localId) => deleteProjectTemplate(localId));
+
+    // 3. Immediately clear the per-project API cache from localStorage so that on
+    //    page reload the stale data is not served and the skip-fetch guard doesn't fire.
+    //    This must happen synchronously — before the async network call — so it takes
+    //    effect even if the DELETE request fails or the user reloads during the await.
+    if (id) invalidateTemplateCache(id);
+
+    // 4. Delete from MongoDB if it has a backend record.
+    //    Project-specific templates (isGlobal = false) are NOT in the Template Gallery,
+    //    so this only removes the project copy — the gallery is unaffected.
+    if (mongoId) {
+      try {
+        await deleteTemplate(mongoId);
+      } catch {
+        // Non-fatal: record is already removed from UI and cache is cleared.
+      }
+    }
+
+    // 5. Force a background re-fetch from MongoDB to confirm the deletion persisted.
+    //    This catches the edge case where the network delete failed — the template
+    //    will reappear (expected), letting the user know the operation didn't succeed.
+    setRemoteTemplatesVersion((v) => v + 1);
+
+    toast.error(`"${tmpl.templateName}" removed from project.`);
+  }, [id]);
+
   // Generation counter — incremented every time the user explicitly mutates records
   // (Delete All, CSV import, apply bulk images, etc.).  The hydrateFromBackend effect
   // snapshots this value before its async fetch and aborts applying the result if the
@@ -1238,7 +1323,16 @@ export function ProjectDetail() {
     }
     const justAttached = (location.state as any)?.justAttachedTemplate;
     if (justAttached) {
-      // Refresh local templates list and remote API list
+      // Optimistic update: immediately insert the newly attached template so it
+      // appears without waiting for the background re-fetch to complete.
+      if (!justAttached.alreadyExists) {
+        const mapped = mapApiTemplateToProjectTemplate(justAttached as TemplateRecord);
+        setRemoteTemplates((prev) => {
+          if (prev.some((t) => t.id === mapped.id)) return prev;
+          return [...prev, mapped];
+        });
+      }
+      // Also trigger a full background refresh for data consistency
       setVersion((v) => v + 1);
       setRemoteTemplatesVersion((v) => v + 1);
       setActiveTab("templates");
@@ -2221,32 +2315,220 @@ export function ProjectDetail() {
     return () => cancelAnimationFrame(rafId);
   }, [isGeneratePreviewOpen, printLayout.sheetWidthPx, printLayout.sheetHeightPx]);
 
-  const handleOpenGeneratePreview = () => {
+  // ── Rule-based helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Determine if a rule is a "catch-all" (no conditions at all, or all condition groups
+   * have 0 conditions). A catch-all rule should only be evaluated LAST.
+   */
+  const isEffectiveCatchAll = (rule: PrintRule) =>
+    rule.conditionGroups.length === 0 ||
+    rule.conditionGroups.every((g) => g.conditions.length === 0);
+
+  /**
+   * Build a row for rule evaluation from a ProjectDataRecord.
+   * The key insight: CSV column names in rules (e.g. "admissionNo") may differ in casing
+   * from how the same field is stored in project data records (e.g. "AdmissionNo").
+   * This function builds a row that has BOTH the exact record keys AND adds entries for
+   * each condition field by doing a normalized (lowercase, alphanumeric-only) key match.
+   */
+  const buildNormalizedRuleRow = (
+    rawRecord: Record<string, unknown>,
+    rules: PrintRule[]
+  ): Record<string, string> => {
+    const normalizeKey = (k: string) => k.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    // Common field-name suffixes that may be present in one source but absent in another
+    // e.g. "className" (condition) vs "Class" (record) → strip "name" → match
+    const FIELD_SUFFIXES = ["name", "no", "num", "number", "code", "id"];
+
+    const resolveFieldValue = (normField: string, lookup: Record<string, string>): string | undefined => {
+      // 1. Direct normalized match
+      if (normField in lookup) return lookup[normField];
+      // 2. Condition field has extra suffix → strip it to match a shorter record key
+      //    e.g. "classname" → strip "name" → "class" matches record key "Class"
+      for (const suf of FIELD_SUFFIXES) {
+        if (normField.length > suf.length + 2 && normField.endsWith(suf)) {
+          const stripped = normField.slice(0, -suf.length);
+          if (stripped in lookup) return lookup[stripped];
+        }
+      }
+      // 3. Record field has extra suffix → condition key is a prefix of the record key
+      //    e.g. condition "class", record key "className" → "classname" starts with "class", extra = "name"
+      for (const [rk, rv] of Object.entries(lookup)) {
+        if (rk.length > normField.length && rk.startsWith(normField)) {
+          const extra = rk.slice(normField.length);
+          if (FIELD_SUFFIXES.includes(extra)) return rv;
+        }
+      }
+      return undefined;
+    };
+
+    // Store original record fields (exact key → string value)
+    const row: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawRecord)) {
+      row[k] = v == null ? "" : String(v);
+    }
+
+    // Build a normalized lookup: normKey → value
+    const normLookup: Record<string, string> = {};
+    for (const [k, v] of Object.entries(row)) {
+      const nk = normalizeKey(k);
+      if (!(nk in normLookup)) normLookup[nk] = v;
+    }
+
+    // For each condition field used in rules, if not already in row with exact key,
+    // find it via normalized + suffix-aware match and add it under the condition's field name.
+    for (const rule of rules) {
+      for (const group of rule.conditionGroups) {
+        for (const condition of group.conditions) {
+          if (!(condition.field in row)) {
+            const normField = normalizeKey(condition.field);
+            const val = resolveFieldValue(normField, normLookup);
+            if (val !== undefined) {
+              row[condition.field] = val;
+            }
+          }
+        }
+      }
+    }
+
+    return row;
+  };
+
+  const handleOpenGeneratePreview = async () => {
     if (!selectedRecords.length) return;
 
+    // ── ALWAYS fetch the latest saved rules from the server before evaluating ──
+    // This ensures any changes saved in the Rule Builder are picked up immediately
+    // rather than relying on potentially stale in-memory state.
+    let activeRules: typeof projectRules = [];
+    if (id) {
+      try {
+        const freshRules = await getRulesByProject(id);
+        const filtered = freshRules.filter((r) => r.isActive !== false);
+        setProjectRules(filtered);
+        activeRules = filtered;
+      } catch {
+        // Fall back to in-memory rules if the fetch fails
+        activeRules = projectRules.filter((r) => r.isActive !== false);
+      }
+    } else {
+      activeRules = projectRules.filter((r) => r.isActive !== false);
+    }
+
+    // ── Rule-based matching: apply saved rules to selected records ──
+    if (activeRules.length > 0) {
+      // Sort: specific rules (with conditions) first, catch-alls last, then by priority
+      const sortedRules = [...activeRules]
+        .filter((r) => Boolean(r.templateId)) // skip rules with no template assigned
+        .sort((a, b) => {
+          const aCatchAll = isEffectiveCatchAll(a);
+          const bCatchAll = isEffectiveCatchAll(b);
+          if (aCatchAll !== bCatchAll) return aCatchAll ? 1 : -1; // specific rules first
+          return (a.priority ?? 0) - (b.priority ?? 0);
+        });
+
+      // Compute per-record template ID assignments using rule conditions
+      const assignments: Record<number, string> = {};
+      const matchLog: Array<{ idx: number; field?: string; value?: string; rule: string; templateId: string }> = [];
+
+      selectedRecords.forEach((record, idx) => {
+        // Build a case-insensitive normalized row so field name casing differences don't break matching
+        const row = buildNormalizedRuleRow(record as Record<string, unknown>, sortedRules);
+
+        // First matching rule wins (sorted: specific → catch-all)
+        const matchedRule = sortedRules.find((rule) => evaluateRule(rule, row));
+        if (matchedRule) {
+          assignments[idx] = matchedRule.templateId;
+          const firstCondition = matchedRule.conditionGroups[0]?.conditions[0];
+          matchLog.push({
+            idx,
+            field: firstCondition?.field,
+            value: firstCondition ? String(row[firstCondition.field] ?? "") : undefined,
+            rule: matchedRule.templateName,
+            templateId: matchedRule.templateId,
+          });
+        }
+      });
+
+      console.log(`[RulePreview] ${sortedRules.length} active rules · ${selectedRecords.length} records · ${Object.keys(assignments).length} matched`, matchLog.slice(0, 10));
+
+      // ── Determine the fallback template ID (for records matched by no rule) ──
+      // Priority: catch-all rule (0 conditions) → first rule
+      const catchAllRule = sortedRules.find((r) => isEffectiveCatchAll(r));
+      const fallbackRule = catchAllRule ?? sortedRules[0];
+      const fallbackTemplateId = fallbackRule?.templateId ?? "";
+
+      // Raw MongoDB ID of the fallback template – the backend can always resolve this
+      // directly from DB even when findPreviewTemplateByLookupId() can't find it locally.
+      const topTemplateId = fallbackTemplateId || (assignments[0] ?? "");
+
+      // Try to resolve the fallback template locally for orientation/type hints.
+      // Deliberately do NOT fall back to galleryTemplateOptions[0] here – that would
+      // silently swap in an unrelated template as the catch-all for unmatched records.
+      const defaultTemplate = findPreviewTemplateByLookupId(topTemplateId) ?? null;
+
+      setRuleAssignments(assignments);
+      setPreviewForm((prev) => ({
+        ...prev,
+        pageSize: "A4",
+        // Always use the raw fallback template ID so the backend resolves it from DB.
+        // If we found it locally, use the normalised lookup ID; otherwise keep raw.
+        templateId: defaultTemplate
+          ? resolveTemplateLookupId(defaultTemplate)
+          : topTemplateId,
+        fallbackTemplateId: topTemplateId,
+        templateType: defaultTemplate?.templateType || prev.templateType,
+        orientation:
+          defaultTemplate?.canvas?.width && defaultTemplate?.canvas?.height
+            ? defaultTemplate.canvas.width > defaultTemplate.canvas.height
+              ? "landscape"
+              : "portrait"
+            : prev.orientation,
+        sheetWidthMm: String(PAGE_SIZE_DIMENSIONS.A4.width),
+        sheetHeightMm: String(PAGE_SIZE_DIMENSIONS.A4.height),
+        fileName: `${project?.name || "project"}_${dataCategory}_preview`,
+        useRuleBasedMapping: true,
+        useFieldBasedMapping: false,
+        templateMappings: [],
+      }));
+      setPreviewError("");
+      setIsGeneratePreviewOpen(true);
+      return;
+    }
+
+    // ── Fallback: existing single-template / field-based mode ──
+    setRuleAssignments(null);
     const templateFromGroup = dataGroups
       .find((group) => selectedRecords.some((record) => record.groupId === group.id) && Boolean(group.templateId))
       ?.templateId;
-    const defaultTemplate = findPreviewTemplateByLookupId(templateFromGroup || "")
-      || galleryTemplateOptions[0]
-      || previewTemplates[0]
-      || null;
+    const defaultTemplate =
+      findPreviewTemplateByLookupId(templateFromGroup || "") ||
+      galleryTemplateOptions[0] ||
+      previewTemplates[0] ||
+      null;
 
     setPreviewForm((prev) => ({
       ...prev,
       pageSize: "A4",
       templateId: defaultTemplate ? resolveTemplateLookupId(defaultTemplate) : "",
       templateType: defaultTemplate?.templateType || prev.templateType,
-      orientation: defaultTemplate?.canvas?.width && defaultTemplate?.canvas?.height
-        ? (defaultTemplate.canvas.width > defaultTemplate.canvas.height ? "landscape" : "portrait")
-        : prev.orientation,
+      orientation:
+        defaultTemplate?.canvas?.width && defaultTemplate?.canvas?.height
+          ? defaultTemplate.canvas.width > defaultTemplate.canvas.height
+            ? "landscape"
+            : "portrait"
+          : prev.orientation,
       sheetWidthMm: String(PAGE_SIZE_DIMENSIONS.A4.width),
       sheetHeightMm: String(PAGE_SIZE_DIMENSIONS.A4.height),
       fileName: `${project?.name || "project"}_${dataCategory}_preview`,
+      useRuleBasedMapping: false,
     }));
     setPreviewError("");
     setIsGeneratePreviewOpen(true);
   };
+
 
 
   const handleGeneratePreviewPdf = async () => {
@@ -2265,7 +2547,15 @@ export function ProjectDetail() {
     }
 
     // Validate template selection based on mode
-    if (previewForm.useFieldBasedMapping) {
+    if (previewForm.useRuleBasedMapping) {
+      // Rule-based mode: just need a non-empty templateId for fallback (used when no rule matches)
+      if (!previewForm.templateId) {
+        setPreviewError("No template ID could be determined from the rules. Please configure rules first.");
+        return;
+      }
+      // Don't require findPreviewTemplateByLookupId to succeed here — the backend will resolve
+      // the template directly from MongoDB using the ID stored in the rules.
+    } else if (previewForm.useFieldBasedMapping) {
       if (!previewForm.templateId) {
         setPreviewError("Please select the default template.");
         return;
@@ -2372,19 +2662,37 @@ export function ProjectDetail() {
           rowMarginMm,
           columnMarginMm,
           fileName: previewForm.fileName.trim(),
-          useFieldBasedMapping: previewForm.useFieldBasedMapping,
+          // Rule-based mode: tell backend to evaluate saved PrintRules server-side
+          useRuleBasedMapping: previewForm.useRuleBasedMapping,
+          useFieldBasedMapping: previewForm.useRuleBasedMapping ? true : previewForm.useFieldBasedMapping,
+          projectId: previewForm.useRuleBasedMapping ? id : undefined,
           fallbackTemplateId: previewForm.fallbackTemplateId || previewForm.templateId,
-          templateMappings: previewForm.templateMappings.map((mapping) => ({
+          templateMappings: previewForm.useRuleBasedMapping ? [] : previewForm.templateMappings.map((mapping) => ({
             fieldName: mapping.fieldName,
             fieldValue: mapping.fieldValue,
             templateId: mapping.templateId,
           })),
+          // Send frontend-computed per-record assignments. The backend server-side evaluator
+          // will re-evaluate and OVERRIDE these with authoritative results, but sending them
+          // here provides a reliable fallback if the backend fetch somehow fails.
+          // In rule-based mode we always include the key (even if empty) so the backend knows
+          // to run server-side evaluation via useRuleBasedMapping=true + projectId.
+          perRecordTemplateAssignments: previewForm.useRuleBasedMapping
+            ? Object.fromEntries(
+                Object.entries(ruleAssignments ?? {}).map(([k, v]) => [String(k), v])
+              )
+            : (ruleAssignments && Object.keys(ruleAssignments).length > 0
+                ? Object.fromEntries(Object.entries(ruleAssignments).map(([k, v]) => [String(k), v]))
+                : undefined),
         },
         template: templatePayload,
       };
 
       console.log('[PDF Generation] Request body:', {
         useFieldBasedMapping: body.configuration.useFieldBasedMapping,
+        useRuleBasedMapping: previewForm.useRuleBasedMapping,
+        perRecordAssignmentCount: Object.keys((body.configuration as any).perRecordTemplateAssignments || {}).length,
+        perRecordAssignmentSample: Object.entries((body.configuration as any).perRecordTemplateAssignments || {}).slice(0, 5),
         templateMappings: body.configuration.templateMappings,
         fallbackTemplateId: body.configuration.fallbackTemplateId,
         selectedRecordCount: body.selectedRecords.length,
@@ -3158,9 +3466,13 @@ export function ProjectDetail() {
                                     }
 
                                     localStorage.setItem("vendor_designer_template_config", JSON.stringify(designerConfig));
+                                    // Use the real MongoDB ID so DesignerStudio loads the project
+                                    // copy from the API (not a synthetic TMPL-edit- prefix).
+                                    // This ensures auto-save writes back to the correct document
+                                    // and saveIsPublic is initialised from the copy's isPublic=false.
                                     localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
                                       projectId: project.id,
-                                      templateId: sessionTemplateId,
+                                      templateId: remoteIdForEdit,
                                       projectName: project.name,
                                       templateName: tmpl.templateName,
                                     }));
@@ -3174,7 +3486,7 @@ export function ProjectDetail() {
                                 {editingTemplateId === tmpl.id ? "Loading…" : "Edit"}
                               </Button>
                               {isOwnTemplate && (
-                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { deleteProjectTemplate(tmpl.id); refresh(); }}>
+                                <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setConfirmDeleteTemplate(tmpl)}>
                                   <Trash2 className="h-3 w-3" />
                                 </Button>
                               )}
@@ -3630,7 +3942,7 @@ export function ProjectDetail() {
                               </Button>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end" className="w-56">
-                              <DropdownMenuItem onClick={handleOpenGeneratePreview} disabled={dataSelectedIds.size === 0}>
+                              <DropdownMenuItem onClick={() => void handleOpenGeneratePreview()} disabled={dataSelectedIds.size === 0}>
                                 <Download className="h-4 w-4 mr-2" /> Generate preview
                               </DropdownMenuItem>
                               <DropdownMenuSeparator />
@@ -4019,7 +4331,7 @@ export function ProjectDetail() {
           <Dialog open={isGeneratePreviewOpen} onOpenChange={(open) => {
             if (isGeneratingPreview) return;
             setIsGeneratePreviewOpen(open);
-            if (!open) { setPreviewError(""); setPreviewPageIndex(0); }
+            if (!open) { setPreviewError(""); setPreviewPageIndex(0); setRuleAssignments(null); }
           }}>
             <DialogContent className="!w-[90vw] !max-w-none !h-[90vh] !p-0 !gap-0 flex flex-col overflow-hidden">
               {/* ── Header ── */}
@@ -4040,6 +4352,17 @@ export function ProjectDetail() {
                 {/* ─────────────── LEFT PANEL (30%) ─────────────── */}
                 <div className="w-[30%] min-w-[270px] flex-shrink-0 flex flex-col border-r overflow-hidden bg-background">
                   <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+
+                    {/* Rule-based matching indicator */}
+                    {previewForm.useRuleBasedMapping && projectRules.length > 0 && (
+                      <div className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs">
+                        <GitBranch className="h-3.5 w-3.5 text-primary flex-shrink-0" />
+                        <div>
+                          <p className="font-semibold text-primary">Rule-Based Matching Active</p>
+                          <p className="text-muted-foreground">{projectRules.length} rule{projectRules.length !== 1 ? "s" : ""} applied · {Object.keys(ruleAssignments || {}).length}/{selectedRecords.length} records matched</p>
+                        </div>
+                      </div>
+                    )}
 
                     {/* 1. Output Setup */}
                     <div className="space-y-2">
@@ -4898,6 +5221,37 @@ export function ProjectDetail() {
           </Dialog>
         </TabsContent>
       </Tabs>
+
+      {/* Confirmation dialog for removing a template from the project */}
+      <AlertDialog
+        open={!!confirmDeleteTemplate}
+        onOpenChange={(open) => { if (!open) setConfirmDeleteTemplate(null); }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove Template</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to remove{" "}
+              <strong>&ldquo;{confirmDeleteTemplate?.templateName}&rdquo;</strong>{" "}
+              from this project? This will not affect the Template Gallery.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>No</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (confirmDeleteTemplate) {
+                  handleDeleteProjectTemplate(confirmDeleteTemplate);
+                  setConfirmDeleteTemplate(null);
+                }
+              }}
+            >
+              Yes, Remove
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
