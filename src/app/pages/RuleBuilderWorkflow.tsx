@@ -1970,6 +1970,16 @@ export function RuleBuilderWorkflow() {
           setRules(allRules);
           setSelectedRuleId(allRules[0]?.localId ?? null);
 
+          // Restore "If no template matches" dropdown from the rule with isDefault=true
+          const restoredDefaultRule = allRules.find(r => r.isDefault === true);
+          if (restoredDefaultRule) {
+            const restoredDefaultTplId =
+              (restoredDefaultRule.template as any)?._id ??
+              restoredDefaultRule.template?.id ??
+              "";
+            if (restoredDefaultTplId) setDefaultTemplateId(restoredDefaultTplId);
+          }
+
           // Jump directly to Rule Builder step if we also have CSV data
           if (hasCsvData) {
             setCompletedSteps(new Set([1 as Step]));
@@ -2053,6 +2063,18 @@ export function RuleBuilderWorkflow() {
       if (selectedRuleId === id) setSelectedRuleId(next[0]?.localId ?? null);
       return next;
     });
+  };
+
+  // Updates "If no template matches" selection AND keeps rule.isDefault in sync
+  const handleDefaultTemplateChange = (val: string) => {
+    setDefaultTemplateId(val);
+    setRules(prev =>
+      prev.map(r => {
+        const tplId =
+          (r.template as any)?._id ?? r.template?.id ?? r.template?.remoteId ?? "";
+        return { ...r, isDefault: val !== "__none__" && tplId === val };
+      }),
+    );
   };
 
   const handleDuplicateRule = (id: string) => {
@@ -2245,7 +2267,7 @@ export function RuleBuilderWorkflow() {
               onDeleteRule={handleDeleteRule}
               onDuplicateRule={handleDuplicateRule}
               onMoveRule={handleMoveRule}
-              onDefaultTemplateChange={setDefaultTemplateId}
+              onDefaultTemplateChange={handleDefaultTemplateChange}
               onChangeTemplate={(ruleId) => setChoosingForRuleId(ruleId)}
             />
           )}

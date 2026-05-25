@@ -512,10 +512,21 @@ export function IdCard({
   // static fields so the same data is never drawn twice (no overlap).
   const hasCanvasText = dynamicTexts.length > 0;
 
+  // Photo area style — preserve exact canvas proportions while ensuring the
+  // photo fills its box completely (object-fit:cover, overflow:hidden).
+  // Enforce a minimum of 32px so photos never become invisible in thumbnails.
+  const rawPhotoStyle = getFieldStyle(config.layout.photo, layoutScaleX, layoutScaleY);
   const photoStyle: CSSProperties = {
     position: "absolute",
     zIndex: 5,
-    ...getFieldStyle(config.layout.photo, layoutScaleX, layoutScaleY),
+    objectFit: "cover",
+    overflow: "hidden",
+    ...rawPhotoStyle,
+    // Clamp to a minimum visible size so scaled-down canvases still show photos
+    width: rawPhotoStyle.width ?? "50px",
+    height: rawPhotoStyle.height ?? "50px",
+    minWidth: 32,
+    minHeight: 32,
   };
 
   return (

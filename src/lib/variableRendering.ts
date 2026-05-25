@@ -458,14 +458,18 @@ export function applyTextFit(
 export function applyImageFit(
   imageObject: fabric.FabricImage,
   boxWidth: number,
-  boxHeight: number
+  boxHeight: number,
+  objectFit: 'contain' | 'cover' = 'contain'
 ): void {
   const width = Math.max(1, boxWidth);
   const height = Math.max(1, boxHeight);
   const srcW = Math.max(1, Number(imageObject.width || 1));
   const srcH = Math.max(1, Number(imageObject.height || 1));
 
-  const ratio = Math.min(width / srcW, height / srcH);
+  // 'cover': image fills the box completely (may crop); 'contain': fits inside (may letterbox)
+  const ratio = objectFit === 'cover'
+    ? Math.max(width / srcW, height / srcH)
+    : Math.min(width / srcW, height / srcH);
   imageObject.set({
     scaleX: ratio,
     scaleY: ratio,
@@ -978,7 +982,22 @@ export async function renderTemplateWithData(
     if (anyObj.maskShape) (loaded as any).maskShape = anyObj.maskShape;
     if (anyObj.maskRadius != null) (loaded as any).maskRadius = anyObj.maskRadius;
 
-    applyImageFit(loaded, box.width, box.height);
+    // Use 'cover' for PHOTO-type variables so the student photo fills the placeholder
+    // box completely (matches CSS object-fit:cover).
+    // Use 'contain' for SIGNATURE, QR, barcode, LOGO and other non-photo variables so
+    // the full image is always visible without cropping.
+    const normVarKey = variableKey.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const PHOTO_VAR_KEYS_FRONT = new Set([
+      'photo', 'photourl', 'profilepic', 'profileimage', 'image',
+      'avatar', 'picture', 'studentphoto', 'passportphoto', 'pic',
+    ]);
+    const storedObjectFit = String(anyObj.__objectFit ?? '').toLowerCase();
+    const imageFitMode: 'cover' | 'contain' =
+      storedObjectFit === 'cover' || PHOTO_VAR_KEYS_FRONT.has(normVarKey)
+        ? 'cover'
+        : 'contain';
+
+    applyImageFit(loaded, box.width, box.height, imageFitMode);
     applyMaskAndBorder(loaded, anyObj.__maskOptions as MaskBorderOptions | undefined);
 
     canvas.remove(obj);

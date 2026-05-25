@@ -8,7 +8,7 @@ import {
   Filter, MoreHorizontal, UserCircle, FileSpreadsheet, Settings2, Users, GripVertical,
   Crop, Wand2, RotateCcw, ImageIcon, UserPlus, FileDown, Archive, Camera, Loader2,
   QrCode, UserRound, AlertTriangle, Globe, ChevronDown, LayoutGrid,
-  ChevronLeft, ChevronRight, Minus, Maximize2, GitBranch,
+  ChevronLeft, ChevronRight, Minus, Maximize2, GitBranch, RefreshCw,
 } from "lucide-react";
 import JSZip from "jszip";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -57,9 +57,9 @@ import {
   deleteProjectRecords,
   API_BASE,
 } from "../../lib/apiService";
-import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
+import { DESIGNER_CONTEXT_KEY, type DesignerContext } from "../../lib/fabricUtils";
 import { BulkImportWizard } from "../components/BulkImportWizard";
-import { IdCard, IdCardGrid, getTemplateSlugForRender } from "../components/preview/TemplateRenderer";
+import { IdCard, IdCardGrid, getTemplateSlugForRender, getTemplateCached } from "../components/preview/TemplateRenderer";
 import { createTemplate, getTemplateById, deleteTemplate, resolveTemplatePreview, getProjectTemplateCacheData, invalidateTemplateCache, setProjectTemplateCacheData, type TemplateRecord } from "../../lib/templateApi";
 import { toast } from "sonner";
 import { matchImages } from "../../lib/imageMatchEngine";
@@ -81,7 +81,7 @@ const TEMPLATE_TYPES: { value: ProjectTemplate["templateType"]; label: string }[
   { value: "custom",      label: "Custom" },
 ];
 
-type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean };
+type PreviewTemplateOption = ProjectTemplate & { isGlobal?: boolean; needsPreviewGeneration?: boolean };
 const MONGODB_OBJECT_ID_RE = /^[0-9a-f]{24}$/i;
 
 function resolveTemplateLookupId(template: PreviewTemplateOption | null | undefined): string {
@@ -103,6 +103,8 @@ function mapApiTemplateToProjectTemplate(template: TemplateRecord): PreviewTempl
     ? rawApplicableFor.join(", ")
     : (rawApplicableFor ? String(rawApplicableFor) : "");
 
+  const resolvedThumbnail = resolveTemplatePreview(template, { fallbackToPlaceholder: false }) || undefined;
+
   return {
     id: template._id,
     remoteId: template._id,
@@ -123,7 +125,20 @@ function mapApiTemplateToProjectTemplate(template: TemplateRecord): PreviewTempl
     applicableFor,
     createdAt: template.createdAt,
     canvasJSON: canvasJSON || undefined,
-    thumbnail: resolveTemplatePreview(template, { fallbackToPlaceholder: false }) || undefined,
+    thumbnail: (() => {
+      const raw = resolvedThumbnail;
+      if (!raw) return undefined;
+      // Append a cache-busting param to relative /uploads/ paths so the browser
+      // re-fetches the image when the template is updated (same filename, new content).
+      if (raw.startsWith('/uploads/') && template.updatedAt) {
+        const ts = new Date(template.updatedAt).getTime();
+        if (ts) return `${raw}?t=${ts}`;
+      }
+      return raw;
+    })() || undefined,
+    // If the API returned no preview URL, force the background generator to fetch
+    // full designData and render/upload a fresh thumbnail.
+    needsPreviewGeneration: !resolvedThumbnail,
     isPublic: template.isGlobal === true,
     isGlobal: template.isGlobal === true,
   };
@@ -383,7 +398,7 @@ function TemplatePreviewCanvas({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canvasPxW, canvasPxH]);
 
-  if (hasError) {
+  if (hasError || canvasPxW <= 0 || canvasPxH <= 0) {
     return (
       <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
         <Layers className="h-8 w-8 text-muted-foreground" />
@@ -456,12 +471,9 @@ function collectTemplateRequiredFields(
 ): string[] {
   const fields = new Set<string>();
 
-  if (template.templateType === "id_card") {
-    fields.add("name");
-    fields.add("photo");
-  } else if (template.templateType === "certificate") {
-    fields.add("name");
-  }
+  // Do NOT hardcode type-based required fields (e.g. id_card → name+photo) because
+  // non-school templates (business cards, employee IDs, etc.) use entirely different
+  // field names.  Only the actual canvasJSON placeholders determine what is required.
 
   layoutObjects.forEach((obj) => {
     const dynamicFieldCandidates = [
@@ -502,7 +514,12 @@ function inspectTemplatePreview(
   const hasDesignElements = hasValidLayoutJson && elementCount > 0;
   const hasThumbnail = typeof template.thumbnail === "string" && template.thumbnail.trim().length > 0;
   const requiredFieldKeys = collectTemplateRequiredFields(template, layoutObjects);
-  const missingFieldKeys = requiredFieldKeys.filter((fieldKey) => !availableFieldKeys.has(fieldKey));
+  // Only flag missing fields when data has actually been loaded.  When availableFieldKeys
+  // is empty the project has no imported data yet — we cannot meaningfully tell whether a
+  // field is mapped or not, so suppress the warning to avoid false positives.
+  const missingFieldKeys = availableFieldKeys.size > 0
+    ? requiredFieldKeys.filter((fieldKey) => !availableFieldKeys.has(fieldKey))
+    : [];
   const hasRenderablePreview = hasDesignElements || hasThumbnail;
 
   return {
@@ -553,7 +570,13 @@ const getRecordPhoto = (rec: ProjectDataRecord): string => {
     ?? rec.photo
     ?? rec.Photo
     ?? rec.avatar
-    ?? rec.Avatar;
+    ?? rec.Avatar
+    // CSV columns that directly store photo filenames or URLs
+    ?? rec.PhotoFilename
+    ?? rec.photo_filename
+    ?? rec.photoFilename
+    ?? rec.PhotoFile
+    ?? rec.photo_file;
   return typeof candidate === "string" ? candidate : "";
 };
 
@@ -696,6 +719,12 @@ export function ProjectDetail() {
   const [previewPageIndex, setPreviewPageIndex] = useState(0);
   const [previewZoom, setPreviewZoom] = useState(50);
   const previewContainerRef = useRef<HTMLDivElement>(null);
+  // Live preview PDF state — shows the backend-generated PDF in the right panel
+  const [livePreviewUrl, setLivePreviewUrl] = useState<string>("");
+  const [isLivePreviewLoading, setIsLivePreviewLoading] = useState(false);
+  const [livePreviewError, setLivePreviewError] = useState<string>("");
+  const livePreviewAbortRef = useRef<AbortController | null>(null);
+  const livePreviewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Saved Rule Builder rules for this project — used in rule-based Generate Preview
   const [projectRules, setProjectRules] = useState<PrintRule[]>([]);
   // Per-record template assignments computed by applying saved rules to selected records
@@ -953,6 +982,57 @@ export function ProjectDetail() {
     };
   }, [previewForm.useFieldBasedMapping, previewForm.templateMappings, previewForm.fallbackTemplateId, isGeneratePreviewOpen, fullTemplatesCache]);
 
+  // Auto-populate fullTemplatesCache for ALL project templates that haven't been fetched yet.
+  // The list API strips canvasJSON and converts data-URI thumbnails to file paths, so the card
+  // can only render the actual design by fetching the full record and using canvasJSON via
+  // TemplatePreviewCanvas. This is equivalent to what "Preview" does manually, but runs
+  // automatically so the card never shows a stale "No Design" placeholder.
+  useEffect(() => {
+    if (!remoteTemplates.length) return;
+
+    const toFetch = remoteTemplates.filter((t) => {
+      if (!MONGODB_OBJECT_ID_RE.test(t.id)) return false;
+      if (fullTemplatesCache[t.id]) return false; // already cached — skip
+      return true; // fetch full record for every uncached template
+    });
+
+    if (toFetch.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const template of toFetch) {
+        if (cancelled) break;
+        try {
+          const full = await getTemplateById(template.id, { timeoutMs: 15000 });
+          if (!cancelled && full) {
+            setFullTemplatesCache((prev) => {
+              if (prev[template.id]) return prev; // already set by concurrent fetch
+              return { ...prev, [template.id]: full };
+            });
+          }
+        } catch {
+          // Non-fatal — card falls back to static thumbnail
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remoteTemplates]);
+
+  // Delayed re-fetch after first load: gives DesignerStudio's fire-and-forget auto-save
+  // time to complete so the template list returns the freshly saved canvasJSON / thumbnail.
+  // Runs unconditionally — the DesignerStudio race can happen for any template, not only
+  // those whose thumbnail happens to be a data URI.
+  useEffect(() => {
+    if (!id || !remoteTemplates.length) return;
+    const timer = setTimeout(() => {
+      setRemoteTemplatesVersion((v) => v + 1);
+    }, 2000);
+    return () => clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, remoteTemplates.length]);
+
   // Load data
   const products = id ? loadProjectProducts(id) : [];
   const tasks = id ? loadProjectTasks(id) : [];
@@ -962,6 +1042,12 @@ export function ProjectDetail() {
     const merged = new Map<string, PreviewTemplateOption>();
     // Lookup: remoteId (MongoDB _id) → API template
     const apiById = new Map(remoteTemplates.map((t) => [t.id, t]));
+    const apiByName = new Map<string, PreviewTemplateOption>();
+    remoteTemplates.forEach((t) => {
+      const key = String(t.templateName || "").trim().toLowerCase();
+      if (!key || apiByName.has(key)) return;
+      apiByName.set(key, t);
+    });
     // Lookup: remoteId → local template (for skipping duplication)
     const localByRemoteId = new Map<string, PreviewTemplateOption>();
     templates.forEach((t) => {
@@ -972,7 +1058,20 @@ export function ProjectDetail() {
     // Add API-only templates (no matching local template)
     remoteTemplates.forEach((template) => {
       if (!localByRemoteId.has(template.id)) {
-        merged.set(template.id, template);
+        const full = fullTemplatesCache[template.id];
+        const designData = (full?.designData || {}) as Record<string, any>;
+        const fullCanvasJSON =
+          typeof designData.canvasJSON === "string"
+            ? designData.canvasJSON
+            : (typeof designData.canvasJson === "string" ? designData.canvasJson : "");
+        const fullThumb = full
+          ? (resolveTemplatePreview(full, { fallbackToPlaceholder: false }) || undefined)
+          : undefined;
+        merged.set(template.id, {
+          ...template,
+          ...(fullCanvasJSON ? { canvasJSON: fullCanvasJSON } : {}),
+          ...(fullThumb ? { thumbnail: fullThumb } : {}),
+        });
       }
     });
 
@@ -980,18 +1079,32 @@ export function ProjectDetail() {
     templates.forEach((template) => {
       if (merged.has(template.id)) return;
       const remoteId = (template as any).remoteId as string | undefined;
-      const apiVersion = remoteId ? apiById.get(remoteId) : undefined;
+      const nameKey = String(template.templateName || "").trim().toLowerCase();
+      const apiVersion = (remoteId ? apiById.get(remoteId) : undefined) || apiByName.get(nameKey);
+      const full = fullTemplatesCache[String(remoteId || template.id || "")];
+      const fullDesignData = (full?.designData || {}) as Record<string, any>;
+      const fullCanvasJSON =
+        typeof fullDesignData.canvasJSON === "string"
+          ? fullDesignData.canvasJSON
+          : (typeof fullDesignData.canvasJson === "string" ? fullDesignData.canvasJson : "");
+      const fullThumb = full
+        ? (resolveTemplatePreview(full, { fallbackToPlaceholder: false }) || undefined)
+        : undefined;
       merged.set(template.id, {
         ...template,
+        remoteId: remoteId || apiVersion?.id,
         // Prefer absolute SFTP URL from API; only fall back to local if it's also absolute.
         // Relative paths (/uploads/...) are intentionally excluded here — they 404 in dev
         // and the API always has the authoritative persisted copy.
         thumbnail:
+          fullThumb
+          ||
           (apiVersion?.thumbnail?.startsWith('http') ? apiVersion.thumbnail : null)
           || (template.thumbnail?.startsWith('http') ? template.thumbnail : null)
           || apiVersion?.thumbnail
           || template.thumbnail
           || undefined,
+        ...(fullCanvasJSON ? { canvasJSON: fullCanvasJSON } : {}),
         // Use API canvas dimensions if local has 0x0
         canvas:
           template.canvas?.width && template.canvas?.height
@@ -1029,7 +1142,7 @@ export function ProjectDetail() {
     }
 
     return Array.from(dedupedByName.values());
-  }, [remoteTemplates, templates]);
+  }, [remoteTemplates, templates, fullTemplatesCache]);
 
   // Single source for preview dropdowns: live Template Gallery + project templates from API.
   // This intentionally avoids local-only template copies and grouped sections.
@@ -1086,7 +1199,7 @@ export function ProjectDetail() {
   }, [previewTemplates, availableTemplateFieldKeys]);
 
   const selectedPreviewTemplateDiagnostics = previewTemplate
-    ? templateDiagnosticsMap[previewTemplate.id]
+    ? previewTemplateDiagnosticsMap[previewTemplate.id]
     : undefined;
 
   // These will be properly defined after selectedRecords, but stub here for dependency ordering
@@ -1094,14 +1207,25 @@ export function ProjectDetail() {
   let selectedGenerateTemplateSlug = "";
   let selectedGenerateTemplateDiagnostics: TemplatePreviewDiagnostics | undefined;
 
+  const selectedPreviewRemoteId = (previewTemplate as any)?.remoteId as string | undefined;
+  const selectedApiVersionThumbnail = selectedPreviewRemoteId
+    ? remoteTemplates.find((r) => r.id === selectedPreviewRemoteId)?.thumbnail
+    : undefined;
+  const selectedIsPrimaryBroken = previewTemplate ? Boolean(brokenTemplatePreviewIds[previewTemplate.id]) : false;
+  const selectedPreviewImageSrc = previewTemplate
+    ? (
+      (selectedApiVersionThumbnail?.startsWith("http") ? selectedApiVersionThumbnail : null)
+      || (!selectedIsPrimaryBroken && previewTemplate.thumbnail?.startsWith("http") ? previewTemplate.thumbnail : null)
+      || bgGeneratedPreviews[previewTemplate.id]
+      || bgGeneratedPreviews[selectedPreviewRemoteId ?? ""]
+      || (!selectedIsPrimaryBroken ? (previewTemplate.thumbnail || null) : null)
+      || undefined
+    )
+    : undefined;
+
   const canRenderSelectedTemplateImage = Boolean(
     previewTemplate
-    && (
-      previewTemplate.thumbnail
-      || bgGeneratedPreviews[previewTemplate.id]
-      || bgGeneratedPreviews[((previewTemplate as any).remoteId as string) ?? ""]
-    )
-    && !brokenTemplatePreviewIds[previewTemplate.id]
+    && selectedPreviewImageSrc
   );
 
   const markTemplatePreviewBroken = (templateId: string) => {
@@ -1122,7 +1246,7 @@ export function ProjectDetail() {
       .filter((t) => {
         const remoteId = (t as any).remoteId as string | undefined;
         const thumb = t.thumbnail || bgGeneratedPreviews[t.id] || bgGeneratedPreviews[remoteId ?? ""];
-        return !thumb || brokenTemplatePreviewIds[t.id];
+        return !thumb || brokenTemplatePreviewIds[t.id] || Boolean((t as any).needsPreviewGeneration);
       })
       .map((t) => ((t as any).remoteId as string | undefined) || t.id)
       .filter((mongoId) => /^[0-9a-f]{24}$/i.test(mongoId));
@@ -1375,53 +1499,59 @@ export function ProjectDetail() {
 
   const handleCreateTemplate = async () => {
     if (!validateTemplate() || !id) return;
-    const thumb = createBlankTemplateThumbnail(templateForm.canvas.width, templateForm.canvas.height);
-    const localTemplate = addProjectTemplate({
-      projectId: id,
-      clientId: project?.clientId ?? "",
-      templateName: templateForm.templateName,
-      templateType: templateForm.templateType,
-      canvas: templateForm.canvas,
-      margin: templateForm.margin,
-      applicableFor: templateForm.applicableFor,
-      thumbnail: thumb,
-      isPublic: templateForm.isPublic,
-    });
+    // Snapshot form values before resetting
+    const templateData = { ...templateForm };
+    const thumb = createBlankTemplateThumbnail(templateData.canvas.width, templateData.canvas.height);
 
+    // Close dialog and navigate to Designer Studio immediately — don't wait for the API
     setTemplateForm(emptyTemplateForm);
     setTemplateErrors({});
     setIsCreateTemplateOpen(false);
-    setActiveTab("templates");
 
-    setIsTemplateSaving(true);
+    localStorage.setItem("vendor_designer_template_config", JSON.stringify({
+      templateName: templateData.templateName,
+      templateType: templateData.templateType,
+      canvas: templateData.canvas,
+      margin: templateData.margin,
+    }));
+    // Open Designer Studio immediately with projectId; templateId will be set once
+    // the API responds and a 'designer:context-ready' event is dispatched.
+    localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+      projectId: id,
+      templateId: "",
+      projectName: project?.name ?? "",
+      templateName: templateData.templateName,
+    }));
+    navigate("/designer-studio");
+
+    // Create the remote template in the background (after navigation)
     try {
       const remoteTemplate = await createTemplate({
         projectId: id,
-        templateName: localTemplate.templateName,
+        templateName: templateData.templateName,
         preview_image: thumb,
         category: "Other",
         designData: {
-          templateType: localTemplate.templateType,
-          canvas: localTemplate.canvas,
-          margin: localTemplate.margin,
-          applicableFor: localTemplate.applicableFor,
+          templateType: templateData.templateType,
+          canvas: templateData.canvas,
+          margin: templateData.margin,
+          applicableFor: templateData.applicableFor,
         },
-        isGlobal: localTemplate.isPublic,
-        isPublic: localTemplate.isPublic,
+        isGlobal: false,
+        isPublic: templateData.isPublic,
       });
 
-      updateProjectTemplate(localTemplate.id, { remoteId: remoteTemplate._id });
-      const mappedRemote = mapApiTemplateToProjectTemplate(remoteTemplate);
-      setRemoteTemplates((prev) => {
-        const next = new Map(prev.map((item) => [item.id, item]));
-        next.set(mappedRemote.id, mappedRemote);
-        return Array.from(next.values());
-      });
-      setRemoteTemplatesVersion((v) => v + 1);
+      // Notify the already-open DesignerStudio of the real MongoDB templateId
+      const ctx: DesignerContext = {
+        projectId: id,
+        templateId: remoteTemplate._id,
+        projectName: project?.name ?? "",
+        templateName: templateData.templateName,
+      };
+      localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify(ctx));
+      window.dispatchEvent(new CustomEvent("designer:context-ready", { detail: { ctx, remoteTemplate } }));
     } catch (error) {
       console.warn("[templates] Failed to persist project template to MongoDB", error);
-    } finally {
-      setIsTemplateSaving(false);
     }
   };
 
@@ -2284,6 +2414,8 @@ export function ProjectDetail() {
       cardsPerPage,
       sheetWidthMm,
       sheetHeightMm,
+      cardWidthPx,
+      cardHeightPx,
     };
   }, [
     previewForm.sheetWidthMm,
@@ -2314,6 +2446,54 @@ export function ProjectDetail() {
     });
     return () => cancelAnimationFrame(rafId);
   }, [isGeneratePreviewOpen, printLayout.sheetWidthPx, printLayout.sheetHeightPx]);
+
+  // Auto-regenerate the live preview whenever dialog is open and any relevant setting changes.
+  // Debounced 600ms so rapid input changes don't flood the backend.
+  useEffect(() => {
+    if (!isGeneratePreviewOpen || !previewForm.templateId) {
+      setLivePreviewUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return ""; });
+      return;
+    }
+    // Cancel pending debounce
+    if (livePreviewDebounceRef.current) clearTimeout(livePreviewDebounceRef.current);
+    livePreviewDebounceRef.current = setTimeout(() => {
+      void generateLivePreviewPage(previewPageIndex);
+    }, 600);
+    return () => {
+      if (livePreviewDebounceRef.current) clearTimeout(livePreviewDebounceRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    isGeneratePreviewOpen,
+    previewPageIndex,
+    previewForm.templateId,
+    previewForm.orientation,
+    previewForm.pageSize,
+    previewForm.sheetWidthMm,
+    previewForm.sheetHeightMm,
+    previewForm.pageMarginTopMm,
+    previewForm.pageMarginLeftMm,
+    previewForm.rowMarginMm,
+    previewForm.columnMarginMm,
+    previewForm.cardWidthMm,
+    previewForm.cardHeightMm,
+    previewForm.useRuleBasedMapping,
+    previewForm.useFieldBasedMapping,
+    previewForm.fallbackTemplateId,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    JSON.stringify(previewForm.templateMappings),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    JSON.stringify(ruleAssignments),
+  ]);
+
+  // Cleanup blob URL on unmount
+  useEffect(() => {
+    return () => {
+      if (livePreviewAbortRef.current) livePreviewAbortRef.current.abort();
+      setLivePreviewUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return ""; });
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Rule-based helpers ──────────────────────────────────────────────────────
 
@@ -2429,35 +2609,73 @@ export function ProjectDetail() {
           return (a.priority ?? 0) - (b.priority ?? 0);
         });
 
+      // isDefault rule = the explicit "If no template matches" selection in the Rule Builder.
+      // It overrides regular catch-all (0-condition) rules for unmatched records.
+      const defaultFallbackRule = sortedRules.find((r) => r.isDefault === true);
+
       // Compute per-record template ID assignments using rule conditions
       const assignments: Record<number, string> = {};
-      const matchLog: Array<{ idx: number; field?: string; value?: string; rule: string; templateId: string }> = [];
+      const matchLog: Array<{ idx: number; field?: string; value?: string; rule: string; templateId: string; catchAll?: boolean; isDefault?: boolean }> = [];
 
       selectedRecords.forEach((record, idx) => {
         // Build a case-insensitive normalized row so field name casing differences don't break matching
         const row = buildNormalizedRuleRow(record as Record<string, unknown>, sortedRules);
 
-        // First matching rule wins (sorted: specific → catch-all)
-        const matchedRule = sortedRules.find((rule) => evaluateRule(rule, row));
+        // Step 1: try specific rules only (skip catch-alls)
+        const specificMatch = sortedRules
+          .filter((r) => !isEffectiveCatchAll(r))
+          .find((r) => evaluateRule(r, row));
+
+        // Step 2: if no specific rule matched, use isDefault rule as fallback (overrides catch-alls)
+        // Step 3: if no isDefault rule, fall through to a catch-all
+        const matchedRule =
+          specificMatch ??
+          defaultFallbackRule ??
+          sortedRules.find((r) => isEffectiveCatchAll(r));
+
         if (matchedRule) {
           assignments[idx] = matchedRule.templateId;
           const firstCondition = matchedRule.conditionGroups[0]?.conditions[0];
+          const isCatchAll = isEffectiveCatchAll(matchedRule) && matchedRule !== defaultFallbackRule;
           matchLog.push({
             idx,
             field: firstCondition?.field,
             value: firstCondition ? String(row[firstCondition.field] ?? "") : undefined,
             rule: matchedRule.templateName,
             templateId: matchedRule.templateId,
+            catchAll: isCatchAll,
+            isDefault: matchedRule === defaultFallbackRule && !specificMatch,
           });
         }
       });
 
-      console.log(`[RulePreview] ${sortedRules.length} active rules · ${selectedRecords.length} records · ${Object.keys(assignments).length} matched`, matchLog.slice(0, 10));
+      // Separate specific matches from catch-all fallthrough for clearer diagnostics
+      const specificLog = matchLog.filter((m) => !m.catchAll);
+      const catchAllLog = matchLog.filter((m) => m.catchAll);
+      console.log(`[RulePreview] ${sortedRules.length} active rules · ${selectedRecords.length} records · ${specificLog.length} matched specific rules · ${catchAllLog.length} fell through to catch-all`, specificLog.slice(0, 10));
+      if (catchAllLog.length > 0) {
+        // Build a detailed list showing what condition field values the catch-all records had
+        const specificConditionFields = [...new Set(
+          sortedRules.filter((r) => !isEffectiveCatchAll(r))
+            .flatMap((r) => r.conditionGroups.flatMap((g) => g.conditions.map((c) => c.field)))
+        )];
+        const catchAllDetails = catchAllLog.slice(0, 20).map((m) => {
+          const rec = selectedRecords[m.idx] as Record<string, unknown>;
+          const row2 = buildNormalizedRuleRow(rec, sortedRules);
+          return {
+            idx: m.idx,
+            name: String(rec?.Name || rec?.name || rec?.studentName || rec?.full_name || `record[${m.idx}]`),
+            rule: m.rule,
+            conditionValues: Object.fromEntries(specificConditionFields.map((f) => [f, row2[f] ?? "(not found)"])),
+          };
+        });
+        console.warn(`[RulePreview] ${catchAllLog.length} record(s) assigned to catch-all — their condition field values:`, catchAllDetails);
+      }
 
       // ── Determine the fallback template ID (for records matched by no rule) ──
-      // Priority: catch-all rule (0 conditions) → first rule
+      // Priority: isDefault rule (explicit "If no template matches") → catch-all rule → first rule
       const catchAllRule = sortedRules.find((r) => isEffectiveCatchAll(r));
-      const fallbackRule = catchAllRule ?? sortedRules[0];
+      const fallbackRule = defaultFallbackRule ?? catchAllRule ?? sortedRules[0];
       const fallbackTemplateId = fallbackRule?.templateId ?? "";
 
       // Raw MongoDB ID of the fallback template – the backend can always resolve this
@@ -2470,7 +2688,15 @@ export function ProjectDetail() {
       const defaultTemplate = findPreviewTemplateByLookupId(topTemplateId) ?? null;
 
       setRuleAssignments(assignments);
-      setPreviewForm((prev) => ({
+      setPreviewForm((prev) => {
+        // Derive card dimensions and orientation directly from the template canvas.
+        const canvW = defaultTemplate?.canvas?.width;
+        const canvH = defaultTemplate?.canvas?.height;
+        const detectedOrientation =
+          canvW && canvH
+            ? canvW > canvH ? "landscape" : "portrait"
+            : prev.orientation;
+        return ({
         ...prev,
         pageSize: "A4",
         // Always use the raw fallback template ID so the backend resolves it from DB.
@@ -2480,19 +2706,19 @@ export function ProjectDetail() {
           : topTemplateId,
         fallbackTemplateId: topTemplateId,
         templateType: defaultTemplate?.templateType || prev.templateType,
-        orientation:
-          defaultTemplate?.canvas?.width && defaultTemplate?.canvas?.height
-            ? defaultTemplate.canvas.width > defaultTemplate.canvas.height
-              ? "landscape"
-              : "portrait"
-            : prev.orientation,
-        sheetWidthMm: String(PAGE_SIZE_DIMENSIONS.A4.width),
-        sheetHeightMm: String(PAGE_SIZE_DIMENSIONS.A4.height),
+        orientation: detectedOrientation,
+        // Card dimensions come from the template canvas (already in mm).
+        // Portrait canvas (54×86) → portrait card; landscape canvas (86×54) → landscape card.
+        cardWidthMm:  canvW ? String(canvW) : prev.cardWidthMm,
+        cardHeightMm: canvH ? String(canvH) : prev.cardHeightMm,
+        // Page orientation matches card orientation: landscape → wide page, portrait → tall page.
+        sheetWidthMm:  String(detectedOrientation === "landscape" ? Math.max(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height) : Math.min(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height)),
+        sheetHeightMm: String(detectedOrientation === "landscape" ? Math.min(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height) : Math.max(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height)),
         fileName: `${project?.name || "project"}_${dataCategory}_preview`,
         useRuleBasedMapping: true,
         useFieldBasedMapping: false,
         templateMappings: [],
-      }));
+      })});
       setPreviewError("");
       setIsGeneratePreviewOpen(true);
       return;
@@ -2509,27 +2735,153 @@ export function ProjectDetail() {
       previewTemplates[0] ||
       null;
 
-    setPreviewForm((prev) => ({
+    setPreviewForm((prev) => {
+      const canvW = defaultTemplate?.canvas?.width;
+      const canvH = defaultTemplate?.canvas?.height;
+      const detectedOrientation =
+        canvW && canvH
+          ? canvW > canvH ? "landscape" : "portrait"
+          : prev.orientation;
+      return ({
       ...prev,
       pageSize: "A4",
       templateId: defaultTemplate ? resolveTemplateLookupId(defaultTemplate) : "",
       templateType: defaultTemplate?.templateType || prev.templateType,
-      orientation:
-        defaultTemplate?.canvas?.width && defaultTemplate?.canvas?.height
-          ? defaultTemplate.canvas.width > defaultTemplate.canvas.height
-            ? "landscape"
-            : "portrait"
-          : prev.orientation,
-      sheetWidthMm: String(PAGE_SIZE_DIMENSIONS.A4.width),
-      sheetHeightMm: String(PAGE_SIZE_DIMENSIONS.A4.height),
+      orientation: detectedOrientation,
+      // Card dimensions from template canvas (mm)
+      cardWidthMm:  canvW ? String(canvW) : prev.cardWidthMm,
+      cardHeightMm: canvH ? String(canvH) : prev.cardHeightMm,
+      // Page orientation matches card orientation: landscape → wide page, portrait → tall page.
+      sheetWidthMm:  String(detectedOrientation === "landscape" ? Math.max(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height) : Math.min(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height)),
+      sheetHeightMm: String(detectedOrientation === "landscape" ? Math.min(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height) : Math.max(PAGE_SIZE_DIMENSIONS.A4.width, PAGE_SIZE_DIMENSIONS.A4.height)),
       fileName: `${project?.name || "project"}_${dataCategory}_preview`,
       useRuleBasedMapping: false,
-    }));
+    })});
     setPreviewError("");
     setIsGeneratePreviewOpen(true);
   };
 
+  // ── Live Preview helpers ────────────────────────────────────────────────────
 
+  /** Build the backend /preview/generate payload for a given slice of records. */
+  const buildPreviewPayload = (recordsSlice: typeof selectedRecords, globalOffset: number) => {
+    const sheetWidthMm = printLayout.sheetWidthMm;
+    const sheetHeightMm = printLayout.sheetHeightMm;
+    const pageMarginTopMm = Number(previewForm.pageMarginTopMm);
+    const pageMarginLeftMm = Number(previewForm.pageMarginLeftMm);
+    const rowMarginMm = Number(previewForm.rowMarginMm || "0");
+    const columnMarginMm = Number(previewForm.columnMarginMm || "0");
+
+    const requestTemplateId = previewForm.templateId;
+    const requestTemplate = findPreviewTemplateByLookupId(requestTemplateId);
+    const templatePayload = requestTemplate
+      ? {
+          id: resolveTemplateLookupId(requestTemplate),
+          templateName: requestTemplate.templateName,
+          templateType: requestTemplate.templateType,
+          templateSlug: getTemplateSlugForRender(requestTemplate),
+          canvas: requestTemplate.canvas,
+          thumbnail: requestTemplate.thumbnail,
+          previewImageUrl: requestTemplate.thumbnail,
+          layoutJSON: requestTemplate.canvasJSON || undefined,
+        }
+      : { id: requestTemplateId };
+
+    // Re-index per-record assignments for the slice
+    const sliceAssignments: Record<string, string> = {};
+    if (ruleAssignments) {
+      recordsSlice.forEach((_, i) => {
+        const globalIdx = globalOffset + i;
+        const assigned = ruleAssignments[globalIdx];
+        if (assigned) sliceAssignments[String(i)] = assigned;
+      });
+    }
+
+    return {
+      selectedRecordIds: recordsSlice.map((r) => String(r.id || "")).filter(Boolean),
+      selectedRecords: recordsSlice,
+      configuration: {
+        pageSize: previewForm.pageSize,
+        templateId: requestTemplateId,
+        orientation: previewForm.orientation,
+        templateType: previewForm.templateType,
+        isSample: false,
+        sheetSize: { widthMm: sheetWidthMm, heightMm: sheetHeightMm },
+        pageMargin: { topMm: pageMarginTopMm, leftMm: pageMarginLeftMm },
+        cardSize: {
+          widthMm: Number(previewForm.cardWidthMm) || 54,
+          heightMm: Number(previewForm.cardHeightMm) || 86,
+        },
+        rowMarginMm,
+        columnMarginMm,
+        fileName: "live_preview",
+        useRuleBasedMapping: previewForm.useRuleBasedMapping,
+        useFieldBasedMapping: previewForm.useRuleBasedMapping ? true : previewForm.useFieldBasedMapping,
+        projectId: previewForm.useRuleBasedMapping ? id : undefined,
+        fallbackTemplateId: previewForm.fallbackTemplateId || previewForm.templateId,
+        templateMappings: previewForm.useRuleBasedMapping ? [] : previewForm.templateMappings.map((m) => ({
+          fieldName: m.fieldName,
+          fieldValue: m.fieldValue,
+          templateId: m.templateId,
+        })),
+        perRecordTemplateAssignments: previewForm.useRuleBasedMapping
+          ? sliceAssignments
+          : (ruleAssignments && Object.keys(ruleAssignments).length > 0
+              ? sliceAssignments
+              : undefined),
+      },
+      template: templatePayload,
+    };
+  };
+
+  /** Fetch a single-page PDF from the backend for the current preview page and display it. */
+  const generateLivePreviewPage = async (pageIdx: number) => {
+    if (!id || !previewForm.templateId || !selectedRecords.length) {
+      setLivePreviewUrl("");
+      return;
+    }
+    // Cancel any in-flight request
+    if (livePreviewAbortRef.current) {
+      livePreviewAbortRef.current.abort();
+    }
+    const ctrl = new AbortController();
+    livePreviewAbortRef.current = ctrl;
+
+    const pageCapacity = printLayout.cardsPerPage || 9;
+    const offset = pageIdx * pageCapacity;
+    const recordsSlice = selectedRecords.slice(offset, offset + pageCapacity);
+    if (!recordsSlice.length) { setLivePreviewUrl(""); return; }
+
+    setIsLivePreviewLoading(true);
+    setLivePreviewError("");
+    try {
+      const body = buildPreviewPayload(recordsSlice, offset);
+      const response = await fetch(`${API_BASE}/preview/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      if (!response.ok) {
+        let msg = `Preview generation failed (HTTP ${response.status})`;
+        try { const j = await response.json(); if ((j as any)?.error) msg = String((j as any).error); } catch { /* ignore */ }
+        throw new Error(msg);
+      }
+      const blob = await response.blob();
+      if (!blob || blob.size === 0) throw new Error("Empty preview response.");
+
+      // Revoke previous blob URL to free memory
+      setLivePreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(blob);
+      });
+    } catch (err: unknown) {
+      if ((err as any)?.name === "AbortError") return; // cancelled — ignore
+      setLivePreviewError((err as Error).message || "Failed to generate preview.");
+    } finally {
+      if (!ctrl.signal.aborted) setIsLivePreviewLoading(false);
+    }
+  };
 
   const handleGeneratePreviewPdf = async () => {
     if (!id) return;
@@ -3183,21 +3535,19 @@ export function ProjectDetail() {
               {previewTemplate && (
                 <div className="space-y-4">
                   <div className="bg-muted/40 rounded-lg p-4 flex items-center justify-center min-h-[200px]">
-                    {canRenderSelectedTemplateImage ? (
-                      <img
-                        src={previewTemplate.thumbnail ||
-                          bgGeneratedPreviews[previewTemplate.id] ||
-                          bgGeneratedPreviews[(previewTemplate as any).remoteId ?? ""] || ""}
-                        alt={previewTemplate.templateName}
-                        className="max-w-full max-h-[320px] object-contain rounded shadow-md border border-border"
-                        onError={() => markTemplatePreviewBroken(previewTemplate.id)}
-                      />
-                    ) : selectedPreviewTemplateDiagnostics?.hasDesignElements && previewTemplate.canvasJSON ? (
+                    {previewTemplate.canvasJSON ? (
                       <TemplatePreviewCanvas
                         canvasJSON={previewTemplate.canvasJSON}
                         canvasConfig={previewTemplate.canvas}
                         maxWidth={352}
                         maxHeight={320}
+                      />
+                    ) : canRenderSelectedTemplateImage ? (
+                      <img
+                        src={selectedPreviewImageSrc || ""}
+                        alt={previewTemplate.templateName}
+                        className="max-w-full max-h-[320px] object-contain rounded shadow-md border border-border"
+                        onError={() => markTemplatePreviewBroken(previewTemplate.id)}
                       />
                     ) : (
                       <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
@@ -3215,12 +3565,6 @@ export function ProjectDetail() {
                     && !bgGeneratedPreviews[((previewTemplate as any).remoteId as string) ?? ""] && (
                     <p className="text-xs text-destructive bg-destructive/10 rounded px-2.5 py-2">
                       No preview available. Please configure the template.
-                    </p>
-                  )}
-
-                  {Boolean(selectedPreviewTemplateDiagnostics?.missingFieldKeys.length) && (
-                    <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2">
-                      Missing field mapping: {selectedPreviewTemplateDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
                     </p>
                   )}
 
@@ -3309,19 +3653,19 @@ export function ProjectDetail() {
                     return (
                       <div key={tmpl.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow space-y-3">
                         <div className="bg-muted/30 rounded flex items-center justify-center h-28 relative overflow-hidden">
-                          {canRenderCardImage ? (
-                            <img
-                              src={effectiveThumbnail}
-                              alt={tmpl.templateName}
-                              className="max-h-full max-w-full object-contain rounded shadow"
-                              onError={() => markTemplatePreviewBroken(tmpl.id)}
-                            />
-                          ) : previewDiagnostics?.hasDesignElements && tmpl.canvasJSON ? (
+                          {tmpl.canvasJSON && tmpl.canvas.width > 0 && tmpl.canvas.height > 0 ? (
                             <TemplatePreviewCanvas
                               canvasJSON={tmpl.canvasJSON}
                               canvasConfig={tmpl.canvas}
                               maxWidth={160}
                               maxHeight={112}
+                            />
+                          ) : canRenderCardImage ? (
+                            <img
+                              src={effectiveThumbnail}
+                              alt={tmpl.templateName}
+                              className="max-h-full max-w-full object-contain rounded shadow"
+                              onError={() => markTemplatePreviewBroken(tmpl.id)}
                             />
                           ) : (
                             <div className="h-full w-full bg-muted/20 flex flex-col items-center justify-center gap-1.5 px-3 text-center">
@@ -3348,21 +3692,49 @@ export function ProjectDetail() {
                               </Badge>
                             )}
                           </div>
-                          {!previewDiagnostics?.hasDesignElements && !effectiveThumbnail && (
-                            <p className="text-[11px] text-destructive mt-1">
-                              No preview available. Please configure the template.
-                            </p>
-                          )}
-                          {Boolean(previewDiagnostics?.missingFieldKeys.length) && (
-                            <p className="text-[11px] text-amber-700 mt-1">
-                              Missing field mapping: {previewDiagnostics?.missingFieldKeys.map(formatFieldLabel).join(", ")}
-                            </p>
-                          )}
                           {tmpl.applicableFor && <p className="text-xs text-muted-foreground mt-1 truncate">For: {tmpl.applicableFor}</p>}
                           <p className="text-xs text-muted-foreground">{tmpl.createdAt}</p>
                         </div>
                         <div className="flex gap-2">
-                          <Button size="sm" variant="outline" className="flex-1 text-xs gap-1" onClick={() => setPreviewTemplate(tmpl)}>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="flex-1 text-xs gap-1"
+                            onClick={async () => {
+                              const enriched = enrichTemplateWithCanvas(tmpl);
+                              setPreviewTemplate(enriched);
+
+                              const remoteId = String((tmpl as any).remoteId || tmpl.id || "").trim();
+                              if (!MONGODB_OBJECT_ID_RE.test(remoteId)) return;
+
+                              // If modal template doesn't already have canvasJSON, fetch full record
+                              // so Preview can render from real designData instead of stale image URLs.
+                              if (enriched?.canvasJSON) return;
+                              try {
+                                const full = await getTemplateById(remoteId, { timeoutMs: 30000 });
+                                if (!full) return;
+                                setFullTemplatesCache((prev) => ({ ...prev, [remoteId]: full }));
+                                const designData = (full.designData || {}) as Record<string, any>;
+                                const canvasJSON =
+                                  typeof designData.canvasJSON === "string"
+                                    ? designData.canvasJSON
+                                    : (typeof designData.canvasJson === "string" ? designData.canvasJson : "");
+                                const thumb = resolveTemplatePreview(full, { fallbackToPlaceholder: false }) || enriched?.thumbnail;
+                                setPreviewTemplate((prev) => {
+                                  if (!prev || String((prev as any).remoteId || prev.id || "").trim() !== remoteId) {
+                                    return prev;
+                                  }
+                                  return {
+                                    ...prev,
+                                    ...(canvasJSON ? { canvasJSON } : {}),
+                                    ...(thumb ? { thumbnail: thumb } : {}),
+                                  };
+                                });
+                              } catch {
+                                // Keep modal open with best available fallback.
+                              }
+                            }}
+                          >
                             <Download className="h-3 w-3" />Preview
                           </Button>
                           <>
@@ -4354,15 +4726,43 @@ export function ProjectDetail() {
                   <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
 
                     {/* Rule-based matching indicator */}
-                    {previewForm.useRuleBasedMapping && projectRules.length > 0 && (
-                      <div className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs">
-                        <GitBranch className="h-3.5 w-3.5 text-primary flex-shrink-0" />
-                        <div>
-                          <p className="font-semibold text-primary">Rule-Based Matching Active</p>
-                          <p className="text-muted-foreground">{projectRules.length} rule{projectRules.length !== 1 ? "s" : ""} applied · {Object.keys(ruleAssignments || {}).length}/{selectedRecords.length} records matched</p>
+                    {previewForm.useRuleBasedMapping && projectRules.length > 0 && (() => {
+                      // Build per-template assignment counts from ruleAssignments
+                      const breakdown: Record<string, { name: string; count: number; isCatchAll: boolean }> = {};
+                      for (const tmplId of Object.values(ruleAssignments || {})) {
+                        if (!tmplId) continue;
+                        const rule = projectRules.find((r) => r.templateId === tmplId);
+                        const name = rule?.templateName ?? tmplId;
+                        const isCatchAll = rule
+                          ? (rule.conditionGroups.length === 0 || rule.conditionGroups.every((g) => g.conditions.length === 0))
+                          : false;
+                        breakdown[tmplId] = { name, count: (breakdown[tmplId]?.count ?? 0) + 1, isCatchAll };
+                      }
+                      const breakdownEntries = Object.values(breakdown).sort((a, b) => b.count - a.count);
+                      const specificMatches = breakdownEntries.filter((e) => !e.isCatchAll).reduce((s, e) => s + e.count, 0);
+                      return (
+                        <div className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs space-y-1">
+                          <div className="flex items-center gap-2">
+                            <GitBranch className="h-3.5 w-3.5 text-primary flex-shrink-0" />
+                            <p className="font-semibold text-primary">Rule-Based Matching Active</p>
+                          </div>
+                          <p className="text-muted-foreground">{projectRules.length} rule{projectRules.length !== 1 ? "s" : ""} applied · {specificMatches}/{selectedRecords.length} records matched specific rules</p>
+                          {breakdownEntries.length > 0 && (
+                            <ul className="mt-1 space-y-0.5 pl-1">
+                              {breakdownEntries.map((e) => (
+                                <li key={e.name} className="flex items-center gap-1.5">
+                                  <span className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${e.isCatchAll ? "bg-muted-foreground" : "bg-primary"}`} />
+                                  <span className={e.isCatchAll ? "text-muted-foreground" : "text-foreground font-medium"}>
+                                    {e.count} record{e.count !== 1 ? "s" : ""} → {e.name}
+                                    {e.isCatchAll && <span className="ml-1 text-muted-foreground">(catch-all)</span>}
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
                         </div>
-                      </div>
-                    )}
+                      );
+                    })()}
 
                     {/* 1. Output Setup */}
                     <div className="space-y-2">
@@ -4380,7 +4780,11 @@ export function ProjectDetail() {
                               setPreviewForm((prev) => {
                                 if (size === "Custom") return { ...prev, pageSize: size };
                                 const dims = PAGE_SIZE_DIMENSIONS[size];
-                                return { ...prev, pageSize: size, sheetWidthMm: String(dims.width), sheetHeightMm: String(dims.height) };
+                                // Respect current orientation when applying page dims
+                                const isLandscape = prev.orientation === "landscape";
+                                const w = isLandscape ? Math.max(dims.width, dims.height) : Math.min(dims.width, dims.height);
+                                const h = isLandscape ? Math.min(dims.width, dims.height) : Math.max(dims.width, dims.height);
+                                return { ...prev, pageSize: size, sheetWidthMm: String(w), sheetHeightMm: String(h) };
                               });
                             }}
                           >
@@ -4401,7 +4805,19 @@ export function ProjectDetail() {
                               type="button"
                               variant={previewForm.orientation === "portrait" ? "default" : "outline"}
                               className="h-7 text-xs"
-                              onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "portrait" }))}
+                              onClick={() => setPreviewForm((prev) => {
+                                if (prev.orientation === "portrait") return prev;
+                                const sw = Number(prev.sheetWidthMm);
+                                const sh = Number(prev.sheetHeightMm);
+                                return {
+                                  ...prev,
+                                  orientation: "portrait",
+                                  // Rotate PAGE to portrait (height > width).
+                                  // Card dims stay at natural template canvas size — no swapping.
+                                  sheetWidthMm:  sw > sh ? String(sh) : prev.sheetWidthMm,
+                                  sheetHeightMm: sw > sh ? String(sw) : prev.sheetHeightMm,
+                                };
+                              })}
                             >
                               Portrait
                             </Button>
@@ -4409,7 +4825,19 @@ export function ProjectDetail() {
                               type="button"
                               variant={previewForm.orientation === "landscape" ? "default" : "outline"}
                               className="h-7 text-xs"
-                              onClick={() => setPreviewForm((prev) => ({ ...prev, orientation: "landscape" }))}
+                              onClick={() => setPreviewForm((prev) => {
+                                if (prev.orientation === "landscape") return prev;
+                                const sw = Number(prev.sheetWidthMm);
+                                const sh = Number(prev.sheetHeightMm);
+                                return {
+                                  ...prev,
+                                  orientation: "landscape",
+                                  // Rotate PAGE to landscape (width > height).
+                                  // Card dims stay at natural template canvas size — no swapping.
+                                  sheetWidthMm:  sw < sh ? String(sh) : prev.sheetWidthMm,
+                                  sheetHeightMm: sw < sh ? String(sw) : prev.sheetHeightMm,
+                                };
+                              })}
                             >
                               Landscape
                             </Button>
@@ -4578,62 +5006,28 @@ export function ProjectDetail() {
                 {(() => {
                   const totalPreviewPages = Math.max(1, Math.ceil(selectedRecords.length / printLayout.cardsPerPage));
                   const safePageIndex = Math.min(previewPageIndex, totalPreviewPages - 1);
-                  const pageRecords = selectedRecords.slice(
-                    safePageIndex * printLayout.cardsPerPage,
-                    (safePageIndex + 1) * printLayout.cardsPerPage
-                  );
                   return (
                     <div className="flex-1 flex flex-col overflow-hidden">
 
                       {/* Preview toolbar */}
                       <div className="flex items-center justify-between px-5 py-2.5 border-b bg-background flex-shrink-0">
                         <span className="text-sm font-semibold">Live Preview</span>
-                        <div className="flex items-center gap-1">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => setPreviewZoom((z) => Math.max(25, z - 25))}
-                            disabled={previewZoom <= 25}
-                          >
-                            <Minus className="h-3.5 w-3.5" />
-                          </Button>
-                          <span className="text-sm font-mono min-w-[3.5rem] text-center select-none tabular-nums">
-                            {previewZoom}%
-                          </span>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => setPreviewZoom((z) => Math.min(200, z + 25))}
-                            disabled={previewZoom >= 200}
-                          >
-                            <Plus className="h-3.5 w-3.5" />
-                          </Button>
-                          <div className="w-px h-5 bg-border mx-1.5" />
+                        <div className="flex items-center gap-1.5">
+                          {isLivePreviewLoading && (
+                            <span className="flex items-center gap-1.5 text-xs text-muted-foreground mr-2">
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              Rendering…
+                            </span>
+                          )}
                           <Button
                             variant="outline"
                             size="sm"
                             className="h-8 text-xs gap-1.5"
-                            onClick={() => {
-                              const container = previewContainerRef.current;
-                              if (!container) { setPreviewZoom(90); return; }
-                              const w = container.clientWidth - 32;
-                              const wz = Math.floor((w / printLayout.sheetWidthPx) * 100);
-                              setPreviewZoom(Math.max(25, Math.round(Math.min(wz, 100) / 5) * 5));
-                            }}
+                            disabled={isLivePreviewLoading}
+                            onClick={() => void generateLivePreviewPage(safePageIndex)}
                           >
-                            <Maximize2 className="h-3.5 w-3.5" />
-                            Fit
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-8 text-xs gap-1.5"
-                            onClick={() => setPreviewZoom(100)}
-                          >
-                            <LayoutGrid className="h-3.5 w-3.5" />
-                            Grid
+                            <RefreshCw className="h-3.5 w-3.5" />
+                            Refresh
                           </Button>
                         </div>
                       </div>
@@ -4667,62 +5061,53 @@ export function ProjectDetail() {
                           ))}
                         </div>
 
-                        {/* Main preview area */}
+                        {/* Main preview area — PDF iframe */}
                         <div
                           ref={previewContainerRef}
-                          className="flex-1 overflow-auto bg-slate-100/80 dark:bg-slate-900/40 flex items-start justify-center"
-                          style={{ padding: "16px" }}
+                          className="flex-1 overflow-hidden bg-slate-100/80 dark:bg-slate-900/40 flex flex-col items-center justify-center relative"
                         >
-                          {!selectedGenerateTemplate ? (
+                          {!previewForm.templateId ? (
                             <div className="flex flex-col items-center justify-center h-full min-h-[300px] text-center gap-3 w-full">
                               <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center">
                                 <FileText className="h-5 w-5 text-muted-foreground" />
                               </div>
                               <p className="text-sm text-muted-foreground">Select a template to see preview</p>
                             </div>
-                          ) : selectedFullTemplateLoading ? (
+                          ) : livePreviewError ? (
+                            <div className="flex flex-col items-center justify-center h-full min-h-[300px] text-center gap-3 w-full px-6">
+                              <div className="w-12 h-12 rounded-full bg-destructive/10 flex items-center justify-center">
+                                <FileText className="h-5 w-5 text-destructive" />
+                              </div>
+                              <p className="text-sm text-destructive font-medium">Preview failed</p>
+                              <p className="text-xs text-muted-foreground">{livePreviewError}</p>
+                              <Button size="sm" variant="outline" onClick={() => void generateLivePreviewPage(safePageIndex)}>
+                                Retry
+                              </Button>
+                            </div>
+                          ) : isLivePreviewLoading && !livePreviewUrl ? (
                             <div className="flex flex-col items-center justify-center h-full min-h-[300px] gap-3 w-full">
-                              <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                              <p className="text-sm text-muted-foreground">Loading template design…</p>
+                              <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                              <p className="text-sm text-muted-foreground">Rendering preview…</p>
+                            </div>
+                          ) : livePreviewUrl ? (
+                            <div className="relative w-full h-full flex flex-col">
+                              {/* Dim overlay while re-rendering (stale preview visible underneath) */}
+                              {isLivePreviewLoading && (
+                                <div className="absolute inset-0 bg-background/60 flex items-center justify-center z-10 pointer-events-none">
+                                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                                </div>
+                              )}
+                              <iframe
+                                key={livePreviewUrl}
+                                src={`${livePreviewUrl}#toolbar=1&navpanes=0&scrollbar=1&view=FitH`}
+                                className="flex-1 w-full h-full border-0"
+                                title="Live Preview PDF"
+                              />
                             </div>
                           ) : (
-                            /* Outer div matches the visual (scaled) size so layout flow is correct */
-                            <div
-                              style={{
-                                width: `${printLayout.sheetWidthPx * previewZoom / 100}px`,
-                                height: `${printLayout.sheetHeightPx * previewZoom / 100}px`,
-                                flexShrink: 0,
-                                position: "relative",
-                              }}
-                            >
-                              {/* Inner div applies the CSS transform from top-left origin */}
-                              <div
-                                style={{
-                                  transform: `scale(${previewZoom / 100})`,
-                                  transformOrigin: "top left",
-                                  position: "absolute",
-                                  top: 0,
-                                  left: 0,
-                                  width: `${printLayout.sheetWidthPx}px`,
-                                  height: `${printLayout.sheetHeightPx}px`,
-                                }}
-                              >
-                                <div
-                                  className="bg-white shadow-2xl"
-                                  style={{
-                                    width: `${printLayout.sheetWidthPx}px`,
-                                    minHeight: `${printLayout.sheetHeightPx}px`,
-                                    padding: `${printLayout.marginTopPx}px ${printLayout.marginLeftPx}px`,
-                                    boxSizing: "border-box",
-                                  }}
-                                >
-                                  <IdCardGrid
-                                    students={pageRecords}
-                                    template={selectedGenerateTemplate}
-                                    containerClassName="p-0"
-                                  />
-                                </div>
-                              </div>
+                            <div className="flex flex-col items-center justify-center h-full min-h-[300px] gap-3 w-full">
+                              <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                              <p className="text-sm text-muted-foreground">Loading…</p>
                             </div>
                           )}
                         </div>

@@ -132,18 +132,22 @@ async function persistPreviewImage(previewValue: string, filenameHint = 'preview
       const tmpPath = path.join(os.tmpdir(), `tmp-${Date.now()}-${filename}`);
       await fs.promises.writeFile(tmpPath, buffer);
       try {
-        return await sftpUploadFile(tmpPath, filename);
+        const remoteUrl = await sftpUploadFile(tmpPath, filename);
+        console.log(`[templates] ✓ Preview SFTP-uploaded: ${filename} → ${remoteUrl}`);
+        return remoteUrl;
+      } catch (sftpErr) {
+        console.warn('[templates] SFTP upload failed, falling back to local disk:', (sftpErr as Error).message);
+        // Fall through to local-disk save below so the preview is never lost.
       } finally {
         await fs.promises.unlink(tmpPath).catch(() => {});
       }
-    } else {
-      // Local mode: write directly to uploads/templates/.
-      const filePath = path.join(templatesUploadsDir, filename);
-      await fs.promises.writeFile(filePath, buffer);
-      const relativePath = `/uploads/templates/${filename}`;
-      console.log(`[templates] ✓ Preview saved to disk: ${filename} (${Math.round(buffer.length / 1024)} KB) → ${relativePath}`);
-      return relativePath;
     }
+    // Local mode (or SFTP fallback): write directly to uploads/templates/.
+    const filePath = path.join(templatesUploadsDir, filename);
+    await fs.promises.writeFile(filePath, buffer);
+    const relativePath = `/uploads/templates/${filename}`;
+    console.log(`[templates] ✓ Preview saved to disk: ${filename} (${Math.round(buffer.length / 1024)} KB) → ${relativePath}`);
+    return relativePath;
   } catch (err) {
     console.warn('[templates] ! persistPreviewImage failed (non-fatal):', (err as Error).message);
     return previewValue; // fall back so the template save itself does not fail
@@ -382,8 +386,13 @@ router.get('/', async (req: Request, res: Response) => {
         ? `projectId:${requestedProjectId}`
         : '__all__';
 
+    // Bypass server cache when the client explicitly requests fresh data (e.g. after an
+    // SSE-triggered re-fetch or a forced refresh). The 'cache' fetch option sets the
+    // Cache-Control request header to 'no-cache' in those cases.
+    const clientWantsNoCache = String(req.headers['cache-control'] || '').toLowerCase().includes('no-cache');
+
     // 1. Check in-memory server cache first (fastest path)
-    const cached = getServerCache(cacheKey);
+    const cached = clientWantsNoCache ? null : getServerCache(cacheKey);
     if (cached) {
       res.setHeader('Cache-Control', 'private, max-age=300, stale-while-revalidate=600');
       res.setHeader('X-Cache', 'HIT');
@@ -812,7 +821,14 @@ router.put('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const rawPreview = resolvePreviewImage(req.body as Record<string, any>)
+    const previewPayload = req.body as Record<string, any>;
+    const requestedPreview = resolvePreviewImage(previewPayload);
+    const hasPreviewField = (
+      Object.prototype.hasOwnProperty.call(previewPayload, 'preview_image')
+      || Object.prototype.hasOwnProperty.call(previewPayload, 'previewImageUrl')
+      || Object.prototype.hasOwnProperty.call(previewPayload, 'imageUrl')
+    );
+    const rawPreview = requestedPreview
       || existingTemplate.preview_image
       || existingTemplate.previewImageUrl
       || '';
@@ -822,10 +838,17 @@ router.put('/:id', async (req: Request, res: Response) => {
     ).replace(/\s+/g, '_');
     const normalizedPreview = await persistPreviewImage(rawPreview, templateHint);
 
+    // If design content changed but the client did not provide a fresh data URL
+    // preview, the existing URL can stay stale (e.g. old "No Design" image).
+    // Clear preview fields to force frontend background regeneration from canvasJSON.
+    const hasDesignUpdate = Object.prototype.hasOwnProperty.call(previewPayload, 'designData');
+    const hasFreshPreviewDataUrl = requestedPreview.startsWith('data:image/');
+    const shouldClearStalePreview = hasDesignUpdate && hasPreviewField && !hasFreshPreviewDataUrl;
+
     const updatePayload: Record<string, any> = {
       ...req.body,
-      preview_image: normalizedPreview || undefined,
-      previewImageUrl: normalizedPreview || undefined,
+      preview_image: shouldClearStalePreview ? null : (normalizedPreview || undefined),
+      previewImageUrl: shouldClearStalePreview ? null : (normalizedPreview || undefined),
     };
 
     // Safety guard: if this template belongs to a specific project it is a
@@ -852,8 +875,11 @@ router.put('/:id', async (req: Request, res: Response) => {
     });
 
     if (template) {
-      // Keep TemplateGalleryMeta in sync (non-blocking).
-      TemplateGalleryMeta.findOneAndUpdate(
+      // Keep TemplateGalleryMeta in sync — AWAITED so cache invalidation and SSE fire
+      // only after the meta collection is consistent. Previously this was fire-and-forget,
+      // which created a race where a frontend re-fetch (triggered by the SSE) could query
+      // TemplateGalleryMeta before the upsert committed and receive the old thumbnail.
+      await TemplateGalleryMeta.findOneAndUpdate(
         { templateId: template._id },
         {
           templateId: template._id,

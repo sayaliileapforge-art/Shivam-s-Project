@@ -145,10 +145,20 @@ const _localUploadsDir = process.env.UPLOADS_DIR?.trim()
  * Returns null if the URL is not local, file doesn't exist, or path is outside
  * the uploads directory (path-traversal guard).
  */
+// Hostnames that map to the local filesystem (populated at startup from BACKEND_URL).
+const _localHostnames = new Set<string>(['localhost', '127.0.0.1']);
+try {
+  const _backendUrl = process.env.BACKEND_URL?.trim();
+  if (_backendUrl) {
+    const _bh = new URL(_backendUrl).hostname;
+    if (_bh) _localHostnames.add(_bh);
+  }
+} catch { /* ignore invalid BACKEND_URL */ }
+
 async function readLocalFileBuffer(url: string): Promise<Buffer | null> {
   try {
     const parsed = new URL(url);
-    const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+    const isLocal = _localHostnames.has(parsed.hostname);
     if (!isLocal) return null;
 
     const pathname = decodeURIComponent(parsed.pathname);
@@ -581,21 +591,112 @@ function toAbsoluteAssetUrl(rawValue: string, req: Request): string {
   return `${base}/${encodePathSegments(raw)}`;
 }
 
+/**
+ * Download photos directly from the SFTP server (port 22) as a batch.
+ * This is the fallback used in local development when the VPS HTTP server
+ * (port 80) is unreachable from the dev machine but SFTP (port 22) is
+ * accessible (because uploads already use it successfully).
+ *
+ * Opens ONE connection, downloads all requested files sequentially, then
+ * closes the connection.
+ */
+async function loadViaSftpBatch(urls: string[]): Promise<Map<string, Buffer>> {
+  const result = new Map<string, Buffer>();
+  const sftpHost = (process.env.SFTP_HOST ?? '').trim();
+  const sftpUser = (process.env.SFTP_USERNAME ?? '').trim();
+  const sftpPass = (process.env.SFTP_PASSWORD ?? '').trim();
+  const sftpPort = Number(process.env.SFTP_PORT ?? 22);
+  const remoteDir = (process.env.SFTP_REMOTE_DIR ?? '/var/www/saasapp/backend/public/uploads')
+    .trim().replace(/\/$/, '');
+
+  if (!sftpHost || !sftpUser) {
+    console.log('[SftpFallback] SFTP_HOST or SFTP_USERNAME not configured — skipping');
+    return result;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const SftpClient = require('ssh2-sftp-client');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const os = require('os');
+  const sftp = new SftpClient();
+  const tmpFiles: string[] = [];
+  try {
+    await sftp.connect({ host: sftpHost, port: sftpPort, username: sftpUser, password: sftpPass, readyTimeout: 15000 });
+    for (const url of urls) {
+      let tmpPath = '';
+      try {
+        const filename = path.basename(new URL(url).pathname);
+        if (!filename) continue;
+        const remotePath = `${remoteDir}/${filename}`;
+        tmpPath = path.join(os.tmpdir(), `sftp_photo_${Date.now()}_${Math.random().toString(36).slice(2)}_${filename}`);
+        tmpFiles.push(tmpPath);
+        // fastGet downloads to a temp file — avoids the sftp.get() hang on Windows
+        await sftp.fastGet(remotePath, tmpPath);
+        const buf = fs.readFileSync(tmpPath);
+        if (buf.length > 0) {
+          result.set(url, buf);
+          console.log(`[SftpFallback] ✓ ${filename} (${buf.length}B)`);
+        } else {
+          console.log(`[SftpFallback] ✗ Empty file: ${filename}`);
+        }
+      } catch (fileErr: unknown) {
+        console.log(`[SftpFallback] ✗ ${url}: ${(fileErr as Error).message}`);
+      }
+    }
+  } catch (connErr: unknown) {
+    console.log(`[SftpFallback] Connection failed: ${(connErr as Error).message}`);
+  } finally {
+    await sftp.end().catch(() => {});
+    // Clean up temp files
+    for (const f of tmpFiles) {
+      try { fs.unlinkSync(f); } catch { /* ignore */ }
+    }
+  }
+  return result;
+}
+
 async function loadStudentPhotoBuffer(rawSource: string, req: Request): Promise<Buffer | null> {
   const source = toAbsoluteAssetUrl(rawSource, req);
-  if (!source) return null;
+  if (!source) {
+    console.log(`[PhotoResolve] ✗ Could not resolve URL for raw="${rawSource}"`);
+    return null;
+  }
 
   const primary = await loadTemplatePreviewBuffer(source);
-  if (primary) return primary;
+  if (primary) {
+    console.log(`[PhotoResolve] ✓ Loaded: ${source}`);
+    return primary;
+  }
 
-  // If the raw value is a bare filename and the /uploads/ attempt failed,
-  // try common upload sub-folder candidates (some projects store photos in sub-dirs).
+  // ── Extension-normalization fallback ─────────────────────────────────────
+  // If the URL path has no image extension (e.g. /uploads/0 or /uploads/abc123),
+  // try appending common extensions so filenames stored without extension still load.
+  try {
+    const srcUrlObj = new URL(source);
+    const hasExt = /\.[a-z0-9]{2,5}$/i.test(srcUrlObj.pathname);
+    if (!hasExt) {
+      for (const ext of ['.jpg', '.jpeg', '.png', '.webp']) {
+        const withExt = `${srcUrlObj.origin}${srcUrlObj.pathname}${ext}`;
+        const buf = await loadTemplatePreviewBuffer(withExt);
+        if (buf) {
+          console.log(`[PhotoResolve] ✓ Loaded with extension fallback: ${withExt}`);
+          return buf;
+        }
+      }
+    }
+  } catch { /* skip invalid URL */ }
+
+  // ── Sub-folder & assets-dir fallback (bare filenames only) ───────────────
+  // When rawSource is a plain filename (no path separator, not a URL), try the
+  // most common upload sub-directories including the local /uploads/assets/ path
+  // used by the server's local-disk storage mode.
   const raw = String(rawSource || '').trim();
   if (raw && !raw.includes('/') && !/^(data:|blob:|https?:)/i.test(raw)) {
     const host = req.get('host') || 'localhost:5000';
     const base = `${req.protocol}://${host}`;
     const encoded = encodeURIComponent(raw);
     const candidates = [
+      `${base}/uploads/assets/${encoded}`,
       `${base}/uploads/students/${encoded}`,
       `${base}/uploads/photos/${encoded}`,
       `${base}/uploads/images/${encoded}`,
@@ -604,20 +705,49 @@ async function loadStudentPhotoBuffer(rawSource: string, req: Request): Promise<
     for (const candidate of candidates) {
       const buf = await loadTemplatePreviewBuffer(candidate);
       if (buf) {
-        console.debug(`[PhotoResolve] Found photo at fallback candidate: ${candidate}`);
+        console.log(`[PhotoResolve] ✓ Found at sub-folder candidate: ${candidate}`);
         return buf;
+      }
+      // Also try with common extensions
+      for (const ext of ['.jpg', '.jpeg', '.png', '.webp']) {
+        const withExt = candidate + ext;
+        const bufExt = await loadTemplatePreviewBuffer(withExt);
+        if (bufExt) {
+          console.log(`[PhotoResolve] ✓ Found at sub-folder+ext candidate: ${withExt}`);
+          return bufExt;
+        }
       }
     }
   }
 
+  console.log(`[PhotoResolve] ✗ All attempts failed for raw="${rawSource}" resolved="${source}"`);
   return null;
 }
 
-function resolveStudentCardData(record: Record<string, unknown>, req: Request): StudentCardData {
+function resolveStudentCardData(
+  record: Record<string, unknown>,
+  req: Request,
+  fieldMappings: Array<{templateField: string; csvColumn: string; fieldType: string}> = [],
+): StudentCardData {
   const name = getRecordValueByAliases(record, ['name', 'Name', 'studentName', 'fullName']) || '-';
   const schoolCode = getRecordValueByAliases(record, ['schoolCode', 'school_code', 'schoolcode', 'code', 'schoolId']) || '-';
   const admissionNo = getRecordValueByAliases(record, ['admissionNo', 'admission_no', 'admissionno', 'rollNo', 'roll_no']) || '-';
-  const photoRaw = getRecordValueByAliases(record, [
+
+  // Check rule's explicit image field mappings first (e.g. photo → PhotoFilename)
+  let photoRaw = '';
+  if (fieldMappings.length > 0) {
+    const imageMapping = fieldMappings.find(
+      (m) => m.fieldType === 'image' && m.csvColumn && String(record[m.csvColumn] ?? '').trim()
+    );
+    if (imageMapping) {
+      photoRaw = String(record[imageMapping.csvColumn] ?? '').trim();
+      console.log(`[FieldMapping] Photo resolved via mapping "${imageMapping.templateField}" → "${imageMapping.csvColumn}": "${photoRaw}"`);
+    }
+  }
+
+  // Fall back to standard alias resolution
+  if (!photoRaw) {
+    photoRaw = getRecordValueByAliases(record, [
     'photo',
     'Photo',
     'profilePic',
@@ -643,7 +773,23 @@ function resolveStudentCardData(record: Record<string, unknown>, req: Request): 
     'Avatar',
     'picture',
     'Picture',
+    // CSV columns that directly store filenames or URLs
+    'PhotoFilename',
+    'photo_filename',
+    'photoFilename',
+    'PhotoFile',
+    'photo_file',
+    'imageFile',
+    'ImageFile',
+    'image_file',
+    'imageFilename',
+    'ImageFilename',
+    'image_filename',
+    'studentImage',
+    'StudentImage',
+    'student_image',
   ]);
+  } // end if (!photoRaw)
 
   return {
     name,
@@ -920,6 +1066,7 @@ interface CanvasPhotoArea {
   placeholderSrc: string;  // data URL of the default silhouette/avatar in the canvas
   rx: number;              // border-radius x in effective canvas px (0 = square)
   clipRadius: number;      // > 0 when a circular clipPath is applied (radius in effective canvas px)
+  variableKey: string;     // normalised variable key (e.g. "photo", "signature", "logo")
 }
 
 interface CanvasStaticImage {
@@ -1066,8 +1213,13 @@ function extractCanvasRenderInfo(
         // Effective dimensions in canvas pixels (own scale × all ancestor scales).
         const totalScaleX = ownScaleX * accumScaleX;
         const totalScaleY = ownScaleY * accumScaleY;
-        const rawWidth  = Number((obj.__boxWidth  as number | undefined) ?? obj.width  ?? 0);
-        const rawHeight = Number((obj.__boxHeight as number | undefined) ?? obj.height ?? 0);
+        // Use obj.width/height as the raw bounding-box dimensions for position maths.
+        // __boxWidth/__boxHeight are only relevant inside specific type branches (groups,
+        // image-variable photo placeholders) where they represent the designer's container.
+        // For fabric.Image objects the natural pixel size is obj.width; scaleX shrinks it to
+        // fit a placeholder icon — using __boxWidth here would corrupt the origin offset.
+        const rawWidth  = Number(obj.width  ?? 0);
+        const rawHeight = Number(obj.height ?? 0);
         const effectiveWidth  = rawWidth  * totalScaleX;
         const effectiveHeight = rawHeight * totalScaleY;
 
@@ -1079,31 +1231,97 @@ function extractCanvasRenderInfo(
 
         const angle = Number(obj.angle ?? 0);
 
-        // ── Groups: recurse into children ─────────────────────────────────────
-        if (type === 'group' && Array.isArray(obj.objects)) {
-          // The group's geometric centre in absolute canvas pixels.
-          const groupCenterX = absCenterX + (originX === 'center' ? 0 : effectiveWidth  / 2);
-          const groupCenterY = absCenterY + (originY === 'center' ? 0 : effectiveHeight / 2);
-          // Pass totalScaleX (own × all ancestors) so that child positions, sizes, and
-          // font sizes all accumulate correctly for any nesting depth.
-          processObjects(
-            obj.objects as Record<string, unknown>[],
-            groupCenterX,
-            groupCenterY,
-            totalScaleX,   // accumulated scale: converts child local coords → canvas pixels
-            totalScaleY,
-          );
-          continue;
-        }
-
-        // ── Photo / image placeholders ────────────────────────────────────────
+        // ── Photo / image placeholders (varKey computed once, used by both groups and images) ────
         const varKey = String(
           (obj.variableKey ?? obj.__fieldKey ?? obj.fieldKey ?? obj.dataKey ?? obj.photoField ?? '') as string
         ).toLowerCase().replace(/[^a-z0-9]/g, '');
-        const isPhotoField = ['photo', 'photourl', 'profilepic', 'image', 'avatar', 'picture', 'studentphoto'].includes(varKey);
+        const isPhotoField = [
+          'photo', 'photourl', 'profilepic', 'image', 'avatar', 'picture', 'studentphoto',
+          'photofilename', 'photofile', 'imagefile', 'studentimage', 'profilephoto',
+          'studentpic', 'studentpicture', 'passportphoto',
+        ].includes(varKey);
+
+        // ── Groups ────────────────────────────────────────────────────────────
+        if (type === 'group') {
+          // A Designer Studio image-variable placeholder is stored as a fabric.Group
+          // with __fieldKind='image' and a photo-related variableKey.  Its children are
+          // only a dashed Rect frame + a Text label (e.g. "{{photo}}").  We must NOT
+          // recurse into these children — doing so extracts the {{photo}} text as a
+          // text variable and renders the student's raw photo URL/value as visible text
+          // in the photo position.  Instead, treat the group itself as a photo area.
+          const grpFieldKind = String((obj.__fieldKind ?? '') as string).toLowerCase();
+          // Detect image-variable placeholder groups using EITHER condition:
+          //  • __fieldKind='image'  – set by current Designer Studio saves
+          //  • isPhotoField        – catches older templates saved before __fieldKind
+          //                         was included in SERIALIZABLE_PROPS (prevents the
+          //                         child {{photo}} text from rendering as raw text).
+          if ((grpFieldKind === 'image' || isPhotoField) && effectiveWidth > 0 && effectiveHeight > 0) {
+            // For Group photo placeholders, the container box width is stored in __boxWidth;
+            // if absent fall back to effectiveWidth (obj.width × totalScaleX, which equals
+            // __boxWidth × scaleX for Groups since obj.width = bounding box = frame Rect width).
+            const grpBoxW = obj.__boxWidth != null
+              ? Number(obj.__boxWidth) * totalScaleX
+              : effectiveWidth;
+            const grpBoxH = obj.__boxHeight != null
+              ? Number(obj.__boxHeight) * totalScaleY
+              : effectiveHeight;
+            photoAreas.push({
+              left: objLeft,
+              top: objTop,
+              width: grpBoxW,
+              height: grpBoxH,
+              angle,
+              opacity: Number.isFinite(Number(obj.opacity)) ? Math.min(1, Math.max(0, Number(obj.opacity))) : 1,
+              placeholderSrc: '',  // Group has no embedded image — student photo or neutral box used
+              rx: Number(obj.rx ?? 0) * totalScaleX,
+              clipRadius: 0,
+              variableKey: varKey,  // track which variable this area represents
+            });
+            continue;  // Do NOT recurse into children
+          }
+
+          // Regular group — recurse into children.
+          if (Array.isArray(obj.objects)) {
+            // The group's geometric centre in absolute canvas pixels.
+            const groupCenterX = absCenterX + (originX === 'center' ? 0 : effectiveWidth  / 2);
+            const groupCenterY = absCenterY + (originY === 'center' ? 0 : effectiveHeight / 2);
+            // Pass totalScaleX (own × all ancestors) so that child positions, sizes, and
+            // font sizes all accumulate correctly for any nesting depth.
+            processObjects(
+              obj.objects as Record<string, unknown>[],
+              groupCenterX,
+              groupCenterY,
+              totalScaleX,   // accumulated scale: converts child local coords → canvas pixels
+              totalScaleY,
+            );
+          }
+          continue;
+        }
 
         if (type === 'image') {
-          if (isPhotoField && effectiveWidth > 0 && effectiveHeight > 0) {
+          // An image element is a photo-variable placeholder when:
+          //  • __fieldKind === 'image'  — explicitly marked as image variable in Designer Studio
+          //  • isPhotoField             — variableKey is a photo alias (older templates)
+          const imgFieldKind = String((obj.__fieldKind ?? '') as string).toLowerCase();
+
+          // Determine the rendered box dimensions in canvas pixels.
+          //
+          // The template was designed around the placeholder image's VISUAL size on canvas:
+          //   visual width  = obj.width  × obj.scaleX  (= obj.width  × ownScaleX × accumScaleX)
+          //   visual height = obj.height × obj.scaleY
+          //
+          // FULL_NAME and other text elements below the photo are positioned at Y coordinates
+          // that sit just below the placeholder's VISUAL bottom edge, NOT the __boxWidth box
+          // bottom.  Using __boxWidth (the larger designed container) extends the photo area
+          // downward, covering those text elements.
+          //
+          // Therefore: always use the ACTUAL VISUAL canvas size for both PHOTO and other
+          // image variables.  The student photo will be scaled with object-fit:cover to
+          // fill this exact visual area, exactly matching the designer's intended layout.
+          const imgBoxW = Number(obj.width ?? 0) * totalScaleX;
+          const imgBoxH = Number(obj.height ?? 0) * totalScaleY;
+
+          if ((imgFieldKind === 'image' || isPhotoField) && imgBoxW > 0 && imgBoxH > 0) {
             // Photo placeholder — student photo will be drawn here.
             // Extract clipPath info for circular or rounded-rect clipping.
             const cpObj = (obj.clipPath ?? null) as Record<string, unknown> | null;
@@ -1116,16 +1334,18 @@ function extractCanvasRenderInfo(
                 clipRadius = Math.min(Number(cpObj.rx ?? 0), Number(cpObj.ry ?? 0)) * totalScaleX;
               }
             }
+            console.log(`[CanvasRender] photoArea(image): __fieldKind="${imgFieldKind}" varKey="${varKey}" hasSrc=${!!String(obj.src ?? '').trim()} size=${Math.round(imgBoxW)}x${Math.round(imgBoxH)} (natural=${Math.round(Number(obj.width))}x${Math.round(Number(obj.height))} scaleX=${Number(obj.scaleX).toFixed(4)})`);
             photoAreas.push({
               left: objLeft,
               top: objTop,
-              width: effectiveWidth,
-              height: effectiveHeight,
+              width: imgBoxW,
+              height: imgBoxH,
               angle: angle,
               opacity: Number.isFinite(Number(obj.opacity)) ? Math.min(1, Math.max(0, Number(obj.opacity))) : 1,
               placeholderSrc: String(obj.src ?? '').trim(),
               rx: Number(obj.rx ?? 0) * totalScaleX,
               clipRadius,
+              variableKey: varKey,  // track which variable this area represents
             });
           } else if (effectiveWidth > 0 && effectiveHeight > 0) {
             // Static design image (icon, logo, decoration) — render from data URL
@@ -1285,44 +1505,87 @@ function renderCardFromCanvas(
   _fallbackImage: unknown | null,   // no longer used — thumbnail causes placeholder artifacts
   studentPhotoImage: unknown | null,
   staticImageObjects?: Array<{ img: unknown; info: CanvasStaticImage }>,
+  studentHasPhotoValue: boolean = false,
+  rotateContent: boolean = false,
+  preOpenedPhotoPlaceholders?: Array<any | null>,  // pre-opened per-area placeholder images (indexed by photoAreas order)
 ): void {
   const { canvasWidthPx, canvasHeightPx, textObjects, photoAreas, backgroundColor, staticImages } = canvasInfo;
   if (!canvasWidthPx || !canvasHeightPx) return;
 
-  // Scale factors: canvas pixels → card mm
-  const scaleX  = cardWidthMm  / canvasWidthPx;
-  const scaleY  = cardHeightMm / canvasHeightPx;
-  const avgScale = (scaleX + scaleY) / 2;  // used for font size
+  // ── Rotation support ─────────────────────────────────────────────────────
+  // When rotateContent=true the card SLOT is landscape (cardWidthMm > cardHeightMm)
+  // but the template canvas is portrait-oriented.  We compute uniform scaling
+  // against a "virtual" portrait slot (slotW×slotH = swapped dims), then apply
+  // a -90° PDFKit rotation transform so the portrait content fills the landscape
+  // slot correctly.  For portrait mode (rotateContent=false) everything is unchanged.
+  //
+  // Transform proof (translate(xMm, yMm+cardHeightMm) then rotate(-90°)):
+  //   draw (0,0)       → page (xMm,           yMm+cardHeightMm) = slot BL  ✓
+  //   draw (slotW, 0)  → page (xMm,           yMm)              = slot TL  ✓
+  //   draw (0, slotH)  → page (xMm+cardWidthMm, yMm+cardHeightMm) = slot BR ✓
+  //   draw (slotW,slotH)→ page (xMm+cardWidthMm, yMm)            = slot TR  ✓
+  // → portrait top→landscape LEFT, portrait bottom→landscape RIGHT (standard CCW 90°)
+  const slotW  = rotateContent ? cardHeightMm : cardWidthMm;   // virtual slot width
+  const slotH  = rotateContent ? cardWidthMm  : cardHeightMm;  // virtual slot height
+  const baseX  = rotateContent ? 0 : xMm;  // virtual origin X (0 in rotated frame)
+  const baseY  = rotateContent ? 0 : yMm;  // virtual origin Y (0 in rotated frame)
 
-  // 1. Thin card border
+  // ── Uniform fit scaling ────────────────────────────────────────────────────
+  const uniformScale    = Math.min(slotW / canvasWidthPx, slotH / canvasHeightPx);
+  const effCardWidthMm  = canvasWidthPx  * uniformScale;   // rendered content width  (mm)
+  const effCardHeightMm = canvasHeightPx * uniformScale;   // rendered content height (mm)
+  // Centre content within the virtual slot
+  const effXMm   = baseX + (slotW - effCardWidthMm)  / 2;
+  const effYMm   = baseY + (slotH - effCardHeightMm) / 2;
+  // Uniform scale on both axes — no distortion
+  const scaleX   = uniformScale;
+  const scaleY   = uniformScale;
+  const avgScale = uniformScale;
+
+  // 1. Thin card border (drawn OUTSIDE the content clip so the full border is visible)
   doc.save();
   doc.lineWidth(0.5).strokeColor('#cccccc');
   doc.roundedRect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm), mmToPt(1.5));
   doc.stroke();
   doc.restore();
 
-  // 2. Background: canvas background image (if any) or solid colour.
-  // We NEVER use the thumbnail here — it shows Designer Studio variable placeholders
-  // as text, causing duplicated/overlapping text when we overlay the actual data.
+  // ── Content clip + optional rotation ─────────────────────────────────────
+  // Clip to the PHYSICAL card boundary so content cannot bleed into adjacent cards.
+  // If rotateContent, apply the rotation transform INSIDE the clip so everything
+  // drawn in the virtual frame maps to the physical landscape slot.
+  doc.save();
+  doc.rect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm)).clip();
+
+  if (rotateContent) {
+    // translate to physical bottom-left of the landscape slot, then rotate -90°.
+    // This establishes a virtual portrait frame where (0,0) is the virtual TL
+    // and (slotW, slotH) is the virtual BR — mapping to the physical slot corners.
+    doc.translate(mmToPt(xMm), mmToPt(yMm + cardHeightMm));
+    doc.rotate(-90);
+  }
+
+  // 2. Background: fill the full virtual slot, then overlay the canvas background image.
+  // We NEVER use the thumbnail — it shows Designer Studio variable placeholders as
+  // raw text, which duplicates/overlaps the variable-substituted text we draw below.
+  const bgFillColor = backgroundColor || '#ffffff';
+  doc.rect(mmToPt(baseX), mmToPt(baseY), mmToPt(slotW), mmToPt(slotH))
+     .fill(bgFillColor);
+
   if (bgImage) {
     try {
-      doc.image(bgImage as Parameters<typeof doc.image>[0], mmToPt(xMm), mmToPt(yMm), {
-        width:  mmToPt(cardWidthMm),
-        height: mmToPt(cardHeightMm),
-      });
+      // Render background image fitted exactly to the content area (same uniform
+      // scale as all other canvas elements — no stretching or cropping).
+      doc.image(bgImage as Parameters<typeof doc.image>[0],
+        mmToPt(effXMm), mmToPt(effYMm),
+        { width: mmToPt(effCardWidthMm), height: mmToPt(effCardHeightMm) });
     } catch { /* ignore – keep generating */ }
-  } else {
-    // Solid background colour (e.g. '#ffffff' for white cards)
-    const fillColor = backgroundColor || '#ffffff';
-    doc.rect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm))
-       .fill(fillColor);
   }
 
   // 2b. Static design images (icons, logos) — pre-opened from data URLs
   const allStaticImages = staticImageObjects ?? [];
   for (const { img, info } of allStaticImages) {
-    const siLeft = xMm + info.left  * scaleX;
-    const siTop  = yMm + info.top   * scaleY;
+    const siLeft = effXMm + info.left  * scaleX;
+    const siTop  = effYMm + info.top   * scaleY;
     const siW    = info.width  * scaleX;
     const siH    = info.height * scaleY;
     if (siW <= 0 || siH <= 0) continue;
@@ -1342,24 +1605,84 @@ function renderCardFromCanvas(
     } catch { /* skip unrenderable images */ }
   }
 
-  // 3. Student photo at each photo-placeholder area (object-fit: cover + clip)
-  for (const area of photoAreas) {
-    const pxMm = xMm + area.left   * scaleX;
-    const pyMm = yMm + area.top    * scaleY;
+  // Variable keys that represent the student PHOTO field.
+  // Empty string ('') means the area was parsed from an older template with no
+  // variableKey stored — default to treating it as a photo area for backward compat.
+  const PHOTO_VAR_KEYS = new Set([
+    '', 'photo', 'photourl', 'profilepic', 'profileimage', 'image',
+    'avatar', 'picture', 'studentphoto', 'passportphoto', 'pic',
+    // Additional aliases for templates where the field key matches the CSV column name
+    'photofilename', 'photo_filename', 'photofile', 'imagefile', 'imagefilename',
+    'studentimage', 'profilephoto', 'studentpic', 'studentpicture',
+    'studentphotourl', 'profileimageurl', 'passportpic', 'userpic', 'userpicture',
+  ]);
+
+  // 3. Image-variable areas — route each to the correct image source based on variableKey.
+  //    Only PHOTO-aliased areas receive the student photo.
+  //    SIGNATURE / LOGO / STAMP / etc. use their template placeholder image.
+  for (let _areaIdx = 0; _areaIdx < photoAreas.length; _areaIdx++) {
+    const area = photoAreas[_areaIdx];
+    const pxMm = effXMm + area.left   * scaleX;
+    const pyMm = effYMm + area.top    * scaleY;
     const pwMm = area.width  * scaleX;
     const phMm = area.height * scaleY;
     if (pwMm <= 0 || phMm <= 0) continue;
 
-    // Resolve image to draw: student photo first, then fall back to the
-    // placeholder silhouette that is embedded as a data URL in the canvas.
-    let photoImg: any = studentPhotoImage ?? null;
-    if (!photoImg && area.placeholderSrc) {
-      try {
-        const buf = parseDataUrl(area.placeholderSrc);
-        if (buf) photoImg = (doc as any).openImage(buf);
-      } catch { /* ignore */ }
+    const areaVarKey = (area.variableKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const isPhotoArea = PHOTO_VAR_KEYS.has(areaVarKey);
+
+    let photoImg: any = null;
+
+    if (isPhotoArea) {
+      // ── PHOTO variable: use the student's photo ───────────────────────────
+      photoImg = studentPhotoImage ?? null;
+      // Only fall back to the template's embedded placeholder when the student
+      // record truly has no photo value (not a failed load).
+      if (!photoImg && !studentHasPhotoValue) {
+        // Use pre-opened placeholder (avoids per-card base64 decode + image open)
+        photoImg = preOpenedPhotoPlaceholders?.[_areaIdx] ?? null;
+        if (!photoImg && area.placeholderSrc) {
+          try {
+            const buf = parseDataUrl(area.placeholderSrc);
+            if (buf) photoImg = (doc as any).openImage(buf);
+          } catch { /* ignore */ }
+        }
+      }
+
+      if (!photoImg) {
+        // Draw a neutral gray "No Photo" box for failed student photos.
+        const npXPt = mmToPt(pxMm);
+        const npYPt = mmToPt(pyMm);
+        const npWPt = mmToPt(pwMm);
+        const npHPt = mmToPt(phMm);
+        if (npWPt > 0 && npHPt > 0) {
+          doc.save();
+          doc.rect(npXPt, npYPt, npWPt, npHPt).fill('#f3f4f6');
+          doc.rect(npXPt, npYPt, npWPt, npHPt).lineWidth(0.5).strokeColor('#d1d5db').stroke();
+          doc.fillColor('#9ca3af').fontSize(Math.max(4, Math.min(6, npHPt * 0.12)));
+          doc.text('No Photo', npXPt, npYPt + npHPt / 2 - 3, {
+            width: npWPt,
+            align: 'center',
+            lineBreak: false,
+          });
+          doc.restore();
+        }
+        continue;
+      }
+    } else {
+      // ── Non-PHOTO variable (SIGNATURE, LOGO, STAMP, QR, etc.) ────────────
+      // Use only the template's embedded placeholder image stored in the canvas.
+      // Do NOT use the student photo here.
+      // Use pre-opened placeholder (avoids per-card base64 decode + image open)
+      photoImg = preOpenedPhotoPlaceholders?.[_areaIdx] ?? null;
+      if (!photoImg && area.placeholderSrc) {
+        try {
+          const buf = parseDataUrl(area.placeholderSrc);
+          if (buf) photoImg = (doc as any).openImage(buf);
+        } catch { /* ignore */ }
+      }
+      if (!photoImg) continue;  // No placeholder for this variable — skip silently
     }
-    if (!photoImg) continue;
 
     const boxXPt = mmToPt(pxMm);
     const boxYPt = mmToPt(pyMm);
@@ -1400,11 +1723,28 @@ function renderCardFromCanvas(
     doc.restore();
   }
 
-  // 4. Text objects — clipped to the card boundary with exact designer styling
+  // 4. Text objects — clipped to the effective card boundary (inner clip, intersects with outer)
   doc.save();
-  doc.rect(mmToPt(xMm), mmToPt(yMm), mmToPt(cardWidthMm), mmToPt(cardHeightMm)).clip();
+  doc.rect(mmToPt(effXMm), mmToPt(effYMm), mmToPt(effCardWidthMm), mmToPt(effCardHeightMm)).clip();
+
+  // Photo-variable aliases used below to skip label texts inside Group photo placeholders.
+  const _photoVarAliases = ['photo', 'photourl', 'profilepic', 'profileimage', 'image',
+                            'avatar', 'picture', 'studentphoto', 'passportphoto', 'pic'];
 
   for (const textObj of textObjects) {
+    // Skip pure photo-variable placeholder texts (e.g. "{{photo}}", "{{image}}").
+    // These are the caption labels rendered inside a Designer Studio Group photo
+    // placeholder.  Rendering them as text would show the raw photo URL or numeric
+    // CSV value as visible text on the card — the photo-area block (section 3) handles
+    // them visually.  Skip unconditionally: a {{photo}} text should never appear as
+    // raw text even when the group was not detected as a photo area (avoids "0"/"78"
+    // numeric CSV artefacts on cards).
+    const _pureVarMatch = /^\s*\{\{([^}]+)\}\}\s*$/.exec(textObj.text);
+    const _pureVarKeyNorm = _pureVarMatch
+      ? _pureVarMatch[1].toLowerCase().replace(/[^a-z0-9]/g, '')
+      : textObj.variableKey.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (_photoVarAliases.includes(_pureVarKeyNorm)) continue;
+
     // Resolve variable placeholders.
     // Priority: variableKey direct lookup → {{VAR}} text substitution
     let resolved = '';
@@ -1421,16 +1761,16 @@ function renderCardFromCanvas(
     if (!displayText.trim()) continue;
 
     // Map canvas px coords to card mm coords
-    const txMm = xMm + textObj.left  * scaleX;
-    const tyMm = yMm + textObj.top   * scaleY;
+    const txMm = effXMm + textObj.left  * scaleX;
+    const tyMm = effYMm + textObj.top   * scaleY;
     const twMm = textObj.width > 0
       ? textObj.width  * scaleX
-      : cardWidthMm - (textObj.left * scaleX);
+      : effCardWidthMm - (textObj.left * scaleX);
     const thMm = textObj.height > 0 ? textObj.height * scaleY : 0;
 
     // Hard bounds-check: skip objects whose top-left is completely outside the card
     // (the PDF clip handles partial overlaps, but this prevents cursor drift)
-    if (txMm > xMm + cardWidthMm + 1 || tyMm > yMm + cardHeightMm + 1) continue;
+    if (txMm > effXMm + effCardWidthMm + 1 || tyMm > effYMm + effCardHeightMm + 1) continue;
 
     // Convert canvas-pixel font size → mm (via avgScale) → PDF points.
     // avgScale: canvas px → mm.  (72/25.4): mm → pt.
@@ -1524,6 +1864,9 @@ function renderCardFromCanvas(
     doc.restore();
   }
 
+  doc.restore();  // close section-4 text clip
+
+  // Close the outer card-boundary clip (and rotation transform if applied).
   doc.restore();
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1543,6 +1886,9 @@ router.post('/generate', async (req: Request, res: Response) => {
       ? configuration.perRecordTemplateAssignments as Record<string, string>
       : {};
     const hasPerRecordAssignments = Object.keys(perRecordTemplateAssignments).length > 0;
+    // Per-record field mappings from matched PrintRules — built during server-side rule evaluation.
+    // Maps record index → array of { templateField, csvColumn, fieldType } from the matched rule.
+    const perRecordFieldMappings: Record<string, Array<{templateField: string; csvColumn: string; fieldType: string}>> = {};
 
     console.debug('[PreviewAPI] incoming request', {
       templateId: requestedTemplateId,
@@ -1716,13 +2062,38 @@ router.post('/generate', async (req: Request, res: Response) => {
                 return (a.priority ?? 0) - (b.priority ?? 0);
               });
 
+            // The isDefault rule = explicit "If no template matches" selection in Rule Builder.
+            // It overrides regular catch-all (0-condition) rules for unmatched records.
+            const defaultFallbackRule = sortedRules.find((r) => (r as any).isDefault === true) ?? null;
+
             // Evaluate each record and build server-side assignments
             const serverAssignments: Record<string, string> = {};
             selectedRecords.forEach((record, idx) => {
               const row = buildNormalizedRowForRules(record, sortedRules);
-              const matched = sortedRules.find((rule) => evalRule(rule, row));
+
+              // Step 1: try specific (non-catch-all) rules only
+              const specificMatch = sortedRules
+                .filter((r) => !isCatchAllRule(r))
+                .find((r) => evalRule(r, row));
+
+              // Step 2: if no specific rule matched, use isDefault rule as fallback (overrides catch-all)
+              // Step 3: if no isDefault rule, fall through to a regular catch-all
+              const matched =
+                specificMatch ??
+                defaultFallbackRule ??
+                sortedRules.find((r) => isCatchAllRule(r));
+
               if (matched) {
                 serverAssignments[String(idx)] = String(matched.templateId);
+                // Store this rule's fieldMappings so the rendering pipeline can use
+                // them for explicit column resolution (e.g. photo → PhotoFilename)
+                if (matched.fieldMappings?.length) {
+                  perRecordFieldMappings[String(idx)] = matched.fieldMappings.map((m: any) => ({
+                    templateField: String(m.templateField || ''),
+                    csvColumn:     String(m.csvColumn     || ''),
+                    fieldType:     String(m.fieldType     || 'text'),
+                  }));
+                }
               }
             });
 
@@ -1739,8 +2110,11 @@ router.post('/generate', async (req: Request, res: Response) => {
 
             // Log rule evaluation result (including what fields the first record has)
             const firstRecord = selectedRecords[0] || {};
-            const conditionFields = sortedRules.flatMap((r) =>
+            const conditionFields = [...new Set(sortedRules.flatMap((r) =>
               r.conditionGroups.flatMap((g) => g.conditions.map((c) => c.field))
+            ))];
+            const specificRuleTemplateIds = new Set(
+              sortedRules.filter((r) => !isCatchAllRule(r)).map((r) => String(r.templateId))
             );
             const firstRow = buildNormalizedRowForRules(firstRecord, sortedRules);
             console.log('[PreviewAPI] server-side rule evaluation result', {
@@ -1748,10 +2122,40 @@ router.post('/generate', async (req: Request, res: Response) => {
               recordCount: selectedRecords.length,
               serverAssignedCount: Object.keys(serverAssignments).length,
               templateAssignmentSummary: assignmentSummary,
-              conditionFields: [...new Set(conditionFields)],
+              conditionFields,
               firstRecordKeys: Object.keys(firstRecord).filter((k) => !String((firstRecord as any)[k]).startsWith('data:')).slice(0, 20),
               firstRecordConditionValues: Object.fromEntries(conditionFields.map((f) => [f, firstRow[f] ?? '(not found)'])),
             });
+
+            // Log records that fell through to catch-all / isDefault fallback
+            const catchAllFallthrough: Array<{ idx: number; name: string; conditionValues: Record<string, string>; via: string }> = [];
+            selectedRecords.forEach((record, idx) => {
+              const assignedId = serverAssignments[String(idx)];
+              if (assignedId && !specificRuleTemplateIds.has(assignedId)) {
+                const row = buildNormalizedRowForRules(record, sortedRules);
+                const nameValue = String(
+                  (record as any)['Name'] || (record as any)['name'] ||
+                  (record as any)['studentName'] || (record as any)['Student Name'] ||
+                  (record as any)['full_name'] || (record as any)['fullName'] || ''
+                ).trim() || `record[${idx}]`;
+                const via = defaultFallbackRule && String(defaultFallbackRule.templateId) === assignedId
+                  ? `isDefault:"${defaultFallbackRule.templateName}"`
+                  : 'catch-all';
+                catchAllFallthrough.push({
+                  idx,
+                  name: nameValue,
+                  via,
+                  conditionValues: Object.fromEntries(conditionFields.map((f) => [f, row[f] ?? '(not found)'])),
+                });
+              }
+            });
+            if (catchAllFallthrough.length > 0) {
+              console.warn(
+                `[PreviewAPI] ${catchAllFallthrough.length} record(s) did not match any specific rule — assigned via fallback.`,
+                `Check that the condition field values below match your rule conditions exactly.`,
+                catchAllFallthrough.slice(0, 20)
+              );
+            }
           }
         } catch (ruleErr) {
           console.warn('[PreviewAPI] server-side rule evaluation failed (non-fatal):', ruleErr);
@@ -1828,7 +2232,9 @@ router.post('/generate', async (req: Request, res: Response) => {
       });
     }
 
-    const studentCardData = selectedRecords.map((record) => resolveStudentCardData(record, req));
+    const studentCardData = selectedRecords.map((record, idx) =>
+      resolveStudentCardData(record, req, perRecordFieldMappings[String(idx)] || [])
+    );
     console.debug('[PreviewAPI] mapped first student data', studentCardData[0] || null);
 
     const recordsWithoutPhoto = studentCardData.filter((s) => !s.photoUrl);
@@ -1844,7 +2250,8 @@ router.post('/generate', async (req: Request, res: Response) => {
     const uniquePhotoSources = Array.from(
       new Set(studentCardData.map((item) => item.photoUrl).filter((value) => Boolean(value)))
     );
-    console.debug(`[PhotoResolve] ${uniquePhotoSources.length} unique photo URLs to fetch (out of ${studentCardData.length} records)`);
+    console.log(`[PhotoResolve] ${uniquePhotoSources.length} unique photo URLs to fetch (out of ${studentCardData.length} records)`);
+    uniquePhotoSources.forEach((url, i) => console.log(`[PhotoResolve]   [${i}] ${url}`));
 
     const studentPhotoBufferByUrl = new Map<string, Buffer>();
     await Promise.all(
@@ -1857,33 +2264,60 @@ router.post('/generate', async (req: Request, res: Response) => {
         }
       })
     );
-    console.debug(`[PhotoResolve] Successfully loaded ${studentPhotoBufferByUrl.size} / ${uniquePhotoSources.length} photo buffers`);
+    console.log(`[PhotoResolve] Successfully loaded ${studentPhotoBufferByUrl.size} / ${uniquePhotoSources.length} photo buffers`);
+
+    // ── SFTP direct-download fallback ──────────────────────────────────────
+    // In local development the VPS web server (port 80) may be unreachable,
+    // so HTTP fetches for SFTP-stored photos all fail.  SFTP port 22 IS
+    // reachable (uploads use it), so we retry failed SFTP-origin URLs via
+    // a single SFTP connection that downloads all of them sequentially.
+    const _sftpPublicBase = (process.env.SFTP_PUBLIC_URL ?? '').replace(/\/$/, '');
+    const _failedSftpUrls = _sftpPublicBase
+      ? uniquePhotoSources.filter(u => !studentPhotoBufferByUrl.has(u) && u.startsWith(_sftpPublicBase))
+      : [];
+    if (_failedSftpUrls.length > 0) {
+      console.log(`[SftpFallback] ${_failedSftpUrls.length} photo(s) failed HTTP — trying SFTP direct download...`);
+      const _sftpBuffers = await loadViaSftpBatch(_failedSftpUrls);
+      _sftpBuffers.forEach((buf, url) => studentPhotoBufferByUrl.set(url, buf));
+      console.log(`[SftpFallback] Loaded ${_sftpBuffers.size} / ${_failedSftpUrls.length} photo(s) via SFTP`);
+    }
 
     const orientation = configuration.orientation === 'landscape' ? 'landscape' : 'portrait';
-    let sheetWidthMm = clampNumber(configuration.sheetSize?.widthMm, 210, 10, 2000);
-    let sheetHeightMm = clampNumber(configuration.sheetSize?.heightMm, 297, 10, 2000);
-
-    if (orientation === 'landscape' && sheetHeightMm > sheetWidthMm) {
-      const temp = sheetWidthMm;
-      sheetWidthMm = sheetHeightMm;
-      sheetHeightMm = temp;
-    }
-    if (orientation === 'portrait' && sheetWidthMm > sheetHeightMm) {
-      const temp = sheetWidthMm;
-      sheetWidthMm = sheetHeightMm;
-      sheetHeightMm = temp;
-    }
+    // Enforce page orientation: landscape → width > height; portrait → height > width.
+    // This corrects any frontend mismatch (e.g. stale state sending portrait dims for landscape).
+    const rawSheetW = clampNumber(configuration.sheetSize?.widthMm,  210, 10, 2000);
+    const rawSheetH = clampNumber(configuration.sheetSize?.heightMm, 297, 10, 2000);
+    const sheetWidthMm  = orientation === 'landscape'
+      ? Math.max(rawSheetW, rawSheetH)   // wider  side = width  for landscape
+      : Math.min(rawSheetW, rawSheetH);  // narrower side = width for portrait
+    const sheetHeightMm = orientation === 'landscape'
+      ? Math.min(rawSheetW, rawSheetH)   // shorter side = height for landscape
+      : Math.max(rawSheetW, rawSheetH);  // taller  side = height for portrait
 
     const templateType: TemplateType = isTemplateType(configuration.templateType)
       ? configuration.templateType
       : resolvedTemplate.templateType;
 
-    const cardWidthMm = configuration.cardSize?.widthMm
+    // Raw card dimensions from the request (= natural template canvas size sent by frontend).
+    const rawCardW = configuration.cardSize?.widthMm
       ? clampNumber(configuration.cardSize.widthMm, templateType === 'id_card' ? 86 : 140, 10, 1000)
       : clampNumber(resolvedTemplate.canvas.width, templateType === 'id_card' ? 86 : 140, 10, 1000);
-    const cardHeightMm = configuration.cardSize?.heightMm
+    const rawCardH = configuration.cardSize?.heightMm
       ? clampNumber(configuration.cardSize.heightMm, templateType === 'id_card' ? 54 : 90, 10, 1000)
       : clampNumber(resolvedTemplate.canvas.height, templateType === 'id_card' ? 54 : 90, 10, 1000);
+    // Card SLOT orientation matches the page orientation so the grid correctly
+    // reflects more columns on a landscape page.
+    //   landscape page → card slot is wider than tall  (max × min)
+    //   portrait  page → card slot is taller than wide (min × max)
+    const cardWidthMm  = orientation === 'landscape' ? Math.max(rawCardW, rawCardH) : Math.min(rawCardW, rawCardH);
+    const cardHeightMm = orientation === 'landscape' ? Math.min(rawCardW, rawCardH) : Math.max(rawCardW, rawCardH);
+    // Rotate card CONTENT when the template canvas orientation differs from the slot orientation.
+    //   portrait template (H>W) in landscape slot (W>H) → rotate 90° CCW so content fills slot ✓
+    //   landscape template (W>H) in landscape slot (W>H) → no rotation needed               ✓
+    //   portrait template (H>W) in portrait slot  (H>W) → no rotation needed               ✓
+    //   landscape template (W>H) in portrait slot  (H>W) → rotate 90° CCW                  ✓
+    const templateIsPortrait = (resolvedTemplate.canvas.height ?? 0) > (resolvedTemplate.canvas.width ?? 0);
+    const rotateCardContent  = templateIsPortrait === (cardWidthMm > cardHeightMm);
 
     const marginTopMm = clampNumber(configuration.pageMargin?.topMm, 8, 0, 100);
     const marginLeftMm = clampNumber(configuration.pageMargin?.leftMm, 8, 0, 100);
@@ -1999,6 +2433,23 @@ router.post('/generate', async (req: Request, res: Response) => {
       canvasStaticImagesByTemplateId.set(templateId, opened);
     }
 
+    // Pre-open photo-area placeholder images once per template.
+    // These are the same base64 data URL for every card of the same template — opening them
+    // here avoids 300+ redundant parseDataUrl + doc.openImage calls in the render loop.
+    const canvasPhotoPlaceholdersByTemplateId = new Map<string, Array<any | null>>();
+    for (const [templateId, canvasInfo] of canvasRenderInfoByTemplateId.entries()) {
+      if (!canvasInfo?.photoAreas.length) continue;
+      const placeholders: Array<any | null> = canvasInfo.photoAreas.map((area) => {
+        if (!area.placeholderSrc) return null;
+        try {
+          const buf = parseDataUrl(area.placeholderSrc);
+          if (buf) return (doc as any).openImage(buf) ?? null;
+        } catch { /* ignore */ }
+        return null;
+      });
+      canvasPhotoPlaceholdersByTemplateId.set(templateId, placeholders);
+    }
+
     // Fetch project-level metadata (school/organisation name) for {{COMPANY_NAME}} etc.
     let projectLevelData: Record<string, string> = {};
     if (projectIdRaw && mongoose.Types.ObjectId.isValid(projectIdRaw)) {
@@ -2058,6 +2509,9 @@ router.post('/generate', async (req: Request, res: Response) => {
       const assignedId = perRecordTemplateAssignments[String(globalRecordIndex)];
       if (assignedId) return assignedId;
 
+      // In rule-based mode, no assignment means no rule matched — return '' to skip rendering.
+      if (useRuleBasedMapping) return '';
+
       if (!useFieldBasedMapping || templateMappings.length === 0) {
         return requestedTemplateId;
       }
@@ -2106,16 +2560,11 @@ router.post('/generate', async (req: Request, res: Response) => {
 
         const matched = recordValue === fieldValue || numericMatch;
         if (matched) {
-          console.log(`[TEMPLATE MAPPING] MATCH field="${fieldName}" recordValue="${recordValue}" fieldValue="${fieldValue}" templateId="${templateId}"`);
           return templateId;
-        } else {
-          console.log(`[TEMPLATE MAPPING] NO_MATCH field="${fieldName}" recordValue="${recordValue}" fieldValue="${fieldValue}"`);
         }
       }
 
       // Use the requested template as the canonical default for all non-matching records.
-      // This guarantees mapped templates only apply to records that actually match.
-      console.log(`[TEMPLATE MAPPING] DEFAULT templateId="${requestedTemplateId}"`);
       return requestedTemplateId;
     };
 
@@ -2141,9 +2590,16 @@ router.post('/generate', async (req: Request, res: Response) => {
         const globalRecordIndex = pageIndex * pageCapacity + index;
         const xMm = marginLeftMm + col * (cardWidthMm + columnMarginMm);
         const yMm = marginTopMm + row * (cardHeightMm + rowMarginMm);
-        const student = studentCardData[globalRecordIndex] || resolveStudentCardData(record, req);
+        const student = studentCardData[globalRecordIndex]
+          || resolveStudentCardData(record, req, perRecordFieldMappings[String(globalRecordIndex)] || []);
         const studentPhotoImage = student.photoUrl ? studentPhotoImageByUrl.get(student.photoUrl) || null : null;
+        console.log(`[PhotoResolve] Card ${globalRecordIndex + 1}: photoUrl="${student.photoUrl ?? '(none)'}" imgLoaded=${studentPhotoImage !== null}`);
         const recordTemplateId = resolveTemplateIdForRecord(record, globalRecordIndex);
+        // Skip records that have no matching rule in rule-based mode.
+        if (!recordTemplateId) {
+          console.log(`[TemplateMapping] Record ${globalRecordIndex} has no matching rule — skipped`);
+          return;
+        }
         const recordTemplate = resolvedTemplateById.get(recordTemplateId) || resolvedTemplate;
         const recordPreviewImage = previewImageByTemplateId.get(recordTemplateId) || previewImageByTemplateId.get(requestedTemplateId) || null;
 
@@ -2156,6 +2612,17 @@ router.post('/generate', async (req: Request, res: Response) => {
           const staticImageObjects = canvasStaticImagesByTemplateId.get(recordTemplateId) ?? [];
           // Enrich record with project-level data (e.g. school name for {{COMPANY_NAME}})
           const enrichedRecord = { ...projectLevelData, ...(record as Record<string, unknown>) };
+          // Apply rule field mappings so {{templateField}} resolves from the mapped CSV column.
+          // e.g. mapping {templateField: 'photo', csvColumn: 'PhotoFilename'} lets
+          // {{photo}} render the value from the PhotoFilename column.
+          const recFieldMappings = perRecordFieldMappings[String(globalRecordIndex)] || [];
+          for (const mapping of recFieldMappings) {
+            if (mapping.templateField && mapping.csvColumn && mapping.csvColumn !== mapping.templateField) {
+              const mappedVal = String(record[mapping.csvColumn] ?? '').trim();
+              if (mappedVal) enrichedRecord[mapping.templateField] = mappedVal;
+            }
+          }
+          const studentHasPhotoValue = Boolean(student.photoUrl);
           renderCardFromCanvas(
             doc,
             xMm,
@@ -2168,6 +2635,9 @@ router.post('/generate', async (req: Request, res: Response) => {
             null,  // no thumbnail fallback — causes placeholder text artifacts
             studentPhotoImage,
             staticImageObjects,
+            studentHasPhotoValue,
+            rotateCardContent,
+            canvasPhotoPlaceholdersByTemplateId.get(recordTemplateId),
           );
         } else {
           renderTemplateCard(recordTemplate.templateSlug as TemplateSlug, {

@@ -54,7 +54,7 @@ import {
   loadProjects, type Project, type ProjectTemplate,
 } from "../../lib/projectStore";
 import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
-import { createTemplate, updateTemplate, getTemplateById, mapTemplateRecordToProjectTemplate } from "../../lib/templateApi";
+import { createTemplate, updateTemplate, getTemplateById, mapTemplateRecordToProjectTemplate, invalidateTemplateCache, type TemplateRecord } from "../../lib/templateApi";
 import { normalizeShapePreviewSvg, type ShapeItem } from "../../lib/shapesGallery";
 
 // --- Types --------------------------------------------------------------------
@@ -1023,6 +1023,25 @@ export function DesignerStudio() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // When ProjectDetail navigates here immediately (before the API call completes),
+  // templateId starts empty. This listener receives the real MongoDB templateId
+  // once ProjectDetail's background createTemplate() resolves.
+  useEffect(() => {
+    const handleContextReady = (e: Event) => {
+      const { ctx, remoteTemplate } = (e as CustomEvent<{ ctx: DesignerContext; remoteTemplate: TemplateRecord }>).detail;
+      // Guard: only apply if we don't already have a templateId
+      if (!ctx?.templateId || designerContext?.templateId) return;
+      const mapped = mapTemplateRecordToProjectTemplate(remoteTemplate);
+      setActiveTemplate({ ...mapped, createdAt: remoteTemplate.createdAt ?? new Date().toLocaleDateString("en-IN") });
+      setDesignerContext(ctx);
+      localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify(ctx));
+      setSaveProjectId(ctx.projectId ?? "");
+      initialTemplateLoadDoneRef.current = true;
+    };
+    window.addEventListener("designer:context-ready", handleContextReady);
+    return () => window.removeEventListener("designer:context-ready", handleContextReady);
+  }, [designerContext?.templateId]);
+
   useEffect(() => {
     const activePage = pages.find((p) => p.id === activePageId);
     if (!activePage) return;
@@ -1232,10 +1251,17 @@ export function DesignerStudio() {
   }, [autoSaveTemplateNow, designerContext?.templateId, importMode, isSaving]);
 
   useEffect(() => {
+    const projectId = designerContext?.projectId;
     return () => {
+      // Proactively invalidate the project template cache so ProjectDetail always
+      // fetches fresh data when navigating back — avoids a stale-cache race with
+      // the fire-and-forget auto-save network request.
+      if (projectId) {
+        invalidateTemplateCache(projectId);
+      }
       autoSaveTemplateNow("unmount");
     };
-  }, [autoSaveTemplateNow]);
+  }, [autoSaveTemplateNow, designerContext?.projectId]);
 
   // Keep the stable ref in sync so event handlers can call the latest version
   // without capturing stale closures.

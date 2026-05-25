@@ -325,7 +325,13 @@ export async function updateTemplate(templateId: string, input: Partial<Template
     }),
   });
 
-  return handleResponse<TemplateRecord>(response);
+  const result = await handleResponse<TemplateRecord>(response);
+  // Invalidate the cache so ProjectDetail picks up the updated thumbnail/canvasJSON
+  // when the user navigates back from Designer Studio.
+  const cacheKey = input.projectId
+    ?? (input.productId?.length === 24 ? undefined : input.productId);
+  invalidateTemplateCache(cacheKey);
+  return result;
 }
 
 export async function deleteTemplate(templateId: string): Promise<void> {
