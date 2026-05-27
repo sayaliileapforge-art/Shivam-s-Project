@@ -67,6 +67,14 @@ import { useGenerateMissingPreviews } from "../../lib/useGenerateMissingPreviews
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
 import { getRulesByProject, evaluateRule, type PrintRule } from "../../lib/ruleBuilderApi";
 
+// ── AI Image Processing components ────────────────────────────────────────────
+import { AICropModal }           from "../components/ai/AICropModal";
+import { AIBgRemoveModal }       from "../components/ai/AIBgRemoveModal";
+import { BarcodeModal }          from "../components/ai/BarcodeModal";
+import { BulkImageUploadModal }  from "../components/ai/BulkImageUploadModal";
+import { ImageUploadModal }      from "../components/ai/ImageUploadModal";
+import { AIPhotoEditorModal }    from "../components/ai/AIPhotoEditorModal";
+
 // ─── Template dialog types ───────────────────────────────────────────────────
 type PageFormat = "a4" | "13x19" | "custom";
 const PAGE_FORMAT_SIZES: Record<PageFormat, { width: number; height: number }> = {
@@ -712,6 +720,15 @@ export function ProjectDetail() {
   const [aiProcessing, setAiProcessing] = useState<string | null>(null);
   const [isGenerateBarcodeOpen, setIsGenerateBarcodeOpen] = useState(false);
   const [barcodeField, setBarcodeField] = useState("");
+
+  // ── AI modals (dark-theme, Python-backed) ──────────────────────────────────
+  const [isAICropOpen, setIsAICropOpen]           = useState(false);
+  const [isAIBgRemoveOpen, setIsAIBgRemoveOpen]   = useState(false);
+  const [isAIBarcodeOpen, setIsAIBarcodeOpen]     = useState(false);
+  const [isAIBulkUploadOpen, setIsAIBulkUploadOpen] = useState(false);
+  const [isAIImageUploadOpen, setIsAIImageUploadOpen] = useState(false);
+  const [aiImageUploadTargetId, setAiImageUploadTargetId] = useState<string | null>(null);
+  const [isAIPhotoEditorOpen, setIsAIPhotoEditorOpen] = useState(false);
   const [isGeneratePreviewOpen, setIsGeneratePreviewOpen] = useState(false);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [previewError, setPreviewError] = useState("");
@@ -1917,6 +1934,27 @@ export function ProjectDetail() {
     setBulkEditValue("");
   };
 
+  // ── Shared helper: apply photo/barcode updates from AI modals ───────────────
+  const applyPhotoUpdates = (updates: Array<{ id: string; photo: string }>) => {
+    if (!id || !updates.length) return;
+    const updated = dataRecords.map((r) => {
+      const upd = updates.find((u) => u.id === r.id);
+      return upd ? { ...r, photo: upd.photo } : r;
+    });
+    persistDataRecords(updated);
+    toast.success(`Updated ${updates.length} photo${updates.length !== 1 ? "s" : ""}`);
+  };
+
+  const applyBarcodeUpdates = (updates: Array<{ id: string; barcode: string }>) => {
+    if (!id || !updates.length) return;
+    const updated = dataRecords.map((r) => {
+      const upd = updates.find((u) => u.id === r.id);
+      return upd ? { ...r, barcode: upd.barcode } : r;
+    });
+    persistDataRecords(updated);
+    toast.success(`Generated ${updates.length} barcode${updates.length !== 1 ? "s" : ""}`);
+  };
+
   // AI Image Auto Crop (canvas center-crop to square)
   const handleAIAutoCrop = async () => {
     const targetIds = dataSelectedIds.size > 0
@@ -2771,6 +2809,8 @@ export function ProjectDetail() {
     const pageMarginLeftMm = Number(previewForm.pageMarginLeftMm);
     const rowMarginMm = Number(previewForm.rowMarginMm || "0");
     const columnMarginMm = Number(previewForm.columnMarginMm || "0");
+
+    console.log(`[Frontend] Sending sheet dimensions: ${sheetWidthMm} x ${sheetHeightMm} mm`);
 
     const requestTemplateId = previewForm.templateId;
     const requestTemplate = findPreviewTemplateByLookupId(requestTemplateId);
@@ -4363,25 +4403,40 @@ export function ProjectDetail() {
                                   : <Crop className="h-4 w-4 mr-2" />}
                                 AI Image Auto Crop
                               </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => setIsAICropOpen(true)}>
+                                <Crop className="h-4 w-4 mr-2 text-violet-400" /> AI Auto Crop (Advanced)
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => setIsAIPhotoEditorOpen(true)}>
+                                <Wand2 className="h-4 w-4 mr-2 text-pink-400" /> AI Photo Studio
+                              </DropdownMenuItem>
                               <DropdownMenuItem onClick={() => void handleAIBgRemove()} disabled={!!aiProcessing}>
                                 {aiProcessing === "bgremove"
                                   ? <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                                   : <Wand2 className="h-4 w-4 mr-2" />}
                                 AI Image Background Remover
                               </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => setIsAIBgRemoveOpen(true)}>
+                                <Wand2 className="h-4 w-4 mr-2 text-cyan-400" /> AI Background Remove (Advanced)
+                              </DropdownMenuItem>
                               <DropdownMenuSeparator />
                               <DropdownMenuItem onClick={handleResetPhoto}>
                                 <RotateCcw className="h-4 w-4 mr-2" /> Reset Photo
                               </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => { setImageUploadTarget("selection"); photoUploadRef.current?.click(); }}>
-                                <ImageIcon className="h-4 w-4 mr-2" /> Image Upload
+                              <DropdownMenuItem onClick={() => { setAiImageUploadTargetId(null); setIsAIImageUploadOpen(true); }}>
+                                <ImageIcon className="h-4 w-4 mr-2 text-indigo-400" /> Image Upload
                               </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => { setBulkImageResults(null); setIsBulkImageUploadOpen(true); }} disabled={!dataRecords.length}>
-                                <Archive className="h-4 w-4 mr-2" /> Bulk Image Upload
+                              <DropdownMenuItem onClick={() => { setImageUploadTarget("selection"); photoUploadRef.current?.click(); }}>
+                                <ImageIcon className="h-4 w-4 mr-2" /> Image Upload (Quick)
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => { setBulkImageResults(null); setIsAIBulkUploadOpen(true); }} disabled={!dataRecords.length}>
+                                <Archive className="h-4 w-4 mr-2 text-blue-400" /> Bulk Image Upload
                               </DropdownMenuItem>
                               <DropdownMenuSeparator />
                               <DropdownMenuItem onClick={() => { setBarcodeField(dataFields[0]?.key ?? ""); setIsGenerateBarcodeOpen(true); }}>
-                                <QrCode className="h-4 w-4 mr-2" /> Generate Bar Code
+                                <QrCode className="h-4 w-4 mr-2" /> Generate Bar Code (Quick)
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => setIsAIBarcodeOpen(true)} disabled={!dataFields.length}>
+                                <QrCode className="h-4 w-4 mr-2 text-amber-400" /> Generate Barcode / QR (Advanced)
                               </DropdownMenuItem>
                               <DropdownMenuItem onClick={handleOpenAddData} disabled={!dataFields.length}>
                                 <UserRound className="h-4 w-4 mr-2" /> Add New User
@@ -4448,16 +4503,18 @@ export function ProjectDetail() {
                                   <TableCell className="text-muted-foreground text-xs">{idx + 1}</TableCell>
                                   <TableCell>
                                     <div className="flex items-center gap-2.5">
-                                      <img
-                                        src={imageUrl}
-                                        alt={nameVal}
-                                        className="h-9 w-9 rounded-full object-cover shrink-0"
-                                        onError={(event) => {
-                                          const img = event.currentTarget;
-                                          img.onerror = null;
-                                          img.src = DEFAULT_AVATAR;
-                                        }}
-                                      />
+                                      <div className="h-9 w-9 rounded-full overflow-hidden shrink-0">
+                                        <img
+                                          src={imageUrl}
+                                          alt={nameVal}
+                                          className="h-full w-full object-cover"
+                                          onError={(event) => {
+                                            const img = event.currentTarget;
+                                            img.onerror = null;
+                                            img.src = DEFAULT_AVATAR;
+                                          }}
+                                        />
+                                      </div>
                                       <div>
                                         <p className="text-sm font-medium leading-none">{nameVal}</p>
                                         {rec.groupId && (
@@ -4484,8 +4541,8 @@ export function ProjectDetail() {
                                         className="h-7 w-7 text-muted-foreground hover:text-foreground"
                                         title="Upload photo"
                                         onClick={() => {
-                                          setImageUploadTarget(rec.id);
-                                          photoUploadRef.current?.click();
+                                          setAiImageUploadTargetId(rec.id);
+                                          setIsAIImageUploadOpen(true);
                                         }}
                                       >
                                         <Camera className="h-3.5 w-3.5" />
@@ -4870,11 +4927,11 @@ export function ProjectDetail() {
                             <div className="flex gap-1">
                               <div className="flex-1">
                                 <Label className="text-[9px] text-muted-foreground">W</Label>
-                                <Input type="number" value={previewForm.sheetWidthMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, sheetWidthMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                                <Input type="number" value={previewForm.sheetWidthMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, pageSize: "Custom", sheetWidthMm: e.target.value }))} className="h-7 text-xs px-1.5" />
                               </div>
                               <div className="flex-1">
                                 <Label className="text-[9px] text-muted-foreground">H</Label>
-                                <Input type="number" value={previewForm.sheetHeightMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, sheetHeightMm: e.target.value }))} className="h-7 text-xs px-1.5" />
+                                <Input type="number" value={previewForm.sheetHeightMm} onChange={(e) => setPreviewForm((prev) => ({ ...prev, pageSize: "Custom", sheetHeightMm: e.target.value }))} className="h-7 text-xs px-1.5" />
                               </div>
                             </div>
                           </div>
@@ -5637,6 +5694,84 @@ export function ProjectDetail() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* ════════════════════════════════════════════════════════════════════
+          AI IMAGE PROCESSING MODALS (dark-theme glassmorphism)
+          ════════════════════════════════════════════════════════════════════ */}
+
+      {/* AI Auto Crop */}
+      <AICropModal
+        open={isAICropOpen}
+        onClose={() => setIsAICropOpen(false)}
+        records={
+          dataSelectedIds.size > 0
+            ? dataRecords.filter((r) => dataSelectedIds.has(r.id))
+            : filteredRecords
+        }
+        getPhotoSrc={(rec) => getRecordPhotoUrl(rec) ?? ""}
+        onApply={applyPhotoUpdates}
+      />
+
+      {/* AI Background Remover */}
+      <AIBgRemoveModal
+        open={isAIBgRemoveOpen}
+        onClose={() => setIsAIBgRemoveOpen(false)}
+        records={
+          dataSelectedIds.size > 0
+            ? dataRecords.filter((r) => dataSelectedIds.has(r.id))
+            : filteredRecords
+        }
+        getPhotoSrc={(rec) => getRecordPhotoUrl(rec) ?? ""}
+        onApply={applyPhotoUpdates}
+      />
+
+      {/* AI Barcode / QR Generator */}
+      <BarcodeModal
+        open={isAIBarcodeOpen}
+        onClose={() => setIsAIBarcodeOpen(false)}
+        records={
+          dataSelectedIds.size > 0
+            ? dataRecords.filter((r) => dataSelectedIds.has(r.id))
+            : dataRecords
+        }
+        fields={dataFields}
+        selectedIds={dataSelectedIds}
+        onApply={applyBarcodeUpdates}
+      />
+
+      {/* Bulk Image Upload (new dark-theme) */}
+      <BulkImageUploadModal
+        open={isAIBulkUploadOpen}
+        onClose={() => setIsAIBulkUploadOpen(false)}
+        records={dataRecords}
+        onApply={applyPhotoUpdates}
+      />
+
+      {/* Single Image Upload (new dark-theme, per-row or bulk) */}
+      <ImageUploadModal
+        open={isAIImageUploadOpen}
+        onClose={() => { setIsAIImageUploadOpen(false); setAiImageUploadTargetId(null); }}
+        targetRecord={aiImageUploadTargetId ? dataRecords.find((r) => r.id === aiImageUploadTargetId) ?? null : null}
+        records={dataSelectedIds.size > 0
+          ? dataRecords.filter((r) => dataSelectedIds.has(r.id))
+          : dataRecords
+        }
+        onApply={applyPhotoUpdates}
+      />
+
+      {/* AI Photo Studio (v7.4 dark editor) */}
+      <AIPhotoEditorModal
+        open={isAIPhotoEditorOpen}
+        onClose={() => setIsAIPhotoEditorOpen(false)}
+        records={
+          dataSelectedIds.size > 0
+            ? dataRecords.filter((r) => dataSelectedIds.has(r.id))
+            : filteredRecords
+        }
+        getPhotoSrc={(rec) => getRecordPhotoUrl(rec) ?? ""}
+        onApply={applyPhotoUpdates}
+      />
+
     </div>
   );
 }

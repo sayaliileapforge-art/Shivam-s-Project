@@ -24,6 +24,7 @@ import { bullBoardRouter } from './queues/bullBoard';
 // For independent horizontal scaling, move this import to a separate entry
 // point (e.g. backend/src/worker.ts) and run it as its own process/container.
 import './workers/bulkImportWorker';
+import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -134,6 +135,24 @@ app.use('/api/upload-images', uploadImagesRoute);
 app.use('/api/realtime', realtimeRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/imports', importsRoutes);
+
+// ── AI Image Processing proxy → Python FastAPI on port 8001 ──────────────────
+// The Python service must be running separately (backend/ai_service/start-ai-service.bat).
+// All /api/ai/* requests from the frontend are forwarded transparently.
+const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:8001';
+app.use(
+  '/api/ai',
+  createProxyMiddleware({
+    target: AI_SERVICE_URL,
+    changeOrigin: true,
+    onError: (_err: any, _req: any, res: any) => {
+      res.status(503).json({
+        success: false,
+        error: 'AI service unavailable. Start backend/ai_service/start-ai-service.bat',
+      });
+    },
+  })
+);
 
 // Bull Board queue monitoring dashboard â€” http://localhost:5000/admin/queues
 // âš ï¸  Protect with auth middleware in production.

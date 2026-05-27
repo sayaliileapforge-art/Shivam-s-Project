@@ -1,0 +1,56 @@
+"""
+AI Image Processing Service — FastAPI entry point.
+
+Runs on port 8001 (separate from the main Node/Express backend on port 5000).
+The Express backend proxies  /api/ai/*  →  http://localhost:8001/api/ai/*
+so the frontend never needs to know about the Python service directly.
+
+Usage:
+    pip install -r requirements.txt
+    python main.py
+      or
+    uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+"""
+
+import os
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from routers.image_processing import router as img_router
+
+# ── App ────────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Enterprise SaaS — AI Image Processing",
+    version="1.0.0",
+    description="Handles auto-crop, background removal, barcode generation and bulk image processing.",
+)
+
+# ── CORS ───────────────────────────────────────────────────────────────────────
+# Allow the Express backend (proxy) and the Vite dev server.
+ALLOWED_ORIGINS = os.environ.get(
+    "AI_CORS_ORIGINS",
+    "http://localhost:5000,http://localhost:5173,http://localhost:5174",
+).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # locked down in production via env var
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Routers ────────────────────────────────────────────────────────────────────
+app.include_router(img_router, prefix="/api/ai", tags=["Image Processing"])
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "ai-image-processing"}
+
+
+# ── Dev entry point ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("AI_PORT", 8001))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

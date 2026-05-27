@@ -2285,14 +2285,24 @@ router.post('/generate', async (req: Request, res: Response) => {
     const orientation = configuration.orientation === 'landscape' ? 'landscape' : 'portrait';
     // Enforce page orientation: landscape → width > height; portrait → height > width.
     // This corrects any frontend mismatch (e.g. stale state sending portrait dims for landscape).
+    // HOWEVER: For CUSTOM page sizes, respect the exact dimensions sent by the frontend.
+    // Only apply swapping for preset sizes (A4, A3, Letter, Legal).
     const rawSheetW = clampNumber(configuration.sheetSize?.widthMm,  210, 10, 2000);
     const rawSheetH = clampNumber(configuration.sheetSize?.heightMm, 297, 10, 2000);
-    const sheetWidthMm  = orientation === 'landscape'
-      ? Math.max(rawSheetW, rawSheetH)   // wider  side = width  for landscape
-      : Math.min(rawSheetW, rawSheetH);  // narrower side = width for portrait
-    const sheetHeightMm = orientation === 'landscape'
-      ? Math.min(rawSheetW, rawSheetH)   // shorter side = height for landscape
-      : Math.max(rawSheetW, rawSheetH);  // taller  side = height for portrait
+    console.log(`[DEBUG] Received sheet dimensions: widthMm=${configuration.sheetSize?.widthMm}, heightMm=${configuration.sheetSize?.heightMm}`);
+    console.log(`[DEBUG] After clamp: rawSheetW=${rawSheetW}, rawSheetH=${rawSheetH}, orientation=${orientation}`);
+
+    const isCustomSize = configuration.pageSize === 'Custom';
+    const sheetWidthMm  = isCustomSize 
+      ? rawSheetW  // For custom sizes, use exactly what frontend sent
+      : (orientation === 'landscape'
+          ? Math.max(rawSheetW, rawSheetH)   // wider  side = width  for landscape
+          : Math.min(rawSheetW, rawSheetH)); // narrower side = width for portrait
+    const sheetHeightMm = isCustomSize
+      ? rawSheetH  // For custom sizes, use exactly what frontend sent
+      : (orientation === 'landscape'
+          ? Math.min(rawSheetW, rawSheetH)   // shorter side = height for landscape
+          : Math.max(rawSheetW, rawSheetH)); // taller  side = height for portrait
 
     const templateType: TemplateType = isTemplateType(configuration.templateType)
       ? configuration.templateType
@@ -2337,6 +2347,10 @@ router.post('/generate', async (req: Request, res: Response) => {
     const columns = Math.max(1, Math.floor((availableWidthMm + columnMarginMm) / (cardWidthMm + columnMarginMm)));
     const rows = Math.max(1, Math.floor((availableHeightMm + rowMarginMm) / (cardHeightMm + rowMarginMm)));
     const pageCapacity = columns * rows;
+
+    // Calculate centered horizontal margin to ensure equal left/right spacing on the page
+    const totalCardsWidthMm = columns * cardWidthMm + Math.max(0, columns - 1) * columnMarginMm;
+    const centeredMarginLeftMm = (sheetWidthMm - totalCardsWidthMm) / 2;
 
     const previewImageBufferByTemplateId = new Map<string, Buffer | null>();
     await Promise.all(
@@ -2588,7 +2602,7 @@ router.post('/generate', async (req: Request, res: Response) => {
         const col = index % columns;
         const row = Math.floor(index / columns);
         const globalRecordIndex = pageIndex * pageCapacity + index;
-        const xMm = marginLeftMm + col * (cardWidthMm + columnMarginMm);
+        const xMm = centeredMarginLeftMm + col * (cardWidthMm + columnMarginMm);
         const yMm = marginTopMm + row * (cardHeightMm + rowMarginMm);
         const student = studentCardData[globalRecordIndex]
           || resolveStudentCardData(record, req, perRecordFieldMappings[String(globalRecordIndex)] || []);

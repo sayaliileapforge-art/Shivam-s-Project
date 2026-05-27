@@ -7,6 +7,14 @@ dist/
 # Local upload artefacts
 backend/uploads/
 backend/src/uploads/
+backend/public/uploads/assets/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
 
 # Editor
 .vscode/
