@@ -69,9 +69,12 @@ def _get_haar(alt: bool = False) -> Any:
             _haar_default = cv2.CascadeClassifier(p)
         return _haar_default
 
-# ── Phase-1 LRU cache (max 10 entries) ───────────────────────────────────────
+# ── Phase-1 LRU cache (max 50 entries) ───────────────────────────────────────
 _p1_cache: OrderedDict = OrderedDict()
-MAX_CACHE = 10
+MAX_CACHE = 50
+
+# ── Fast-path flag: set True once all sessions are initialised ───────────────
+_sessions_ready: bool = False
 
 GRADIENT_PRESETS = {
     "None": None,
@@ -101,7 +104,9 @@ def hex_to_rgb(h: str) -> Tuple[int, int, int]:
 
 
 def init_sessions():
-    global _app, _session_std, _session_hum, _face_mesh
+    global _app, _session_std, _session_hum, _face_mesh, _sessions_ready
+    if _sessions_ready:
+        return  # already initialised — skip the 4 null-checks on every batch image
     if _app is None and INSIGHTFACE_OK:
         try:
             _app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
@@ -125,6 +130,7 @@ def init_sessions():
                 refine_landmarks=True, min_detection_confidence=0.5)
         except Exception as e:
             print(f"⚠ MediaPipe init: {e}")
+    _sessions_ready = True
 
 
 def load_gfpgan() -> bool:
@@ -301,14 +307,48 @@ def _safe_rembg(rgb_arr, session):
     raise RuntimeError("All rembg tiers failed")
 
 
+def _grabcut_alpha(crop_bgr: np.ndarray) -> np.ndarray:
+    """
+    OpenCV GrabCut fallback when rembg is unavailable.
+    Assumes the subject (person) occupies the central ~80 % of the crop.
+    Returns a float32 alpha mask in [0, 1].
+    """
+    h, w = crop_bgr.shape[:2]
+    # Work at a capped resolution so GrabCut stays fast (≤512px)
+    scale = min(1.0, 512.0 / max(h, w))
+    ww, wh = max(1, int(w * scale)), max(1, int(h * scale))
+    small = cv2.resize(crop_bgr, (ww, wh), cv2.INTER_AREA)
+
+    # GrabCut rect: subject expected in the central region after face-crop
+    mx, my = int(ww * 0.08), int(wh * 0.05)
+    rect = (mx, my, ww - 2 * mx, wh - 2 * my)
+
+    mask_gc = np.zeros((wh, ww), np.uint8)
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(small, mask_gc, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+    except Exception:
+        pass
+
+    # GC_FGD=1, GC_PR_FGD=3 are foreground
+    fg = np.where((mask_gc == cv2.GC_FGD) | (mask_gc == cv2.GC_PR_FGD),
+                  1.0, 0.0).astype(np.float32)
+
+    # Soften edges
+    fg = cv2.GaussianBlur(fg, (7, 7), 2)
+
+    # Scale back to original crop size
+    alpha = cv2.resize(fg, (w, h), cv2.INTER_LINEAR)
+    return np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+
 def _run_rembg(crop_bgr):
     """Run rembg on crop, returns (fg_rgb, alpha_float)."""
     if not REMBG_OK or _session_std is None:
-        # Fallback: corner-color threshold
+        # Fallback: GrabCut-based segmentation (much better than corner-threshold)
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        corner_avg = np.mean([rgb[0, 0], rgb[0, -1], rgb[-1, 0], rgb[-1, -1]], axis=0)
-        diff = np.linalg.norm(rgb.astype(float) - corner_avg, axis=2)
-        alpha = np.clip(diff / 60.0, 0, 1).astype(np.float32)
+        alpha = _grabcut_alpha(crop_bgr)
         return rgb, alpha
 
     rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
@@ -830,6 +870,8 @@ def run_phase1(img_bytes: bytes, settings: Dict[str, Any]) -> Dict[str, Any]:
         alpha=alpha_f, alpha_preshift=alp_ps,
         anchor_dx=adx, anchor_dy=ady,
         crop_M=M, crop_cs=cs, mode="manual",
+        _padding=float(settings.get("padding", 4.5)),
+        _headroom=float(settings.get("headroom", 0.20)),
         metrics=dict(
             tilt=f"{tilt:+.1f}°",
             brightness=f"{bright}/255",
@@ -852,19 +894,50 @@ def run_phase2(p1: Dict[str, Any], settings: Dict[str, Any]) -> bytes:
     """
     SIZE = 1024
     face = p1["face"]; landmarks = p1["landmarks"]
-    alpha = p1["alpha"].copy()
     work = p1["work"].copy()
 
     skin = detect_skin_pixels(work, landmarks)
     work = apply_all_ops(work, skin, landmarks, settings)
 
-    # Re-crop with stored transform (no rembg re-run)
-    M = p1["crop_M"]; cs = p1["crop_cs"]
-    adx = p1["anchor_dx"]; ady = p1["anchor_dy"]
+    # ── Dynamic composition (padding / headroom) ──────────────────────────────
+    # These params can be adjusted without re-running rembg.
+    # When they differ from Phase 1 cached values, we approximate by scaling the
+    # cached alpha mask so the composition preview updates instantly.
+    padding  = float(settings.get("padding",  p1.get("_padding", 4.5)))
+    headroom = float(settings.get("headroom", p1.get("_headroom", 0.20)))
+    p1_padding  = float(p1.get("_padding",  4.5))
+    p1_headroom = float(p1.get("_headroom", 0.20))
+
+    if abs(padding - p1_padding) > 0.09:
+        bw = face.bbox[2] - face.bbox[0]; bh = face.bbox[3] - face.bbox[1]
+        cs = int(max(bw, bh) * padding)
+        el, er = face.kps[0], face.kps[1]
+        ec  = ((el[0]+er[0])/2, (el[1]+er[1])/2)
+        ang = np.degrees(np.arctan2(er[1]-el[1], er[0]-el[0]))
+        M   = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
+        # Scale cached alpha to match new padding zoom level
+        scale = p1_padding / padding   # < 1 when padding grew (person smaller in frame)
+        cx = cy = SIZE // 2
+        Msc = np.float32([[scale, 0, cx*(1-scale)], [0, scale, cy*(1-scale)]])
+        alp_ps = cv2.warpAffine(p1["alpha_preshift"], Msc, (SIZE, SIZE),
+                                flags=cv2.INTER_LINEAR, borderValue=0.0)
+    else:
+        M, cs  = p1["crop_M"], p1["crop_cs"]
+        alp_ps = p1["alpha_preshift"]
+
+    if abs(headroom - p1_headroom) > 0.004:
+        ady, adx = safe_position_anchor(alp_ps, headroom, SIZE)
+    else:
+        adx, ady = p1["anchor_dx"], p1["anchor_dy"]
+
+    alpha = cv2.warpAffine(alp_ps, np.float32([[1, 0, adx], [0, 1, ady]]),
+                           (SIZE, SIZE), borderValue=0)
+    # ── End dynamic composition ───────────────────────────────────────────────
+
     crop_rt = cv2.warpAffine(work, M, (cs, cs), borderValue=(255, 255, 255))
     fg_rgb = cv2.resize(cv2.cvtColor(crop_rt, cv2.COLOR_BGR2RGB), (SIZE, SIZE), cv2.INTER_LANCZOS4)
     if settings.get("decontaminate", True):
-        fg_rgb = decontaminate_edges(fg_rgb, p1["alpha_preshift"])
+        fg_rgb = decontaminate_edges(fg_rgb, alp_ps)
     fg_bgr = cv2.cvtColor(fg_rgb, cv2.COLOR_RGB2BGR)
     fg_bgr = cv2.warpAffine(fg_bgr, np.float32([[1, 0, adx], [0, 1, ady]]),
                             (SIZE, SIZE), borderValue=(0, 0, 0))
@@ -905,16 +978,24 @@ def run_phase2(p1: Dict[str, Any], settings: Dict[str, Any]) -> bytes:
     if wm:
         result = add_watermark(result, wm)
 
-    # Encode to JPEG
+    # ── Output format resize + encode ─────────────────────────────────────────
     quality = int(settings.get("quality", 82))
+    fmt = settings.get("format", "1024×1024 (Standard)")
+    target_w, target_h = OUTPUT_FORMATS.get(fmt, (SIZE, SIZE))
     if PIL_OK:
         pil = Image.fromarray(result)
+        if (target_w, target_h) != (SIZE, SIZE):
+            pil = pil.resize((target_w, target_h), Image.LANCZOS)
         buf = io.BytesIO()
         pil.save(buf, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=2)
         return buf.getvalue()
     else:
-        _, enc = cv2.imencode(".jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR),
-                              [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if (target_w, target_h) != (SIZE, SIZE):
+            result_bgr = cv2.resize(cv2.cvtColor(result, cv2.COLOR_RGB2BGR),
+                                    (target_w, target_h), cv2.INTER_LANCZOS4)
+        else:
+            result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+        _, enc = cv2.imencode(".jpg", result_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
         return enc.tobytes()
 
 
@@ -1156,7 +1237,7 @@ def full_process_fast(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
         result = add_watermark(result, wm)
 
     # ── Upsample to requested output size ────────────────────────────────────
-    out_wh = OUTPUT_FORMATS.get(s.get("output_format","1024\u00d71024 (Standard)"), (1024,1024))
+    out_wh = OUTPUT_FORMATS.get(s.get("format", s.get("output_format", "1024\u00d71024 (Standard)")), (1024, 1024))
     if result.shape[1] != out_wh[0] or result.shape[0] != out_wh[1]:
         result = cv2.resize(result, out_wh, cv2.INTER_LANCZOS4)
 

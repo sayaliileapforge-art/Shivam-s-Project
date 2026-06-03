@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import threading
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +46,24 @@ app.add_middleware(
 app.include_router(img_router, prefix="/api/ai", tags=["Image Processing"])
 
 
+# ── Startup: pre-warm rembg / InsightFace sessions ───────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    """
+    Download / initialise the rembg U2Net model in a background thread so the
+    very first photo upload responds quickly instead of waiting for a cold
+    model download (≈ 180 MB on first run, instant on subsequent starts).
+    """
+    def _warm():
+        try:
+            from services.photo_editor import init_sessions
+            init_sessions()
+            print("[AI Service] OK rembg / InsightFace sessions ready")
+        except Exception as exc:
+            print(f"[AI Service] WARN Pre-warm failed - will init on first request: {exc}")
+    threading.Thread(target=_warm, daemon=True).start()
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "ai-image-processing"}
@@ -53,4 +72,6 @@ async def health():
 # ── Dev entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("AI_PORT", 8001))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    # reload=False: on Windows, uvicorn's WatchFiles reload triggers
+    # "Terminate batch job (Y/N)?" which kills the concurrently process group.
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

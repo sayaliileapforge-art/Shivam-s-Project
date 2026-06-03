@@ -9,8 +9,9 @@
     "build:all": "npm run build && npm run build:backend",
     "dev": "vite",
     "dev:backend": "npm --prefix backend run dev",
+    "dev:ai": "cd backend/ai_service && python main.py",
     "dev:frontend": "vite",
-    "dev:full": "concurrently -k -n backend,frontend \"npm:dev:backend\" \"wait-on tcp:5000 && npm run dev:frontend\"",
+    "dev:full": "concurrently -k -n backend,ai,frontend \"npm:dev:backend\" \"wait-on tcp:5000 && npm run dev:ai\" \"wait-on tcp:5000 && npm run dev:frontend\"",
     "start:render": "node --max-old-space-size=450 backend/dist/server.js"
   },
   "dependencies": {

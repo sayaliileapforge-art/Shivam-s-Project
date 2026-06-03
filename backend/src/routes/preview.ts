@@ -2315,19 +2315,13 @@ router.post('/generate', async (req: Request, res: Response) => {
     const rawCardH = configuration.cardSize?.heightMm
       ? clampNumber(configuration.cardSize.heightMm, templateType === 'id_card' ? 54 : 90, 10, 1000)
       : clampNumber(resolvedTemplate.canvas.height, templateType === 'id_card' ? 54 : 90, 10, 1000);
-    // Card SLOT orientation matches the page orientation so the grid correctly
-    // reflects more columns on a landscape page.
-    //   landscape page → card slot is wider than tall  (max × min)
-    //   portrait  page → card slot is taller than wide (min × max)
+    // For landscape pages, orient card SLOTS as landscape (wider than tall) so the
+    // grid makes full use of the wide page area (e.g. 3×3 = 9 cards on A4 landscape
+    // vs 4×2 = 8 with portrait slots). For portrait pages keep natural template dims.
     const cardWidthMm  = orientation === 'landscape' ? Math.max(rawCardW, rawCardH) : Math.min(rawCardW, rawCardH);
     const cardHeightMm = orientation === 'landscape' ? Math.min(rawCardW, rawCardH) : Math.max(rawCardW, rawCardH);
-    // Rotate card CONTENT when the template canvas orientation differs from the slot orientation.
-    //   portrait template (H>W) in landscape slot (W>H) → rotate 90° CCW so content fills slot ✓
-    //   landscape template (W>H) in landscape slot (W>H) → no rotation needed               ✓
-    //   portrait template (H>W) in portrait slot  (H>W) → no rotation needed               ✓
-    //   landscape template (W>H) in portrait slot  (H>W) → rotate 90° CCW                  ✓
-    const templateIsPortrait = (resolvedTemplate.canvas.height ?? 0) > (resolvedTemplate.canvas.width ?? 0);
-    const rotateCardContent  = templateIsPortrait === (cardWidthMm > cardHeightMm);
+    // rotateCardContent is computed per-record inside the rendering loop below so that
+    // each record's own template canvas orientation is checked against the slot orientation.
 
     const marginTopMm = clampNumber(configuration.pageMargin?.topMm, 8, 0, 100);
     const marginLeftMm = clampNumber(configuration.pageMargin?.leftMm, 8, 0, 100);
@@ -2351,6 +2345,10 @@ router.post('/generate', async (req: Request, res: Response) => {
     // Calculate centered horizontal margin to ensure equal left/right spacing on the page
     const totalCardsWidthMm = columns * cardWidthMm + Math.max(0, columns - 1) * columnMarginMm;
     const centeredMarginLeftMm = (sheetWidthMm - totalCardsWidthMm) / 2;
+
+    // Calculate centered vertical margin to ensure equal top/bottom spacing on the page
+    const totalCardsHeightMm = rows * cardHeightMm + Math.max(0, rows - 1) * rowMarginMm;
+    const centeredMarginTopMm = (sheetHeightMm - totalCardsHeightMm) / 2;
 
     const previewImageBufferByTemplateId = new Map<string, Buffer | null>();
     await Promise.all(
@@ -2603,7 +2601,7 @@ router.post('/generate', async (req: Request, res: Response) => {
         const row = Math.floor(index / columns);
         const globalRecordIndex = pageIndex * pageCapacity + index;
         const xMm = centeredMarginLeftMm + col * (cardWidthMm + columnMarginMm);
-        const yMm = marginTopMm + row * (cardHeightMm + rowMarginMm);
+        const yMm = centeredMarginTopMm + row * (cardHeightMm + rowMarginMm);
         const student = studentCardData[globalRecordIndex]
           || resolveStudentCardData(record, req, perRecordFieldMappings[String(globalRecordIndex)] || []);
         const studentPhotoImage = student.photoUrl ? studentPhotoImageByUrl.get(student.photoUrl) || null : null;
@@ -2637,6 +2635,12 @@ router.post('/generate', async (req: Request, res: Response) => {
             }
           }
           const studentHasPhotoValue = Boolean(student.photoUrl);
+          // Determine per-record rotation: rotate content only when the record's
+          // template canvas orientation (portrait vs landscape) does NOT match the
+          // card slot orientation. This handles rule-based mode where different records
+          // may use templates with different canvas orientations.
+          const recCanvasIsPortrait = (recordTemplate.canvas?.height ?? 0) > (recordTemplate.canvas?.width ?? 0);
+          const recRotateContent = recCanvasIsPortrait === (cardWidthMm > cardHeightMm);
           renderCardFromCanvas(
             doc,
             xMm,
@@ -2650,7 +2654,7 @@ router.post('/generate', async (req: Request, res: Response) => {
             studentPhotoImage,
             staticImageObjects,
             studentHasPhotoValue,
-            rotateCardContent,
+            recRotateContent,
             canvasPhotoPlaceholdersByTemplateId.get(recordTemplateId),
           );
         } else {

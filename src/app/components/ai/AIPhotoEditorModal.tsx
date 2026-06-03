@@ -14,17 +14,22 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import JSZip from "jszip";
 import {
   X, Upload, RefreshCw, Download, Layers, ShieldCheck,
   Loader2, CheckCircle2, AlertCircle, Sliders, Zap, ChevronDown,
-  SwitchCamera,
+  SwitchCamera, ChevronLeft, ChevronRight,
 } from "lucide-react";
 import type { ProjectDataRecord } from "../../../lib/projectStore";
 import {
   photoEditorUpload,
   photoEditorRender,
   photoEditorBatch,
+  photoEditorBatchStart,
+  photoEditorBatchStatus,
+  photoEditorBatchDelete,
   type PhotoEditorSettings,
+  type BatchTaskStatus,
 } from "../../../lib/aiImageService";
 import { API_BASE, uploadImages } from "../../../lib/apiService";
 import { toast } from "sonner";
@@ -169,7 +174,7 @@ function IntSliderRow({ label, value, min, max, step = 1, hint, color = "#64748b
           <input
             type="range"
             min={min} max={max} step={step} value={value}
-            onChange={(e) => onChange(parseInt(e.target.value))}
+            onChange={(e) => onChange(parseFloat(e.target.value))}
             className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
           />
           <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color }} />
@@ -270,20 +275,33 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   const [phase1Loading, setPhase1Loading] = useState(false);
   const [renderLoading, setRenderLoading] = useState(false);
   const [batchLoading, setBatchLoading] = useState(false);
-  const [batchProgress, setBatchProgress] = useState(0);
+  const [batchProgress, setBatchProgress] = useState(0);   // 0–100 percent
+  const [batchCurrentName, setBatchCurrentName] = useState("");
+  const [batchCompleted, setBatchCompleted] = useState(0);
+  const [batchSuccessCount, setBatchSuccessCount] = useState(0);
+  const [batchFailedCount, setBatchFailedCount] = useState(0);
+  const [batchEta, setBatchEta] = useState<number | null>(null);
+  const [batchFailedItems, setBatchFailedItems] = useState<BatchTaskStatus["errors"]>([]);
+  const [batchResults, setBatchResults] = useState<Array<{ id: string; photo: string }>>([]);
+  const [batchDone, setBatchDone] = useState(false);
+  const [batchUploading, setBatchUploading] = useState(false);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [metrics, setMetrics] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [selectedRecordIdx, setSelectedRecordIdx] = useState(0);
-  const [batchResults, setBatchResults] = useState<Array<{ id: string; photo: string }>>([]);
-  const [batchDone, setBatchDone] = useState(false);
-  const [batchFailedCount, setBatchFailedCount] = useState(0);
-  const [batchUploading, setBatchUploading] = useState(false);
   const [activePreset, setActivePreset] = useState<string>("Natural");
 
   const renderDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const compositionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const uploadForEditingRef = useRef<((rec: ProjectDataRecord) => Promise<void>) | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // settingsRef is always in sync with `settings` state — lets us read the latest
+  // settings synchronously without putting `settings` in callback dependency arrays.
+  const settingsRef = useRef<PhotoEditorSettings>({ ...DEFAULT_SETTINGS });
 
   const recordsWithPhoto = records.filter((r) => Boolean(getPhotoSrc(r)));
+  // Keep settingsRef in sync on every render
+  settingsRef.current = settings;
 
   // ── Upload current record to Phase 1 ─────────────────────────────────────
 
@@ -330,9 +348,21 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       });
 
       if (result.success) {
-        setSessionId(result.session_id);
+        const sid = result.session_id;
+        setSessionId(sid);
         setPreviewImg(result.preview);
         setMetrics(result.metrics ?? {});
+        // The Phase 1 upload renders a preview using hardcoded defaults
+        // (enhance=5, skin=5, glow=40, shadowSoft=51) which differ from the
+        // UI slider values. Immediately re-render with the actual slider settings
+        // so the preview is always in sync with the controls.
+        setRenderLoading(true);
+        void photoEditorRender(sid, settingsRef.current)
+          .then((rendered) => {
+            if (rendered.success && rendered.data_url) setPreviewImg(rendered.data_url);
+          })
+          .catch(() => { /* Phase 1 preview stays as fallback */ })
+          .finally(() => setRenderLoading(false));
       } else {
         throw new Error(result.error ?? "Upload failed");
       }
@@ -348,6 +378,9 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       setPhase1Loading(false);
     }
   }, [getPhotoSrc, settings.cropMode, settings.padding, settings.headroom, settings.gfpgan]);
+
+  // Always keep ref in sync so composition debounce can call latest version
+  uploadForEditingRef.current = uploadForEditing;
 
   // Auto-upload when modal opens
   useEffect(() => {
@@ -367,27 +400,52 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       try {
         const result = await photoEditorRender(sessionId, newSettings);
         if (result.success && result.data_url) {
-          // Success: update preview
           setPreviewImg(result.data_url);
+        } else if (!result.success) {
+          const msg = result.error ?? "Render failed";
+          // Session expired — auto-reprocess the current record
+          if (msg.toLowerCase().includes("not found") || msg.toLowerCase().includes("session")) {
+            toast.error("Session expired — reprocessing image…");
+            if (uploadForEditingRef.current) {
+              const rec = recordsWithPhoto[selectedRecordIdx];
+              if (rec) void uploadForEditingRef.current(rec);
+            }
+          } else {
+            toast.error(`Render error: ${msg}`);
+          }
         }
-        // On failure: keep current previewImg as implicit rollback (no state change)
-      } catch {
-        // Network error: keep current previewImg (rollback)
+      } catch (err: any) {
+        const msg: string = err?.message ?? "";
+        if (msg === "Failed to fetch" || msg.includes("NetworkError") || msg.includes("ECONNREFUSED")) {
+          toast.error("AI service is offline. Run: cd backend/ai_service && python main.py");
+        } else {
+          toast.error(`Render error: ${msg}`);
+        }
       } finally {
         setRenderLoading(false);
       }
     }, 450);
-  }, [sessionId]);
+  }, [sessionId, recordsWithPhoto, selectedRecordIdx]);
 
   const updateSetting = useCallback(<K extends keyof PhotoEditorSettings>(
     key: K, value: PhotoEditorSettings[K]
   ) => {
-    setSettings((prev) => {
-      const next = { ...prev, [key]: value };
-      triggerRender(next);
-      return next;
-    });
-  }, [triggerRender]);
+    setActivePreset("");
+    // Build next settings synchronously from the ref so we always have the
+    // latest values (avoids calling triggerRender inside a state updater).
+    const next = { ...settingsRef.current, [key]: value };
+    settingsRef.current = next;
+    setSettings(next);
+    triggerRender(next);
+    // Composition params require Phase 1 re-run to update the crop geometry
+    if (key === "padding" || key === "headroom") {
+      if (compositionTimerRef.current) clearTimeout(compositionTimerRef.current);
+      compositionTimerRef.current = setTimeout(() => {
+        const rec = recordsWithPhoto[selectedRecordIdx];
+        if (rec && uploadForEditingRef.current) void uploadForEditingRef.current(rec);
+      }, 900);
+    }
+  }, [triggerRender, recordsWithPhoto, selectedRecordIdx]);
 
   // ── Download current preview ──────────────────────────────────────────────
 
@@ -409,116 +467,167 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   };
 
   // ── Batch process all records ─────────────────────────────────────────────
-  // Uses the /batch endpoint so Python processes all images in a chunk with
-  // asyncio.gather (concurrent threads). Files are sent first, then URLs —
-  // matching Python's processing order — so results[i] always maps to the
-  // correct record with zero index drift.
+  // Uses the /batch-async endpoint: the Python service processes all images in
+  // parallel (asyncio.gather + ThreadPoolExecutor) and the frontend polls for
+  // per-image progress every 1.5 s, displaying name, ETA, success/fail counts.
 
-  const handleBatch = async () => {
-    const recs = recordsWithPhoto;
+  /** Resolve every record's photo to an absolute server URL ready for Python to fetch. */
+  const resolveToAbsoluteUrls = async (
+    recs: ProjectDataRecord[],
+  ): Promise<Array<{ rec: ProjectDataRecord; url: string | null }>> => {
+    return Promise.all(
+      recs.map(async (rec) => {
+        try {
+          const src = getPhotoSrc(rec);
+          if (!src) return { rec, url: null };
+          // data: / blob: → upload to file server so Python can reach it
+          if (src.startsWith("data:") || src.startsWith("blob:")) {
+            let file: File;
+            if (src.startsWith("data:")) {
+              const [header, b64] = src.split(",");
+              const mime = header.match(/:(.*?);/)?.[1] ?? "image/jpeg";
+              const bytes = atob(b64);
+              const arr = new Uint8Array(bytes.length);
+              for (let j = 0; j < bytes.length; j++) arr[j] = bytes.charCodeAt(j);
+              file = new File([arr], `pre_${rec.id}.jpg`, { type: mime });
+            } else {
+              const blob = await (await fetch(src)).blob();
+              file = new File([blob], `pre_${rec.id}.jpg`, { type: blob.type || "image/jpeg" });
+            }
+            const [serverUrl] = await uploadImages([file]);
+            return { rec, url: `${BACKEND_ORIGIN}${serverUrl}` };
+          }
+          // relative /uploads/... → prefix with origin
+          if (src.startsWith("/")) return { rec, url: `${BACKEND_ORIGIN}${src}` };
+          return { rec, url: src };
+        } catch {
+          return { rec, url: null };
+        }
+      }),
+    );
+  };
+
+  const stopPolling = () => {
+    if (pollIntervalRef.current !== null) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  };
+
+  /** Start (or re-start for retry) a batch job with the given subset of records. */
+  const runBatchForRecords = async (recs: ProjectDataRecord[]) => {
     if (recs.length === 0) return;
 
     setBatchLoading(true);
     setBatchProgress(0);
+    setBatchCompleted(0);
+    setBatchSuccessCount(0);
+    setBatchFailedCount(0);
+    setBatchCurrentName("");
+    setBatchEta(null);
+    setBatchFailedItems([]);
     setBatchDone(false);
     setBatchResults([]);
-    setBatchFailedCount(0);
     setError("");
+    stopPolling();
 
-    // 15 per chunk: large enough for concurrency, small enough not to OOM
-    const CHUNK_SIZE = 15;
-    const allResults: Array<{ id: string; photo: string }> = [];
-    let failedCount = 0;
+    let taskId: string | null = null;
+    try {
+      // Step 1: resolve all photos to absolute server URLs
+      const resolved = await resolveToAbsoluteUrls(recs);
+      const validItems = resolved.filter((it) => it.url !== null) as Array<{
+        rec: ProjectDataRecord;
+        url: string;
+      }>;
+      const invalidCount = resolved.length - validItems.length;
+      if (invalidCount > 0) setBatchFailedCount(invalidCount);
 
-    for (let i = 0; i < recs.length; i += CHUNK_SIZE) {
-      const chunk = recs.slice(i, Math.min(i + CHUNK_SIZE, recs.length));
-
-      // ── Step 1: resolve every record to either a File or an absolute URL ──
-      type RawItem = { rec: ProjectDataRecord; file: File | null; url: string | null };
-      const rawItems: RawItem[] = await Promise.all(
-        chunk.map(async (rec): Promise<RawItem> => {
-          try {
-            const src = getPhotoSrc(rec);
-            if (!src) return { rec, file: null, url: null };
-            if (src.startsWith("data:")) {
-              const [header, b64] = src.split(",");
-              const mime = header.match(/:(.*?);/)?.[1] ?? "image/jpeg";
-              const rawBytes = atob(b64);
-              const arr = new Uint8Array(rawBytes.length);
-              for (let j = 0; j < rawBytes.length; j++) arr[j] = rawBytes.charCodeAt(j);
-              return { rec, file: new File([arr], `b_${rec.id}.jpg`, { type: mime }), url: null };
-            } else if (src.startsWith("blob:")) {
-              const fetchRes = await fetch(src);
-              const blob = await fetchRes.blob();
-              return { rec, file: new File([blob], `b_${rec.id}.jpg`, { type: blob.type || "image/jpeg" }), url: null };
-            } else {
-              return { rec, file: null, url: src.startsWith("/") ? `${BACKEND_ORIGIN}${src}` : src };
-            }
-          } catch {
-            return { rec, file: null, url: null };
-          }
-        })
-      );
-
-      // ── Step 2: separate files and URLs (Python processes files FIRST) ────
-      // orderedItems = [...fileItems, ...urlItems] matches Python's item order
-      // so results[idx] === orderedItems[idx].rec  with no index drift.
-      const fileItems = rawItems.filter((it) => it.file !== null);
-      const urlItems  = rawItems.filter((it) => it.file === null && it.url !== null);
-      const invalid   = rawItems.filter((it) => it.file === null && it.url === null);
-      failedCount += invalid.length;
-
-      const orderedItems = [...fileItems, ...urlItems];
-
-      if (orderedItems.length > 0) {
-        try {
-          const batchResult = await photoEditorBatch(
-            orderedItems.map((it) => it.file),          // files first (nulls for url-type items)
-            settings,
-            orderedItems.map((it) => it.url ?? undefined), // urls after (undefined for file-type items)
-          );
-
-          const results = batchResult.results ?? [];
-
-          // Guard: if Python returned fewer results than sent, count the rest as failed
-          const expectedCount = orderedItems.length;
-          if (results.length < expectedCount) {
-            failedCount += expectedCount - results.length;
-          }
-
-          results.forEach((r: any, idx: number) => {
-            const item = orderedItems[idx];
-            if (!item) { failedCount++; return; } // extra guard
-            if (r.success && r.data_url) {
-              allResults.push({ id: item.rec.id, photo: r.data_url });
-            } else {
-              failedCount++;
-              console.warn(`[batch] ${item.rec.id}: ${r.error ?? "failed"}`);
-            }
-          });
-        } catch (e: any) {
-          // Whole chunk request failed — count all as failed
-          failedCount += orderedItems.length;
-          console.warn("[batch] chunk error:", e.message);
-        }
+      if (validItems.length === 0) {
+        setError("No photos could be resolved for processing.");
+        setBatchLoading(false);
+        return;
       }
 
-      setBatchProgress(Math.round(((i + chunk.length) / recs.length) * 100));
-    }
+      // Step 2: start async batch task on the server
+      const names = validItems.map(({ rec }) => {
+        const r = rec as any;
+        return r.name ?? r.studentName ?? r.student_name ?? rec.id;
+      });
+      const urls = validItems.map(({ url }) => url);
+      const { task_id } = await photoEditorBatchStart(urls, names, settings);
+      taskId = task_id;
 
-    setBatchResults(allResults);
-    setBatchFailedCount(failedCount);
-    setBatchDone(true);
-    setBatchLoading(false);
+      // Step 3: poll every 1.5 s for progress updates
+      const startedTaskId = task_id;
+      pollIntervalRef.current = setInterval(async () => {
+        try {
+          const status = await photoEditorBatchStatus(startedTaskId);
+          const pct = status.total > 0 ? Math.round((status.completed / status.total) * 100) : 0;
+          setBatchProgress(pct);
+          setBatchCompleted(status.completed);
+          setBatchSuccessCount(status.success);
+          setBatchFailedCount((prev) => Math.max(prev, status.failed));
+          setBatchCurrentName(status.current ?? "");
+          setBatchEta(status.eta_seconds ?? null);
 
-    if (failedCount > 0 && allResults.length > 0) {
-      toast.error(`${failedCount} image${failedCount !== 1 ? "s" : ""} failed · ${allResults.length} succeeded`);
-    } else if (failedCount > 0) {
-      toast.error(`All ${failedCount} images failed to process`);
-    } else {
-      toast.success(`All ${allResults.length} images processed successfully`);
+          if (status.done) {
+            stopPolling();
+
+            // Build final results mapping task result index → record id
+            const allResults: Array<{ id: string; photo: string }> = [];
+            for (const r of status.results ?? []) {
+              const item = validItems[r.index];
+              if (item) allResults.push({ id: item.rec.id, photo: r.data_url });
+            }
+
+            setBatchResults(allResults);
+            setBatchFailedItems(status.errors ?? []);
+            setBatchFailedCount((status.errors?.length ?? 0) + invalidCount);
+            setBatchDone(true);
+            setBatchLoading(false);
+
+            const succeededCount = allResults.length;
+            const failedTotal = (status.errors?.length ?? 0) + invalidCount;
+            if (failedTotal > 0 && succeededCount > 0) {
+              toast.error(
+                `${failedTotal} image${failedTotal !== 1 ? "s" : ""} failed · ${succeededCount} succeeded`,
+              );
+            } else if (failedTotal > 0) {
+              toast.error(`All ${failedTotal} images failed to process`);
+            } else {
+              toast.success(`All ${succeededCount} images processed successfully`);
+            }
+
+            // Clean up task on server
+            photoEditorBatchDelete(startedTaskId).catch(() => {});
+          }
+        } catch (pollErr: any) {
+          console.warn("[batch] poll error:", pollErr.message);
+        }
+      }, 1500);
+    } catch (e: any) {
+      stopPolling();
+      setBatchLoading(false);
+      setError(e.message ?? "Batch failed to start");
     }
   };
+
+  const handleBatch = () => {
+    const recs = recordsWithPhoto;
+    if (recs.length === 0) return;
+    runBatchForRecords(recs);
+  };
+
+  /** Retry only the images that failed in the previous batch run. */
+  const handleRetryFailed = () => {
+    if (batchFailedItems.length === 0) return;
+    const failedIndices = new Set(batchFailedItems.map((e) => e.index));
+    const recsToRetry = recordsWithPhoto.filter((_, i) => failedIndices.has(i));
+    // Reset only the failed-specific state, keep successful results
+    setBatchFailedItems([]);
+    runBatchForRecords(recsToRetry);
+  };
+
 
   // ── Apply batch results ───────────────────────────────────────────────────
   // Uploads processed data URLs to the backend file server so that only small
@@ -563,6 +672,26 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
     }
   };
 
+  // ── Download all batch results as ZIP ─────────────────────────────────────
+
+  const handleDownloadZip = async () => {
+    if (batchResults.length === 0) return;
+    const zip = new JSZip();
+    batchResults.forEach((r, i) => {
+      const [, b64] = r.photo.split(",");
+      const name = recordsWithPhoto.find((rec) => rec.id === r.id);
+      const label = (name as any)?.name || (name as any)?.studentName || r.id;
+      zip.file(`${i + 1}_${label}.jpg`, b64, { base64: true });
+    });
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ai_photos_${Date.now()}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // ── Reset ─────────────────────────────────────────────────────────────────
 
   const handleReset = () => {
@@ -586,9 +715,16 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
         gfpgan: settings.gfpgan,
       });
       if (result.success) {
-        setSessionId(result.session_id);
+        const sid = result.session_id;
+        setSessionId(sid);
         setPreviewImg(result.preview);
         setMetrics(result.metrics ?? {});
+        // Sync preview to actual slider settings (Phase 1 uses hardcoded defaults)
+        setRenderLoading(true);
+        void photoEditorRender(sid, settingsRef.current)
+          .then((r) => { if (r.success && r.data_url) setPreviewImg(r.data_url); })
+          .catch(() => {})
+          .finally(() => setRenderLoading(false));
       } else {
         throw new Error(result.error ?? "Upload failed");
       }
@@ -632,9 +768,34 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
             </div>
           </div>
 
-          {/* Record selector */}
+          {/* Record selector with prev/next */}
           {recordsWithPhoto.length > 1 && (
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  const prev = selectedRecordIdx > 0 ? selectedRecordIdx - 1 : recordsWithPhoto.length - 1;
+                  setSelectedRecordIdx(prev);
+                  uploadForEditing(recordsWithPhoto[prev]);
+                }}
+                disabled={phase1Loading}
+                className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white disabled:opacity-40 transition-colors"
+                title="Previous student"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <span className="text-[11px] text-gray-500">{selectedRecordIdx + 1}/{recordsWithPhoto.length}</span>
+              <button
+                onClick={() => {
+                  const next = selectedRecordIdx < recordsWithPhoto.length - 1 ? selectedRecordIdx + 1 : 0;
+                  setSelectedRecordIdx(next);
+                  uploadForEditing(recordsWithPhoto[next]);
+                }}
+                disabled={phase1Loading}
+                className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white disabled:opacity-40 transition-colors"
+                title="Next student"
+              >
+                <ChevronRight size={14} />
+              </button>
               <span className="text-[11px] text-gray-500">Editing:</span>
               <select
                 value={selectedRecordIdx}
@@ -678,8 +839,16 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
           {/* ── LEFT: Preview Panel ─────────────────────────────────── */}
           <div className="flex flex-col" style={{ width: "58%", background: "#0a0a0a", borderRight: "1px solid #1a1a1a" }}>
 
-            {/* Image preview area */}
-            <div className="flex-1 flex items-center justify-center p-4 relative overflow-hidden">
+            {/* Image preview area — drag-drop enabled */}
+            <div
+              className="flex-1 flex items-center justify-center p-4 relative overflow-hidden"
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const file = e.dataTransfer.files[0];
+                if (file && file.type.startsWith("image/")) handleFileUpload(file);
+              }}
+            >
               {phase1Loading && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center z-10"
                   style={{ background: "rgba(0,0,0,0.85)" }}>
@@ -794,39 +963,84 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
                   </div>
                 )}
                 {batchLoading && (
-                  <div className="mt-2">
-                    <div className="flex justify-between text-[11px] text-gray-500 mb-1">
+                  <div className="mt-2 space-y-1.5">
+                    {/* Progress bar */}
+                    <div className="flex justify-between text-[11px] text-gray-500 mb-0.5">
                       <span>Processing batch…</span>
                       <span>{batchProgress}%</span>
                     </div>
                     <div className="h-1.5 bg-[#1a1a1a] rounded-full overflow-hidden">
                       <div
-                        className="h-full rounded-full transition-all"
+                        className="h-full rounded-full transition-all duration-500"
                         style={{ width: `${batchProgress}%`, background: "linear-gradient(90deg,#f97316,#ef4444)" }}
                       />
+                    </div>
+                    {/* Per-image stats */}
+                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
+                      {batchCurrentName && (
+                        <span className="text-gray-400 truncate max-w-[180px]" title={batchCurrentName}>
+                          ▶ {batchCurrentName}
+                        </span>
+                      )}
+                      <span className="text-gray-500">{batchCompleted}/{recordsWithPhoto.length}</span>
+                      {batchSuccessCount > 0 && (
+                        <span className="text-green-400">✓ {batchSuccessCount}</span>
+                      )}
+                      {batchFailedCount > 0 && (
+                        <span className="text-red-400">✗ {batchFailedCount}</span>
+                      )}
+                      {batchEta !== null && batchEta > 0 && (
+                        <span className="text-gray-500">
+                          ~{batchEta >= 60
+                            ? `${Math.ceil(batchEta / 60)}m`
+                            : `${Math.ceil(batchEta)}s`} left
+                        </span>
+                      )}
                     </div>
                   </div>
                 )}
                 {batchDone && (
-                  <div className="mt-2 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <CheckCircle2 size={14} className="text-green-400" />
-                      <span className="text-[12px] text-green-300">{batchResults.length} succeeded</span>
-                      {batchFailedCount > 0 && (
-                        <span className="text-[12px] text-red-400">{batchFailedCount} failed</span>
-                      )}
+                  <div className="mt-2 flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <CheckCircle2 size={14} className="text-green-400" />
+                        <span className="text-[12px] text-green-300">{batchResults.length} succeeded</span>
+                        {batchFailedCount > 0 && (
+                          <span className="text-[12px] text-red-400">{batchFailedCount} failed</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 flex-wrap justify-end">
+                        {batchFailedItems.length > 0 && (
+                          <button
+                            onClick={handleRetryFailed}
+                            className="text-[11px] px-3 py-1 rounded bg-yellow-700 hover:bg-yellow-600 text-white transition-colors flex items-center gap-1"
+                            title="Retry failed images only"
+                          >
+                            <RefreshCw size={11} /> Retry {batchFailedItems.length} failed
+                          </button>
+                        )}
+                        {batchResults.length > 0 && (
+                          <button
+                            onClick={() => void handleDownloadZip()}
+                            className="text-[11px] px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 text-white transition-colors flex items-center gap-1"
+                            title="Download all processed photos as ZIP"
+                          >
+                            <Download size={11} /> ZIP
+                          </button>
+                        )}
+                        {batchResults.length > 0 && (
+                          <button
+                            onClick={() => void handleApplyBatch()}
+                            disabled={batchUploading}
+                            className="text-[11px] px-3 py-1 rounded bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-60 flex items-center gap-1"
+                          >
+                            {batchUploading
+                              ? <><Loader2 size={11} className="animate-spin" /> Saving…</>
+                              : "Apply All"}
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    {batchResults.length > 0 && (
-                      <button
-                        onClick={() => void handleApplyBatch()}
-                        disabled={batchUploading}
-                        className="text-[11px] px-3 py-1 rounded bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-60 flex items-center gap-1"
-                      >
-                        {batchUploading
-                          ? <><Loader2 size={11} className="animate-spin" /> Saving…</>
-                          : "Apply All"}
-                      </button>
-                    )}
                   </div>
                 )}
               </div>
@@ -850,7 +1064,9 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
                     key={preset}
                     onClick={() => {
                       setActivePreset(preset);
-                      setSettings(prev => ({ ...prev, ...QUALITY_PRESETS[preset] }));
+                      const newSettings = { ...settings, ...QUALITY_PRESETS[preset] };
+                      setSettings(newSettings);
+                      triggerRender(newSettings);
                     }}
                     className={`px-3 py-1 rounded-full text-xs font-semibold border transition-colors ${
                       activePreset === preset

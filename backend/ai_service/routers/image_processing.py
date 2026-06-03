@@ -3,12 +3,15 @@ Image Processing Router
 =======================
 All AI image-processing endpoints.
 
-POST /api/ai/auto-crop           — single image smart crop
-POST /api/ai/auto-crop/bulk      — bulk smart crop
-POST /api/ai/remove-bg           — single background removal
-POST /api/ai/remove-bg/bulk      — bulk background removal
-POST /api/ai/barcode             — barcode / QR generation (JSON body, array of records)
-GET  /api/ai/health              — quick liveness check
+POST /api/ai/auto-crop                        — single image smart crop
+POST /api/ai/auto-crop/bulk                   — bulk smart crop
+POST /api/ai/remove-bg                        — single background removal
+POST /api/ai/remove-bg/bulk                   — bulk background removal
+POST /api/ai/barcode                          — barcode / QR generation
+POST /api/ai/photo-edit/batch-async           — start async batch (returns task_id)
+GET  /api/ai/photo-edit/batch-status/{id}     — poll batch progress
+DELETE /api/ai/photo-edit/batch-task/{id}     — clean up a finished task
+GET  /api/ai/health                           — quick liveness check
 """
 
 from __future__ import annotations
@@ -18,9 +21,11 @@ import base64
 import io
 import json
 import os
+import time
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from typing import Dict, List, Optional, Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -33,9 +38,10 @@ from services.barcode_gen import generate_barcode_image
 router = APIRouter()
 
 # Dedicated thread pool for CPU-bound batch photo processing.
-# OpenCV / NumPy release the GIL, so threads give true multi-core parallelism.
-# Workers = cpu_count ensures we never over-subscribe the machine.
-_BATCH_POOL = ThreadPoolExecutor(max_workers=max(4, (os.cpu_count() or 4)))
+# Workers = _N_REMBG (from bg_remover) so the pool size matches the semaphore;
+# extra queued tasks wait in asyncio rather than spinning up idle OS threads.
+_N_WORKERS = max(2, min(4, (os.cpu_count() or 4)))
+_BATCH_POOL = ThreadPoolExecutor(max_workers=max(8, (os.cpu_count() or 4) * 2))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -145,7 +151,7 @@ async def remove_bg_single(
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, remove_background, data, bg_color, model_name
+            _BATCH_POOL, remove_background, data, bg_color, model_name
         )
         is_png = bg_color == "transparent"
         mime = "image/png" if is_png else "image/jpeg"
@@ -167,22 +173,30 @@ async def remove_bg_bulk(
     if len(images) > 500:
         raise HTTPException(status_code=400, detail="Maximum 500 images per bulk request.")
 
+    # Limit how many rembg inferences run at the same time within one request.
+    # Without this cap, asyncio.gather fires ALL images simultaneously into the
+    # thread pool; combined with the global threading.Semaphore in bg_remover
+    # the excess coroutines just queue, but flooding the pool with hundreds of
+    # run_in_executor() calls wastes event-loop scheduling overhead.
+    _sem = asyncio.Semaphore(_N_WORKERS)
+
     async def process_one(file: UploadFile):
-        try:
-            data = await _read_and_validate(file)
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, remove_background, data, bg_color, model_name
-            )
-            is_png = bg_color == "transparent"
-            mime = "image/png" if is_png else "image/jpeg"
-            return {
-                "success": True,
-                "filename": file.filename,
-                "data_url": _to_data_url(result, mime),
-            }
-        except Exception as exc:
-            return {"success": False, "filename": file.filename, "error": str(exc)}
+        async with _sem:
+            try:
+                data = await _read_and_validate(file)
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    _BATCH_POOL, remove_background, data, bg_color, model_name
+                )
+                is_png = bg_color == "transparent"
+                mime = "image/png" if is_png else "image/jpeg"
+                return {
+                    "success": True,
+                    "filename": file.filename,
+                    "data_url": _to_data_url(result, mime),
+                }
+            except Exception as exc:
+                return {"success": False, "filename": file.filename, "error": str(exc)}
 
     results = await asyncio.gather(*[process_one(f) for f in images])
     failed = sum(1 for r in results if not r["success"])
@@ -292,12 +306,14 @@ async def photo_edit_upload(
         raise HTTPException(status_code=422, detail="Provide either 'image' (file) or 'image_url'.")
 
     try:
+        # Use the same defaults as the frontend DEFAULT_SETTINGS so the initial
+        # Phase 1 preview matches what the sliders show before any adjustment.
         init_settings = compute_settings(
-            enhance=5, exposure=0, color_temp_lv=0, sharpness_lv=5, skin_lv=5,
+            enhance=3.0, exposure=0, color_temp_lv=0, sharpness_lv=4.0, skin_lv=2.5,
             color_grade="natural", crop_mode=mode,
             padding=padding, headroom=headroom,
-            sh_soft=51, sh_dist=15, glow=40, gradient="None",
-            balance_skin=True, decontaminate=True, gfpgan_enable=gfpgan, quality=82,
+            sh_soft=12, sh_dist=6, glow=8, gradient="None",
+            balance_skin=True, decontaminate=True, gfpgan_enable=gfpgan, quality=88,
         )
         loop = asyncio.get_event_loop()
         session_id, metrics = await loop.run_in_executor(
@@ -342,6 +358,7 @@ async def photo_edit_render(
     balance_skin: bool  = Form(True),
     clean_hair:   bool  = Form(True),
     gfpgan:       bool  = Form(False),
+    format:       str   = Form("1024\u00d71024 (Standard)"),
 ):
     """Fast Phase 2 render using cached Phase 1 data. Runs in ~0.1–0.5s."""
     settings = compute_settings(
@@ -354,6 +371,7 @@ async def photo_edit_render(
         quality=jpeg_quality, bg_color=bg_color, shadow_color=shadow_color,
         watermark=watermark,
     )
+    settings["format"] = format
     try:
         loop = asyncio.get_event_loop()
         result_bytes = await loop.run_in_executor(
@@ -393,6 +411,7 @@ async def photo_edit_batch(
     balance_skin: bool  = Form(True),
     clean_hair:   bool  = Form(True),
     gfpgan:       bool  = Form(False),
+    format:       str   = Form("1024×1024 (Standard)"),
 ):
     """Process up to 200 images with the same settings. Accepts files, URLs, or a mix."""
     # Build a flat list of (source_label, bytes_or_url) items
@@ -420,27 +439,32 @@ async def photo_edit_batch(
         quality=jpeg_quality, bg_color=bg_color, shadow_color=shadow_color,
         watermark=watermark,
     )
+    settings["format"] = format
+
+    _sem = asyncio.Semaphore(max(2, min(4, (os.cpu_count() or 4))))
 
     async def process_one(item: dict):
         label = item.get("file", {}).filename if item["type"] == "file" else item.get("url", "url")
-        try:
-            if item["type"] == "file":
-                data = await _read_and_validate(item["file"])
-            else:
-                req = urllib.request.Request(item["url"], headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = resp.read()
-            loop = asyncio.get_event_loop()
-            # Use full_process_fast: 512×512 intermediate + no NLM-denoise/inpaint
-            # + dedicated thread pool sized to CPU count for true multi-core throughput.
-            result_bytes = await loop.run_in_executor(_BATCH_POOL, full_process_fast, data, settings)
-            return {
-                "success": True,
-                "filename": label,
-                "data_url": _to_data_url(result_bytes, "image/jpeg"),
-            }
-        except Exception as exc:
-            return {"success": False, "filename": label, "error": str(exc)}
+        async with _sem:
+            try:
+                if item["type"] == "file":
+                    data = await _read_and_validate(item["file"])
+                else:
+                    def _fetch_url():
+                        req = urllib.request.Request(item["url"], headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            return resp.read()
+                    loop = asyncio.get_event_loop()
+                    data = await loop.run_in_executor(_BATCH_POOL, _fetch_url)
+                loop = asyncio.get_event_loop()
+                result_bytes = await loop.run_in_executor(_BATCH_POOL, full_process_fast, data, settings)
+                return {
+                    "success": True,
+                    "filename": label,
+                    "data_url": _to_data_url(result_bytes, "image/jpeg"),
+                }
+            except Exception as exc:
+                return {"success": False, "filename": label, "error": str(exc)}
 
     results = await asyncio.gather(*[process_one(item) for item in items])
     failed = sum(1 for r in results if not r["success"])
@@ -450,6 +474,209 @@ async def photo_edit_batch(
         "failed": failed,
         "results": results,
     })
+
+
+# ── Async Batch Processing with real-time progress ────────────────────────────
+# Two-step approach:
+#   1. POST /photo-edit/batch-async   → starts background task, returns task_id
+#   2. GET  /photo-edit/batch-status/{task_id}  → poll for progress / results
+# This lets the frontend display per-image progress, ETA and partial results
+# without waiting for the entire batch to complete before receiving anything.
+
+_batch_tasks: Dict[str, Dict[str, Any]] = {}
+_TASK_EXPIRY_SECONDS = 900  # 15 min — clean up old completed tasks
+
+
+def _cleanup_old_tasks() -> None:
+    """Evict tasks older than _TASK_EXPIRY_SECONDS to prevent unbounded growth."""
+    cutoff = time.monotonic() - _TASK_EXPIRY_SECONDS
+    expired = [k for k, v in _batch_tasks.items() if v.get("_monotonic_start", 0) < cutoff]
+    for k in expired:
+        del _batch_tasks[k]
+
+
+async def _run_batch_task(
+    task_id: str,
+    url_items: List[Dict[str, Any]],  # [{index, url, name}]
+    settings: Dict[str, Any],
+) -> None:
+    """Background coroutine: processes each URL and updates task state in-place."""
+    task = _batch_tasks.get(task_id)
+    if task is None:
+        return
+
+    loop = asyncio.get_event_loop()
+    # Limit true CPU concurrency: rembg + InsightFace are both memory-heavy.
+    # Allow at most cpu_count concurrent inferences so the system doesn't OOM.
+    cpu = os.cpu_count() or 2
+    sem = asyncio.Semaphore(max(2, min(cpu, 4)))
+    elapsed_times: List[float] = []
+
+    async def process_one(item: Dict[str, Any]) -> None:
+        name = item.get("name", f"Image {item['index'] + 1}")
+        url  = item["url"]
+        task["current"] = name
+
+        t0 = time.monotonic()
+        async with sem:
+            try:
+                def _fetch_and_process() -> bytes:
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        data = resp.read()
+                    if len(data) > MAX_FILE_SIZE:
+                        raise ValueError("Image exceeds 15 MB limit")
+                    return full_process_fast(data, settings)
+
+                result_bytes = await loop.run_in_executor(_BATCH_POOL, _fetch_and_process)
+                task["results"].append({
+                    "index": item["index"],
+                    "name": name,
+                    "data_url": _to_data_url(result_bytes, "image/jpeg"),
+                })
+                task["success"] += 1
+            except Exception as exc:
+                task["errors"].append({
+                    "index": item["index"],
+                    "name": name,
+                    "error": str(exc),
+                })
+                task["failed"] += 1
+
+        elapsed_times.append(time.monotonic() - t0)
+        task["completed"] += 1
+
+        # Running ETA: average time per image × remaining images ÷ concurrency slots
+        if elapsed_times:
+            avg = sum(elapsed_times) / len(elapsed_times)
+            remaining = task["total"] - task["completed"]
+            effective_concurrency = max(2, min(cpu, 4))
+            task["eta_seconds"] = round(remaining * avg / effective_concurrency, 1)
+
+    await asyncio.gather(*[process_one(item) for item in url_items])
+
+    task["done"] = True
+    task["status"] = "done"
+    task["current"] = ""
+    task["eta_seconds"] = 0
+
+
+@router.post("/photo-edit/batch-async", summary="Start async batch (returns task_id for polling)")
+async def photo_edit_batch_async(
+    image_urls:   str   = Form(..., description="JSON array of absolute image URLs"),
+    student_names: str  = Form("[]", description="JSON array of student names (for progress display)"),
+    enhance:      float = Form(5.0),
+    exposure:     float = Form(0.0),
+    color_temp:   float = Form(0.0),
+    sharpness:    float = Form(5.0),
+    skin:         float = Form(5.0),
+    color_grade:  str   = Form("natural"),
+    crop_mode:    str   = Form("manual"),
+    padding:      float = Form(4.5),
+    headroom:     float = Form(0.20),
+    bg_color:     str   = Form("#FFFFFF"),
+    shadow_color: str   = Form("#222222"),
+    gradient:     str   = Form("None"),
+    glow:         int   = Form(40),
+    shadow_soft:  int   = Form(51),
+    shadow_dist:  int   = Form(15),
+    jpeg_quality: int   = Form(82),
+    watermark:    str   = Form(""),
+    balance_skin: bool  = Form(True),
+    clean_hair:   bool  = Form(True),
+    gfpgan:       bool  = Form(False),
+    format:       str   = Form("1024×1024 (Standard)"),
+):
+    """
+    Start asynchronous batch processing.
+
+    Returns immediately with {task_id, total}.
+    Poll GET /photo-edit/batch-status/{task_id} every ~1 s for progress.
+    """
+    try:
+        urls: List[str] = json.loads(image_urls)
+    except Exception:
+        raise HTTPException(status_code=400, detail="'image_urls' must be a valid JSON array.")
+    try:
+        names: List[str] = json.loads(student_names)
+    except Exception:
+        names = []
+
+    if not urls:
+        raise HTTPException(status_code=422, detail="'image_urls' must not be empty.")
+    if len(urls) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 images per async batch.")
+
+    settings = compute_settings(
+        enhance=enhance, exposure=exposure, color_temp_lv=color_temp,
+        sharpness_lv=sharpness, skin_lv=skin,
+        color_grade=color_grade, crop_mode=crop_mode,
+        padding=padding, headroom=headroom,
+        sh_soft=shadow_soft, sh_dist=shadow_dist, glow=glow, gradient=gradient,
+        balance_skin=balance_skin, decontaminate=clean_hair, gfpgan_enable=gfpgan,
+        quality=jpeg_quality, bg_color=bg_color, shadow_color=shadow_color,
+        watermark=watermark,
+    )
+    settings["format"] = format
+
+    _cleanup_old_tasks()
+
+    task_id = str(uuid.uuid4())
+    _batch_tasks[task_id] = {
+        "task_id":         task_id,
+        "status":          "running",
+        "total":           len(urls),
+        "completed":       0,
+        "success":         0,
+        "failed":          0,
+        "current":         "",
+        "results":         [],     # [{index, name, data_url}]
+        "errors":          [],     # [{index, name, error}]
+        "done":            False,
+        "eta_seconds":     None,
+        "_monotonic_start": time.monotonic(),
+    }
+
+    url_items = [
+        {"index": i, "url": u, "name": names[i] if i < len(names) else f"Image {i + 1}"}
+        for i, u in enumerate(urls)
+    ]
+
+    asyncio.create_task(_run_batch_task(task_id, url_items, settings))
+
+    return JSONResponse({"task_id": task_id, "total": len(urls)})
+
+
+@router.get("/photo-edit/batch-status/{task_id}", summary="Poll async batch progress")
+async def photo_edit_batch_status(task_id: str):
+    """
+    Returns the current state of an async batch task.
+
+    Fields:
+      status      — "running" | "done"
+      total       — total images in batch
+      completed   — images finished (success + failed)
+      success     — successfully processed count
+      failed      — failed count
+      current     — name of the image currently being processed
+      eta_seconds — estimated seconds remaining (null until first image completes)
+      results     — [{index, name, data_url}] — grows as images complete
+      errors      — [{index, name, error}]
+      done        — true when all images have been processed
+    """
+    task = _batch_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found or expired (>15 min).")
+    # Return a safe copy without the internal monotonic timestamp
+    return JSONResponse({k: v for k, v in task.items() if not k.startswith("_")})
+
+
+@router.delete("/photo-edit/batch-task/{task_id}", summary="Clean up a completed batch task")
+async def photo_edit_batch_task_delete(task_id: str):
+    """Free memory held by a finished batch task."""
+    if task_id in _batch_tasks:
+        del _batch_tasks[task_id]
+    return {"deleted": task_id}
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

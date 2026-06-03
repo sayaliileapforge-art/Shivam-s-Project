@@ -178,14 +178,14 @@ export async function fetchProjects(clientId?: string) {
 }
 
 export async function fetchProjectById(id: string) {
-  try {
-    const response = await fetch(`${API_BASE}/projects/${id}`);
-    const result = await response.json() as ApiResponse<any>;
-    return result.data || null;
-  } catch (error) {
-    console.warn('Project API error:', error);
-    return null;
-  }
+  const response = await fetch(`${API_BASE}/projects/${id}`);
+  // 404 → project genuinely doesn't exist, return null
+  if (response.status === 404) return null;
+  // Any other non-OK status (5xx, network error from fetch throwing, etc.) → throw
+  // so callers can distinguish a transient failure from a true missing project.
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const result = await response.json() as ApiResponse<any>;
+  return result.data ?? null;
 }
 
 export async function createProject(data: Record<string, any>) {

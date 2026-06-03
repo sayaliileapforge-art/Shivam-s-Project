@@ -641,6 +641,7 @@ export function ProjectDetail() {
   const [version, setVersion] = useState(0);
   const [project, setProject] = useState<ReturnType<typeof mapApiProjectToUi> | null>(null);
   const [projectLoading, setProjectLoading] = useState(true);
+  const [projectFetchError, setProjectFetchError] = useState<string | null>(null);
   void version;
 
   // dialogs
@@ -785,21 +786,38 @@ export function ProjectDetail() {
     if (!id) {
       setProject(null);
       setProjectLoading(false);
+      setProjectFetchError(null);
       return;
     }
 
     setProjectLoading(true);
-    apiFetchProjectById(id)
-      .then((data) => {
+    setProjectFetchError(null);
+
+    // Retry up to 2 extra times (with 1.5 s backoff) on transient errors so that a
+    // backend restart from `tsx watch` doesn't immediately flash "Project not found".
+    const fetchWithRetry = async (attemptsLeft: number): Promise<void> => {
+      try {
+        const data = await apiFetchProjectById(id);
         if (!mounted) return;
+        // null here means a genuine 404 — project doesn't exist
         setProject(data ? mapApiProjectToUi(data) : null);
         setProjectLoading(false);
-      })
-      .catch(() => {
+      } catch {
         if (!mounted) return;
-        setProject(null);
+        if (attemptsLeft > 0) {
+          // Transient error (5xx / network blip) — wait then retry
+          await new Promise<void>((r) => setTimeout(r, 1500));
+          if (!mounted) return;
+          return fetchWithRetry(attemptsLeft - 1);
+        }
+        // All retries exhausted — keep any previously loaded project data and
+        // show an error banner instead of falsely claiming the project doesn't exist.
+        setProjectFetchError('Could not load project. Check your connection and try again.');
         setProjectLoading(false);
-      });
+      }
+    };
+
+    void fetchWithRetry(2);
 
     return () => {
       mounted = false;
@@ -2434,8 +2452,15 @@ export function ProjectDetail() {
 
     const usableWidth = Math.max(1, sheetWidthPx - marginLeftPx * 2);
     const usableHeight = Math.max(1, sheetHeightPx - marginTopPx * 2);
-    const cardWidthPx = Math.max(1, Math.round(Math.max(Number(previewForm.cardWidthMm) || 54, 1) * MM_TO_PX));
-    const cardHeightPx = Math.max(1, Math.round(Math.max(Number(previewForm.cardHeightMm) || 86, 1) * MM_TO_PX));
+    // Mirror the backend logic: for landscape pages, use landscape-oriented card slots
+    // (wider than tall) so the displayed Fits/Page stats match the generated PDF exactly.
+    const rawCardW = Number(previewForm.cardWidthMm) || 54;
+    const rawCardH = Number(previewForm.cardHeightMm) || 86;
+    const isLandscape = previewForm.orientation === "landscape";
+    const effectiveCardWidthMm  = isLandscape ? Math.max(rawCardW, rawCardH) : Math.min(rawCardW, rawCardH);
+    const effectiveCardHeightMm = isLandscape ? Math.min(rawCardW, rawCardH) : Math.max(rawCardW, rawCardH);
+    const cardWidthPx  = Math.max(1, Math.round(Math.max(effectiveCardWidthMm,  1) * MM_TO_PX));
+    const cardHeightPx = Math.max(1, Math.round(Math.max(effectiveCardHeightMm, 1) * MM_TO_PX));
     const columns = Math.max(1, Math.floor((usableWidth + columnGapPx) / (cardWidthPx + columnGapPx)));
     const rows = Math.max(1, Math.floor((usableHeight + rowGapPx) / (cardHeightPx + rowGapPx)));
     const cardsPerPage = Math.max(1, columns * rows);
@@ -2464,6 +2489,7 @@ export function ProjectDetail() {
     previewForm.columnMarginMm,
     previewForm.cardWidthMm,
     previewForm.cardHeightMm,
+    previewForm.orientation,
   ]);
 
   // Auto-fit zoom whenever dialog opens or sheet dimensions change
@@ -3174,6 +3200,20 @@ export function ProjectDetail() {
     return (
       <div className="flex flex-col items-center justify-center py-24 space-y-4">
         <p className="text-muted-foreground text-lg">Loading project...</p>
+      </div>
+    );
+  }
+
+  if (projectFetchError) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 space-y-4">
+        <p className="text-muted-foreground text-lg">{projectFetchError}</p>
+        <div className="flex gap-3">
+          <Button variant="outline" onClick={() => setVersion((v) => v + 1)}>Retry</Button>
+          <Link to="/projects">
+            <Button variant="outline">Back to Projects</Button>
+          </Link>
+        </div>
       </div>
     );
   }
@@ -4397,26 +4437,14 @@ export function ProjectDetail() {
                                 <Edit className="h-4 w-4 mr-2" /> Bulk Edit
                               </DropdownMenuItem>
                               <DropdownMenuSeparator />
-                              <DropdownMenuItem onClick={() => void handleAIAutoCrop()} disabled={!!aiProcessing}>
-                                {aiProcessing === "autocrop"
-                                  ? <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                                  : <Crop className="h-4 w-4 mr-2" />}
-                                AI Image Auto Crop
-                              </DropdownMenuItem>
                               <DropdownMenuItem onClick={() => setIsAICropOpen(true)}>
-                                <Crop className="h-4 w-4 mr-2 text-violet-400" /> AI Auto Crop (Advanced)
+                                <Crop className="h-4 w-4 mr-2 text-violet-400" /> AI Auto Crop
                               </DropdownMenuItem>
                               <DropdownMenuItem onClick={() => setIsAIPhotoEditorOpen(true)}>
                                 <Wand2 className="h-4 w-4 mr-2 text-pink-400" /> AI Photo Studio
                               </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => void handleAIBgRemove()} disabled={!!aiProcessing}>
-                                {aiProcessing === "bgremove"
-                                  ? <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                                  : <Wand2 className="h-4 w-4 mr-2" />}
-                                AI Image Background Remover
-                              </DropdownMenuItem>
                               <DropdownMenuItem onClick={() => setIsAIBgRemoveOpen(true)}>
-                                <Wand2 className="h-4 w-4 mr-2 text-cyan-400" /> AI Background Remove (Advanced)
+                                <Wand2 className="h-4 w-4 mr-2 text-cyan-400" /> AI Background Remove
                               </DropdownMenuItem>
                               <DropdownMenuSeparator />
                               <DropdownMenuItem onClick={handleResetPhoto}>
@@ -4425,18 +4453,12 @@ export function ProjectDetail() {
                               <DropdownMenuItem onClick={() => { setAiImageUploadTargetId(null); setIsAIImageUploadOpen(true); }}>
                                 <ImageIcon className="h-4 w-4 mr-2 text-indigo-400" /> Image Upload
                               </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => { setImageUploadTarget("selection"); photoUploadRef.current?.click(); }}>
-                                <ImageIcon className="h-4 w-4 mr-2" /> Image Upload (Quick)
-                              </DropdownMenuItem>
                               <DropdownMenuItem onClick={() => { setBulkImageResults(null); setIsAIBulkUploadOpen(true); }} disabled={!dataRecords.length}>
                                 <Archive className="h-4 w-4 mr-2 text-blue-400" /> Bulk Image Upload
                               </DropdownMenuItem>
                               <DropdownMenuSeparator />
-                              <DropdownMenuItem onClick={() => { setBarcodeField(dataFields[0]?.key ?? ""); setIsGenerateBarcodeOpen(true); }}>
-                                <QrCode className="h-4 w-4 mr-2" /> Generate Bar Code (Quick)
-                              </DropdownMenuItem>
                               <DropdownMenuItem onClick={() => setIsAIBarcodeOpen(true)} disabled={!dataFields.length}>
-                                <QrCode className="h-4 w-4 mr-2 text-amber-400" /> Generate Barcode / QR (Advanced)
+                                <QrCode className="h-4 w-4 mr-2 text-amber-400" /> Generate Barcode / QR
                               </DropdownMenuItem>
                               <DropdownMenuItem onClick={handleOpenAddData} disabled={!dataFields.length}>
                                 <UserRound className="h-4 w-4 mr-2" /> Add New User

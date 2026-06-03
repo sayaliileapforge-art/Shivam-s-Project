@@ -10,3 +10,7 @@ python-barcode==0.15.1
 mediapipe==0.10.14
 aiofiles==23.2.1
 httpx==0.27.2
+# Optional: InsightFace for improved face detection (buffalo_l model ~700 MB download on first run)
+# Uncomment to enable — requires C++ build tools on Windows
+# insightface==0.7.3
+# onnxruntime==1.19.2
