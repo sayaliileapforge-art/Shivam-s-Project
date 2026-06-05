@@ -11,6 +11,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Verify secrets are set
+        run: |
+          if [ -z "${{ secrets.SSH_HOST }}" ]; then echo "ERROR: SSH_HOST is empty"; exit 1; fi
+          if [ -z "${{ secrets.SSH_USER }}" ]; then echo "ERROR: SSH_USER is empty"; exit 1; fi
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then echo "ERROR: SSH_PRIVATE_KEY is empty"; exit 1; fi
+          echo "All secrets are set"
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -18,6 +25,9 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 22
+          timeout: 30s
+          command_timeout: 30m
+          key_strict: false
           script: |
             set -e
             echo "=== Pulling latest code ==="
