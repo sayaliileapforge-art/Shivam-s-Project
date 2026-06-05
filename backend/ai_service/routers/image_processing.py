@@ -534,7 +534,8 @@ async def _run_batch_task(
     # Limit true CPU concurrency: rembg + InsightFace are both memory-heavy.
     # Allow at most cpu_count concurrent inferences so the system doesn't OOM.
     cpu = os.cpu_count() or 2
-    sem = asyncio.Semaphore(max(2, min(cpu, 4)))
+    # On low-CPU VPS, limit to 2 concurrent to avoid thrashing and OOM
+    sem = asyncio.Semaphore(max(1, min(cpu, 2)))
     elapsed_times: List[float] = []
 
     async def process_one(item: Dict[str, Any]) -> None:
