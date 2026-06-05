@@ -27,11 +27,14 @@ jobs:
           port: 22
           timeout: 30s
           command_timeout: 30m
-          key_strict: false
           script: |
             set -e
             echo "=== Pulling latest code ==="
             cd /var/www/saasapp
+            echo "=== Pulling latest code ==="
+            cd /var/www/saasapp
+
+            git stash --include-untracked || true
             git pull origin main
 
             echo "=== Aligning UPLOADS_DIR to git-checkout path ==="
