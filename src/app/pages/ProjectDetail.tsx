@@ -4530,6 +4530,7 @@ export function ProjectDetail() {
                                           src={imageUrl}
                                           alt={nameVal}
                                           className="h-full w-full object-cover"
+                                          style={{ objectPosition: 'center' }}
                                           onError={(event) => {
                                             const img = event.currentTarget;
                                             img.onerror = null;
@@ -5321,7 +5322,7 @@ export function ProjectDetail() {
                         <ul className="text-xs text-green-700 space-y-0.5 max-h-36 overflow-y-auto px-3 pb-2.5 pt-1.5 border-t border-green-200">
                           {bulkImageResults.matched.map((m) => (
                             <li key={m.userId} className="flex gap-1.5 items-center">
-                              <img src={m.imageUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" />
+                              <img src={m.imageUrl} alt="" className="h-5 w-5 rounded-full object-cover shrink-0" style={{ objectPosition: 'center' }} />
                               <span className="truncate">{m.filename} → <strong>{m.name}</strong></span>
                             </li>
                           ))}

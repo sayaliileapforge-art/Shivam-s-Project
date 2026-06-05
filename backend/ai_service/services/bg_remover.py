@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Background removal service using rembg.
 

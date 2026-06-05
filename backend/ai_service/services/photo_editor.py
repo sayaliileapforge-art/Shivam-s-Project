@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 AI Photo Studio v7.4 — FastAPI service port
 ============================================
@@ -235,22 +236,28 @@ def get_faces(img_bgr):
 # ── Alpha matting helpers ─────────────────────────────────────────────────────
 
 def clean_alpha(alpha, crop_bgr):
+    """Clean rembg alpha: close holes, guided-filter edges, hard-threshold to remove artifacts."""
     a8 = (alpha * 255).astype(np.uint8)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    a8 = cv2.morphologyEx(a8, cv2.MORPH_CLOSE, k, iterations=2)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    a8 = cv2.morphologyEx(a8, cv2.MORPH_CLOSE, k, iterations=3)
+    a8 = cv2.morphologyEx(a8, cv2.MORPH_OPEN,  k, iterations=1)
     guide = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.
     af = a8.astype(np.float32) / 255.
-    r = 5
-    mG = cv2.boxFilter(guide, -1, (r, r)); mA = cv2.boxFilter(af, -1, (r, r))
-    mGA = cv2.boxFilter(guide * af, -1, (r, r)); mGG = cv2.boxFilter(guide * guide, -1, (r, r))
-    A = (mGA - mG * mA) / (mGG - mG * mG + 1e-3); B = mA - A * mG
+    r = 7
+    mG  = cv2.boxFilter(guide,       -1, (r, r))
+    mA  = cv2.boxFilter(af,          -1, (r, r))
+    mGA = cv2.boxFilter(guide * af,  -1, (r, r))
+    mGG = cv2.boxFilter(guide * guide, -1, (r, r))
+    A = (mGA - mG * mA) / (mGG - mG * mG + 1e-3)
+    B = mA - A * mG
     ag = np.clip(cv2.boxFilter(A, -1, (r, r)) * guide + cv2.boxFilter(B, -1, (r, r)), 0, 1)
     res = af.copy()
     res[(af > 0.05) & (af < 0.95)] = ag[(af > 0.05) & (af < 0.95)]
-    # Edge sharpening: push semi-transparent values toward 0 or 1 to reduce halo/ghosting.
-    # Sigmoid-style contrast: values near 0.5 get pushed outward, creating cleaner edges.
-    edge_zone = (res > 0.10) & (res < 0.90)
-    res[edge_zone] = np.clip((res[edge_zone] - 0.5) * 1.6 + 0.5, 0, 1)
+    # Stronger sigmoid: drive semi-transparent fringes to binary (removes artifact ghosting)
+    edge_zone = (res > 0.08) & (res < 0.92)
+    res[edge_zone] = np.clip((res[edge_zone] - 0.5) * 2.4 + 0.5, 0, 1)
+    res[res < 0.08] = 0.0
+    res[res > 0.92] = 1.0
     return np.clip(res, 0, 1).astype(np.float32)
 
 
@@ -268,13 +275,18 @@ def decontaminate_edges(img_rgb, alpha):
 
 
 def safe_position_anchor(alpha, headroom, SIZE=1024):
-    coords = np.where(alpha > 0.1)
+    """Compute (dy, dx) to place subject top at headroom% and center horizontally."""
+    coords = np.where(alpha > 0.15)
     if coords[0].size == 0:
         return 0, 0
-    top_detected = int(np.min(coords[0]))
+    top_detected   = int(np.min(coords[0]))
+    left_detected  = int(np.min(coords[1]))
+    right_detected = int(np.max(coords[1]))
+    subject_cx = (left_detected + right_detected) // 2
     target_top = int(SIZE * headroom)
+    target_cx  = SIZE // 2
     ady = target_top - top_detected
-    adx = 512 - (int(np.min(coords[1])) + int(np.max(coords[1]))) // 2
+    adx = target_cx - subject_cx
     max_up = -(target_top // 2)
     if ady < max_up:
         ady = max_up
@@ -282,11 +294,185 @@ def safe_position_anchor(alpha, headroom, SIZE=1024):
 
 
 def _build_crop_M(ec, ang, cs, face_bbox_y1, padding):
-    internal_hr = 0.55 / max(float(padding), 2.0)
-    M = cv2.getRotationMatrix2D(ec, ang, 1.)
-    M[0, 2] += cs / 2 - ec[0]
-    M[1, 2] += cs * internal_hr - face_bbox_y1
+    """
+    Build affine crop matrix.
+    Eyes at 38% from top — leaves ~15% headroom above the head for ID photos.
+    Subject centered horizontally.
+    """
+    M = cv2.getRotationMatrix2D(ec, ang, 1.0)
+    M[0, 2] += cs / 2.0 - ec[0]   # center horizontally
+    M[1, 2] += cs * 0.38 - ec[1]  # eyes at 38% from top (head fully visible)
     return M
+
+
+def _validate_crop(crop_bgr, min_content_ratio=0.30, face_bbox=None, crop_center=None):
+    """
+    Validate that crop contains sufficient non-white content AND has subject centered.
+    
+    Args:
+        crop_bgr: The cropped image
+        min_content_ratio: Minimum non-white pixel ratio (default 0.30)
+        face_bbox: Optional (x1, y1, x2, y2) in CROP coordinates for centering check
+        crop_center: Optional (cx, cy) - expected center of subject in crop
+    
+    Returns True if crop is valid (good content ratio AND subject reasonably centered)
+    """
+    if crop_bgr is None or crop_bgr.shape[0] < 100 or crop_bgr.shape[1] < 100:
+        return False
+    
+    h, w = crop_bgr.shape[:2]
+    cs = max(h, w)
+    
+    # Check for excessive white fill (all channels ≥ 240)
+    white_mask = (crop_bgr[:,:,0] >= 240) & (crop_bgr[:,:,1] >= 240) & (crop_bgr[:,:,2] >= 240)
+    white_ratio = np.sum(white_mask) / (h * w)
+    
+    # If >70% is white, it's a failed crop
+    if white_ratio > 0.70:
+        print(f"⚠ Crop validation: {white_ratio*100:.1f}% white fill — INVALID")
+        return False
+    
+    # Check for minimum colored content
+    colored_pixels = 1 - white_ratio
+    if colored_pixels < min_content_ratio:
+        print(f"⚠ Crop validation: only {colored_pixels*100:.1f}% non-white content — INVALID")
+        return False
+    
+    # Check that colored content is not concentrated on one edge (off-center subject)
+    colored_mask = ~white_mask
+    col_sum = np.sum(colored_mask, axis=0)  # Sum across rows for each column
+    row_sum = np.sum(colored_mask, axis=1)  # Sum across cols for each row
+    
+    # Find where the main content concentration is
+    cs_w = crop_bgr.shape[1]  # Width
+    cs_h = crop_bgr.shape[0]  # Height
+    third_w = cs_w // 3
+    third_h = cs_h // 3
+    
+    # Check horizontal distribution - content shouldn't be only in first or last third
+    left_third = np.sum(col_sum[:third_w])
+    right_third = np.sum(col_sum[-third_w:])
+    center_third = np.sum(col_sum[third_w:2*third_w])
+    total_h = np.sum(col_sum)
+    
+    if total_h > 100:  # Only check if there's substantial content
+        left_ratio = left_third / total_h if total_h > 0 else 0
+        right_ratio = right_third / total_h if total_h > 0 else 0
+        center_ratio = center_third / total_h if total_h > 0 else 0
+        
+        # Content should be somewhat distributed - not all on one side
+        if (left_ratio > 0.65 or right_ratio > 0.65) and center_ratio < 0.15:
+            print(f"⚠ Crop validation: subject off-center horizontally (L={left_ratio:.1%}, C={center_ratio:.1%}, R={right_ratio:.1%}) — INVALID")
+            return False
+    
+    # Check vertical distribution - content shouldn't be only at top or bottom
+    top_third = np.sum(row_sum[:third_h])
+    bottom_third = np.sum(row_sum[-third_h:])
+    middle_third = np.sum(row_sum[third_h:2*third_h])
+    total_v = np.sum(row_sum)
+    
+    if total_v > 100:
+        top_ratio = top_third / total_v if total_v > 0 else 0
+        bottom_ratio = bottom_third / total_v if total_v > 0 else 0
+        middle_ratio = middle_third / total_v if total_v > 0 else 0
+        
+        # Content should be reasonably distributed vertically
+        if (top_ratio > 0.70 or bottom_ratio > 0.50):
+            print(f"⚠ Crop validation: subject off-center vertically (T={top_ratio:.1%}, M={middle_ratio:.1%}, B={bottom_ratio:.1%}) — INVALID")
+            return False
+    
+    return True
+
+
+def _clamp_crop_bounds(img_bgr, M, cs):
+    """
+    Ensure crop stays within reasonable bounds to avoid excessive white fill.
+    
+    Strategy: Apply minimal clamping to prevent completely out-of-bounds crops,
+    while preserving the rotation-aware centering computed by _build_crop_M.
+    
+    For affine transforms, overly aggressive clamping breaks subject centering
+    and causes half-face crops. Instead, we only prevent extreme cases where
+    the entire crop would be outside the image.
+    """
+    h, w = img_bgr.shape[:2]
+    
+    # Minimal safety bounds: ensure at least 20% of crop is inside image
+    # This prevents completely empty crops while preserving centering
+    min_overlap = cs * 0.20
+    
+    M_adj = M.copy().astype(np.float32)
+    
+    # Clamp translation to ensure minimal overlap
+    # Allow generous margins to preserve centering from _build_crop_M
+    M_adj[0, 2] = np.clip(M_adj[0, 2], -cs + min_overlap, w - min_overlap)
+    M_adj[1, 2] = np.clip(M_adj[1, 2], -cs + min_overlap, h - min_overlap)
+    
+    return M_adj
+
+
+def _extract_crop_simple(img_bgr, face, cs, padding, headroom):
+    """
+    Simple and direct approach to extract a square crop centered on face.
+    
+    This approach:
+    1. Calculates face center from eye landmarks
+    2. Positions crop to keep face centered, clamping to image bounds
+    3. Pads with white if crop extends beyond image bounds
+    4. Returns the cropped image
+    
+    This is more reliable than complex affine transformations.
+    """
+    h, w = img_bgr.shape[:2]
+    
+    # Get face center from bounding box (more reliable than eye landmarks for centering)
+    fx1, fy1, fx2, fy2 = face.bbox
+    face_cx = (fx1 + fx2) / 2
+    face_cy = (fy1 + fy2) / 2
+    
+    # Use the provided crop size directly (already calculated as max(bw,bh)*padding)
+    crop_size = cs
+    
+    # Position crop centered on face with headroom
+    # 0.45 means face is positioned at 45% from top (leaving space above head)
+    crop_top = int(face_cy - crop_size * 0.45)
+    crop_left = int(face_cx - crop_size / 2)
+    
+    # **CRITICAL FIX**: Clamp crop position to keep face centered within image bounds
+    # Instead of just clamping the edges, we need to ensure the face stays centered
+    # Adjust crop position to maximize visibility while staying in bounds
+    if crop_left < 0:
+        crop_left = 0
+    if crop_left + crop_size > w:
+        crop_left = max(0, w - crop_size)
+    
+    if crop_top < 0:
+        crop_top = 0
+    if crop_top + crop_size > h:
+        crop_top = max(0, h - crop_size)
+    
+    # Create output canvas with white background
+    canvas = np.full((crop_size, crop_size, 3), 255, dtype=np.uint8)
+    
+    # Define the region from source image that we can actually use
+    src_top = crop_top
+    src_left = crop_left
+    src_bottom = min(h, crop_top + crop_size)
+    src_right = min(w, crop_left + crop_size)
+    
+    # Define where this region maps to in the canvas
+    canvas_top = max(0, -crop_top)  # Padding at top if crop_top was negative
+    canvas_left = max(0, -crop_left)  # Padding at left if crop_left was negative
+    
+    src_height = src_bottom - src_top
+    src_width = src_right - src_left
+    
+    # Copy image region to canvas
+    if src_height > 0 and src_width > 0:
+        canvas[canvas_top:canvas_top + src_height, canvas_left:canvas_left + src_width] = \
+            img_bgr[src_top:src_bottom, src_left:src_right]
+    
+    return canvas
 
 
 # ── rembg wrapper (3-tier fallback) ──────────────────────────────────────────
@@ -835,15 +1021,25 @@ def run_phase1(img_bytes: bytes, settings: Dict[str, Any]) -> Dict[str, Any]:
     padding = float(settings.get("padding", 4.5))
     headroom = float(settings.get("headroom", 0.20))
 
-    # Build crop + run rembg
-    bw = face.bbox[2] - face.bbox[0]; bh = face.bbox[3] - face.bbox[1]
-    cs = int(max(bw, bh) * padding)
-    el, er = face.kps[0], face.kps[1]
-    ec = ((el[0] + er[0]) / 2, (el[1] + er[1]) / 2)
-    ang = np.degrees(np.arctan2(er[1] - el[1], er[0] - el[0]))
-    M = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
-    crop = cv2.warpAffine(work, M, (cs, cs), borderValue=(255, 255, 255))
+    # Crop sizing: map UI padding (1-9) to a tight head+shoulders multiplier (2.0-3.2x face)
+    bw = face.bbox[2] - face.bbox[0]
+    bh = face.bbox[3] - face.bbox[1]
+    face_size = max(bw, bh)
+    padding = float(settings.get("padding", 4.5))
+    crop_mult = 2.0 + (min(padding, 9.0) / 9.0) * 1.2   # 2.0 at min, 3.2 at max
+    cs = int(face_size * crop_mult)
+    cs = min(cs, int(min(work.shape[1], work.shape[0]) * 0.92))
+    cs = max(cs, int(face_size * 1.8))
 
+    el, er = face.kps[0], face.kps[1]
+    ec  = ((el[0] + er[0]) / 2.0, (el[1] + er[1]) / 2.0)
+    ang = np.degrees(np.arctan2(er[1] - el[1], er[0] - el[0]))
+    print(f"[PHASE1] {work.shape[1]}x{work.shape[0]} face={face_size:.0f}px crop={cs}x{cs} ang={ang:.1f}")
+    M = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
+    M = np.float32(M)
+
+    # Apply the affine crop
+    crop = cv2.warpAffine(work, M, (cs, cs), borderValue=(255, 255, 255))
     fg_rgb, alp = _run_rembg(crop)
     alp_rs = cv2.resize(alp, (SIZE, SIZE), cv2.INTER_AREA)
     crop_rs = cv2.resize(crop, (SIZE, SIZE), cv2.INTER_LANCZOS4)
@@ -910,12 +1106,40 @@ def run_phase2(p1: Dict[str, Any], settings: Dict[str, Any]) -> bytes:
 
     if abs(padding - p1_padding) > 0.09:
         bw = face.bbox[2] - face.bbox[0]; bh = face.bbox[3] - face.bbox[1]
-        cs = int(max(bw, bh) * padding)
-        el, er = face.kps[0], face.kps[1]
-        ec  = ((el[0]+er[0])/2, (el[1]+er[1])/2)
-        ang = np.degrees(np.arctan2(er[1]-el[1], er[0]-el[0]))
-        M   = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
-        # Scale cached alpha to match new padding zoom level
+        h, w = work.shape[:2]
+        
+        # Use simple rectangular cropping with eye-center positioning
+        # Try crop with validation when padding changes significantly
+        M = None
+        for try_padding in [padding, padding * 0.95, padding * 0.9, p1_padding]:
+            cs = int(max(bw, bh) * try_padding)
+            el, er = face.kps[0], face.kps[1]
+            ec = ((el[0]+er[0])/2, (el[1]+er[1])/2)
+            ang = np.degrees(np.arctan2(er[1]-el[1], er[0]-el[0]))
+            
+            M_candidate = _build_crop_M(ec, ang, cs, face.bbox[1], try_padding)
+            M_candidate = _clamp_crop_bounds(work, M_candidate, cs)
+            M_candidate = np.float32(M_candidate)  # Ensure proper matrix type
+            
+            # Test the crop
+            try:
+                test_crop = cv2.warpAffine(work, M_candidate, (cs, cs), borderValue=(255, 255, 255))
+                if _validate_crop(test_crop, min_content_ratio=0.25):
+                    M = M_candidate
+                    break
+            except Exception:
+                continue
+        
+        # If validation failed, fall back to p1 padding
+        if M is None:
+            cs = int(max(bw, bh) * p1_padding)
+            el, er = face.kps[0], face.kps[1]
+            ec = ((el[0]+er[0])/2, (el[1]+er[1])/2)
+            ang = np.degrees(np.arctan2(er[1]-el[1], er[0]-el[0]))
+            M = _build_crop_M(ec, ang, cs, face.bbox[1], p1_padding)
+            M = _clamp_crop_bounds(work, M, cs)
+            M = np.float32(M)  # Ensure proper matrix type
+
         scale = p1_padding / padding   # < 1 when padding grew (person smaller in frame)
         cx = cy = SIZE // 2
         Msc = np.float32([[scale, 0, cx*(1-scale)], [0, scale, cy*(1-scale)]])
@@ -924,6 +1148,7 @@ def run_phase2(p1: Dict[str, Any], settings: Dict[str, Any]) -> bytes:
     else:
         M, cs  = p1["crop_M"], p1["crop_cs"]
         alp_ps = p1["alpha_preshift"]
+        crop_img = None  # Will use M/cs approach below
 
     if abs(headroom - p1_headroom) > 0.004:
         ady, adx = safe_position_anchor(alp_ps, headroom, SIZE)
@@ -934,7 +1159,12 @@ def run_phase2(p1: Dict[str, Any], settings: Dict[str, Any]) -> bytes:
                            (SIZE, SIZE), borderValue=0)
     # ── End dynamic composition ───────────────────────────────────────────────
 
-    crop_rt = cv2.warpAffine(work, M, (cs, cs), borderValue=(255, 255, 255))
+    # Use direct crop if available, otherwise fall back to affine transform
+    if crop_img is not None:
+        crop_rt = crop_img
+    else:
+        crop_rt = cv2.warpAffine(work, M, (cs, cs), borderValue=(255, 255, 255))
+    
     fg_rgb = cv2.resize(cv2.cvtColor(crop_rt, cv2.COLOR_BGR2RGB), (SIZE, SIZE), cv2.INTER_LANCZOS4)
     if settings.get("decontaminate", True):
         fg_rgb = decontaminate_edges(fg_rgb, alp_ps)
@@ -1089,17 +1319,26 @@ def full_process_fast(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
     padding  = float(settings.get("padding", 4.5))
     headroom = float(settings.get("headroom", 0.20))
 
+    # Crop sizing: same formula as run_phase1 for consistent batch output
     bw = face.bbox[2] - face.bbox[0]
     bh = face.bbox[3] - face.bbox[1]
-    cs  = int(max(bw, bh) * padding)
-    el, er = face.kps[0], face.kps[1]
-    ec  = ((el[0]+er[0])/2, (el[1]+er[1])/2)
-    ang = np.degrees(np.arctan2(er[1]-el[1], er[0]-el[0]))
-    M   = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
+    face_size = max(bw, bh)
+    crop_mult = 2.0 + (min(padding, 9.0) / 9.0) * 1.2
+    cs = int(face_size * crop_mult)
+    cs = min(cs, int(min(w, h) * 0.92))
+    cs = max(cs, int(face_size * 1.8))
 
+    el, er = face.kps[0], face.kps[1]
+    ec  = ((el[0] + er[0]) / 2.0, (el[1] + er[1]) / 2.0)
+    ang = np.degrees(np.arctan2(er[1] - el[1], er[0] - el[0]))
+    print(f"[BATCH] {w}x{h} face={face_size:.0f}px crop={cs}x{cs} ang={ang:.1f}")
+    M = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
+    M = _clamp_crop_bounds(img_bgr, M, cs)
+    M = np.float32(M)
+    crop_full = cv2.warpAffine(img_bgr, M, (cs, cs), borderValue=(255, 255, 255))
+    
     # ── Crop → resize to BS×BS immediately ───────────────────────────────────
     # Everything from this point operates on the small BS×BS image.
-    crop_full = cv2.warpAffine(img_bgr, M, (cs, cs), borderValue=(255, 255, 255))
     img = cv2.resize(crop_full, (BS, BS), cv2.INTER_AREA)   # ← the working image
 
     # ── Background removal on BS×BS ──────────────────────────────────────────
@@ -1251,60 +1490,6 @@ def full_process_fast(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
     _, enc = cv2.imencode(".jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR),
                           [cv2.IMWRITE_JPEG_QUALITY, quality])
     return enc.tobytes()
-
-    """
-    Optimised batch path.
-    * Phase 1 runs at BATCH_SIZE (512) instead of 1024 — 4× fewer pixels for
-      BG-removal, clean_alpha, guided-filter and all subsequent blurs.
-    * Phase 2 skips NLM-denoise and inpaint (the two slowest ops in apply_all_ops).
-    * Final result is upsampled to the requested output size before JPEG encode,
-      so the delivered photo is the same resolution as the normal path.
-    * Phase 1 result is NOT cached — batch images are each processed once.
-    """
-    BS = BATCH_SIZE
-    init_sessions()
-
-    # ── Decode ───────────────────────────────────────────────────────────────
-    arr = np.frombuffer(img_bytes, np.uint8)
-    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise ValueError("Cannot decode image")
-
-    h, w = img_bgr.shape[:2]
-    # Cap working image at 1200px (saves face-detect time vs 1600px cap)
-    if max(h, w) > 1200:
-        s = 1200 / max(h, w)
-        img_bgr = cv2.resize(img_bgr, (int(w * s), int(h * s)), cv2.INTER_AREA)
-
-    work = img_bgr.copy()
-
-    # ── Face detection — always returns ≥1 face via portrait-position fallback ──
-    faces = get_faces(work)
-    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-    padding  = float(settings.get("padding", 4.5))
-    headroom = float(settings.get("headroom", 0.20))
-
-    bw = face.bbox[2] - face.bbox[0]
-    bh = face.bbox[3] - face.bbox[1]
-    cs = int(max(bw, bh) * padding)
-    el, er = face.kps[0], face.kps[1]
-    ec  = ((el[0] + er[0]) / 2, (el[1] + er[1]) / 2)
-    ang = np.degrees(np.arctan2(er[1] - el[1], er[0] - el[0]))
-    M   = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
-    crop = cv2.warpAffine(work, M, (cs, cs), borderValue=(255, 255, 255))
-
-    # ── Background removal at BS×BS ──────────────────────────────────────────
-    fg_rgb, alp = _run_rembg(crop)
-    alp_rs  = cv2.resize(alp,  (BS, BS), cv2.INTER_AREA)
-    crop_rs = cv2.resize(crop, (BS, BS), cv2.INTER_AREA)
-    alp_ps  = clean_alpha(alp_rs, crop_rs)
-    ady, adx = safe_position_anchor(alp_ps, headroom, BS)
-    alpha = cv2.warpAffine(alp_ps,
-                           np.float32([[1, 0, adx], [0, 1, ady]]),
-                           (BS, BS), borderValue=0)
-
-    # ── Skin detection (no landmarks — skipped for speed) ────────────────────
-    skin = detect_skin_pixels(work, None)
 
     # ── Apply ops: SKIP denoise (very slow) and SKIP inpaint blemish ─────────
     s = settings

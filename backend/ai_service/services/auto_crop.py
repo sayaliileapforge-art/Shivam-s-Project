@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Auto-crop service.
 

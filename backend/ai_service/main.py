@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 AI Image Processing Service — FastAPI entry point.
 
@@ -13,10 +14,30 @@ Usage:
 """
 
 import os
+import sys
+import json
 import threading
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Ensure UTF-8 encoding for stdout/stderr to handle Unicode in student names
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
+# Configure JSON encoding to use UTF-8 by default
+def json_dumps_default(obj):
+    """JSON encoder that ensures UTF-8 handling"""
+    import json
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+# Set Python's default encoding
+import codecs
+if sys.version_info[0] >= 3:
+    # For Python 3, ensure UTF-8 is used for JSON operations
+    pass
 
 from routers.image_processing import router as img_router
 

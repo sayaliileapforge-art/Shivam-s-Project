@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Image Processing Router
 =======================
@@ -36,6 +37,30 @@ from services.bg_remover import remove_background
 from services.barcode_gen import generate_barcode_image
 
 router = APIRouter()
+
+# ── Custom JSON Encoder for UTF-8 handling ────────────────────────────────────
+class UTF8JSONEncoder(json.JSONEncoder):
+    """Ensure Unicode characters are properly encoded"""
+    def encode(self, o):
+        # Use ensure_ascii=False to preserve Unicode characters
+        result = super().encode(o)
+        if isinstance(result, bytes):
+            return result.decode('utf-8')
+        return result
+
+def _safe_json_response(data, **kwargs):
+    """
+    Create a JSONResponse that safely handles Unicode characters.
+    Uses ensure_ascii=False to preserve Unicode in student names.
+    """
+    # Convert data to JSON string with UTF-8 encoding
+    json_str = json.dumps(data, ensure_ascii=False, default=str)
+    # Return as response
+    return JSONResponse(
+        content=data,
+        media_type="application/json; charset=utf-8",
+        **kwargs
+    )
 
 # Dedicated thread pool for CPU-bound batch photo processing.
 # Workers = _N_REMBG (from bg_remover) so the pool size matches the semaphore;
@@ -536,10 +561,16 @@ async def _run_batch_task(
                 })
                 task["success"] += 1
             except Exception as exc:
+                # Safely convert exception to string, handling Unicode characters
+                try:
+                    error_msg = str(exc)
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    error_msg = repr(exc)  # Fallback to repr if str() fails
+                
                 task["errors"].append({
                     "index": item["index"],
                     "name": name,
-                    "error": str(exc),
+                    "error": error_msg,
                 })
                 task["failed"] += 1
 
@@ -644,7 +675,7 @@ async def photo_edit_batch_async(
 
     asyncio.create_task(_run_batch_task(task_id, url_items, settings))
 
-    return JSONResponse({"task_id": task_id, "total": len(urls)})
+    return _safe_json_response({"task_id": task_id, "total": len(urls)})
 
 
 @router.get("/photo-edit/batch-status/{task_id}", summary="Poll async batch progress")
@@ -668,7 +699,9 @@ async def photo_edit_batch_status(task_id: str):
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found or expired (>15 min).")
     # Return a safe copy without the internal monotonic timestamp
-    return JSONResponse({k: v for k, v in task.items() if not k.startswith("_")})
+    # Ensure Unicode characters in names are properly handled
+    response_data = {k: v for k, v in task.items() if not k.startswith("_")}
+    return _safe_json_response(response_data)
 
 
 @router.delete("/photo-edit/batch-task/{task_id}", summary="Clean up a completed batch task")

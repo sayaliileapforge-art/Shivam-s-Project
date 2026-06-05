@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Pydantic request / response models for the AI image service.
 """

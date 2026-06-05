@@ -1,15 +1,11 @@
 @echo off
-:: AI Image Processing Service — Windows startup script
-:: Run this from the backend/ai_service/ directory
-::
-::   cd backend\ai_service
-::   start-ai-service.bat
-
 cd /d "%~dp0"
+set PYTHONIOENCODING=utf-8
 
+echo [AI Service] Checking Python...
 where python >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Python is not installed or not on PATH.
+    echo [ERROR] Python not found on PATH.
     pause
     exit /b 1
 )
@@ -17,5 +13,9 @@ if %errorlevel% neq 0 (
 echo [AI Service] Installing / verifying dependencies...
 pip install -r requirements.txt --quiet
 
-echo [AI Service] Starting FastAPI on port 8001...
+echo.
+echo [AI Service] Starting on http://localhost:8001
+echo [AI Service] Press Ctrl+C to stop.
+echo.
 python main.py
+pause
