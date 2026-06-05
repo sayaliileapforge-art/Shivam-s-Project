@@ -34,8 +34,14 @@ import {
 import { API_BASE, uploadImages } from "../../../lib/apiService";
 import { toast } from "sonner";
 
-// Derive the Express backend origin (strips "/api" suffix if present)
-const BACKEND_ORIGIN = API_BASE.replace(/\/api\/?$/, "");
+// Derive the Express backend origin — always an absolute URL so the Python
+// service can fetch images server-side. Falls back to window.location.origin
+// when API_BASE is a relative path (same-origin production deploy).
+const BACKEND_ORIGIN = (() => {
+  const stripped = API_BASE.replace(/\/api\/?$/, "");
+  if (stripped.startsWith("http")) return stripped;
+  return typeof window !== "undefined" ? window.location.origin : "";
+})();
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
