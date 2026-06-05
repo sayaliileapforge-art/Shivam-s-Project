@@ -27,7 +27,6 @@ jobs:
           port: 22
           timeout: 30s
           command_timeout: 30m
-          key_strict: false
           script: |
             set -e
             echo "=== Pulling latest code ==="
