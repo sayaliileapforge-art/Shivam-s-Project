@@ -73,6 +73,12 @@ jobs:
 
             echo "=== Restarting backend with PM2 ==="
             pm2 restart saasapp --update-env || pm2 start /var/www/saasapp/backend/dist/server.js --name saasapp --env production
+
+            echo "=== Restarting AI service with PM2 ==="
+            pm2 restart saasapp-ai --update-env || pm2 start /var/www/saasapp/backend/ai_service/main.py \
+              --name saasapp-ai \
+              --interpreter python3 \
+              --cwd /var/www/saasapp/backend/ai_service
             pm2 save
 
             echo "=== Deploy complete ==="
