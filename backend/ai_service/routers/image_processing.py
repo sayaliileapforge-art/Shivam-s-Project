@@ -63,10 +63,11 @@ def _safe_json_response(data, **kwargs):
     )
 
 # Dedicated thread pool for CPU-bound batch photo processing.
-# Workers = _N_REMBG (from bg_remover) so the pool size matches the semaphore;
-# extra queued tasks wait in asyncio rather than spinning up idle OS threads.
-_N_WORKERS = max(2, min(4, (os.cpu_count() or 4)))
-_BATCH_POOL = ThreadPoolExecutor(max_workers=max(8, (os.cpu_count() or 4) * 2))
+# Local machines: use more workers for speed. VPS: limit to avoid OOM.
+_IS_VPS = os.environ.get("NODE_ENV") == "production"
+_CPU = os.cpu_count() or 4
+_N_WORKERS = max(2, min(4, _CPU)) if _IS_VPS else max(4, _CPU)
+_BATCH_POOL = ThreadPoolExecutor(max_workers=_N_WORKERS * 2)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -531,11 +532,11 @@ async def _run_batch_task(
         return
 
     loop = asyncio.get_event_loop()
-    # Limit true CPU concurrency: rembg + InsightFace are both memory-heavy.
-    # Allow at most cpu_count concurrent inferences so the system doesn't OOM.
     cpu = os.cpu_count() or 2
-    # On low-CPU VPS, limit to 2 concurrent to avoid thrashing and OOM
-    sem = asyncio.Semaphore(max(1, min(cpu, 2)))
+    # Local: use more concurrency for speed. VPS: limit to avoid OOM.
+    is_vps = os.environ.get("NODE_ENV") == "production"
+    concurrency = max(1, min(cpu, 2)) if is_vps else max(2, min(cpu, 6))
+    sem = asyncio.Semaphore(concurrency)
     elapsed_times: List[float] = []
 
     async def process_one(item: Dict[str, Any]) -> None:
@@ -582,8 +583,7 @@ async def _run_batch_task(
         if elapsed_times:
             avg = sum(elapsed_times) / len(elapsed_times)
             remaining = task["total"] - task["completed"]
-            effective_concurrency = max(2, min(cpu, 4))
-            task["eta_seconds"] = round(remaining * avg / effective_concurrency, 1)
+            task["eta_seconds"] = round(remaining * avg / concurrency, 1)
 
     await asyncio.gather(*[process_one(item) for item in url_items])
 

@@ -77,6 +77,26 @@ MAX_CACHE = 50
 # ── Fast-path flag: set True once all sessions are initialised ───────────────
 _sessions_ready: bool = False
 
+# ── Shared rembg session for batch (avoids per-thread session creation cost) ─
+_shared_rembg_session = None
+_shared_rembg_lock = None
+
+def _get_shared_rembg_session():
+    """Return a single shared rembg session, created once."""
+    global _shared_rembg_session, _shared_rembg_lock
+    import threading
+    if _shared_rembg_lock is None:
+        _shared_rembg_lock = threading.Lock()
+    if _shared_rembg_session is None and REMBG_OK:
+        with _shared_rembg_lock:
+            if _shared_rembg_session is None:
+                try:
+                    _shared_rembg_session = rembg_session("u2net_human_seg")
+                    print("[batch] Shared rembg session ready")
+                except Exception as e:
+                    print(f"[batch] rembg session failed: {e}")
+    return _shared_rembg_session
+
 GRADIENT_PRESETS = {
     "None": None,
     "🌫 Studio Grey": ("#9E9E9E", "#F5F5F5", "radial"),
@@ -1288,7 +1308,7 @@ def full_process(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
 #   • landmark-based teeth / dark-circle ops (no MediaPipe in batch)
 # Combined, this gives ≈5-8× speedup vs full_process.
 
-BATCH_SIZE = 512   # all processing happens at this resolution
+BATCH_SIZE = 384   # reduced from 512 — rembg runs at 320px internally, 384 is enough
 
 def full_process_fast(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
     """
