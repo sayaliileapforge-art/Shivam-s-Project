@@ -1,4 +1,4 @@
-﻿import 'dotenv/config';
+import 'dotenv/config';
 import express from 'express';
 import compression from 'compression';
 import cors from 'cors';
@@ -66,7 +66,7 @@ app.use('/api', apiCorsMiddleware);
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-// Serve uploads from backend/public/uploads/ â€” consistent with uploads route.
+// Serve uploads from backend/public/uploads/ — consistent with uploads route.
 // UPLOADS_DIR env var lets VPS deployments point to a persistent directory that
 // survives redeploys and container restarts (e.g. /var/data/uploads or a mounted volume).
 const uploadsDir = process.env.UPLOADS_DIR?.trim()
@@ -136,8 +136,8 @@ app.use('/api/realtime', realtimeRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/imports', importsRoutes);
 
-// ── AI Image Processing proxy → Python FastAPI on port 8001 ──────────────────
-// The Python service must be running separately (backend/ai_service/start-ai-service.bat).
+// -- AI Image Processing proxy ? Python FastAPI on port 8001 ------------------
+// The Python service is auto-started by the backend on startup.
 // All /api/ai/* requests from the frontend are forwarded transparently.
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:8001';
 app.use(
@@ -148,14 +148,47 @@ app.use(
     onError: (_err: any, _req: any, res: any) => {
       res.status(503).json({
         success: false,
-        error: 'AI service unavailable. Start backend/ai_service/start-ai-service.bat',
+        error: 'AI service is starting up. Please retry in a few seconds.',
       });
     },
   })
 );
 
-// Bull Board queue monitoring dashboard â€” http://localhost:5000/admin/queues
-// âš ï¸  Protect with auth middleware in production.
+// Auto-start AI Python service in background
+function startAIService() {
+  const { spawn } = require('child_process');
+  const isWindows = process.platform === 'win32';
+  const aiServiceDir = path.resolve(backendRootDir, 'ai_service');
+
+  if (!fs.existsSync(path.join(aiServiceDir, 'main.py'))) {
+    console.warn('[AI Service] main.py not found, skipping auto-start');
+    return;
+  }
+
+  const cmd = isWindows ? 'python' : 'python3';
+  const proc = spawn(cmd, ['main.py'], {
+    cwd: aiServiceDir,
+    stdio: 'pipe',
+    detached: false,
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+  });
+
+  proc.stdout.on('data', (d: Buffer) => process.stdout.write(`[AI] ${d}`.replace(/\n/g, '\n[AI] ')));
+  proc.stderr.on('data', (d: Buffer) => process.stderr.write(`[AI] ${d}`.replace(/\n/g, '\n[AI] ')));
+  proc.on('exit', (code: number | null) => {
+    if (code !== 0 && code !== null) {
+      console.warn(`[AI Service] exited with code ${code}. Restarting in 5s...`);
+      setTimeout(startAIService, 5000);
+    }
+  });
+  proc.on('error', (err: Error) => {
+    console.warn('[AI Service] Failed to start:', err.message);
+  });
+  console.log('[AI Service] Auto-started on port 8001');
+}
+
+// Bull Board queue monitoring dashboard — http://localhost:5000/admin/queues
+// ⚠️  Protect with auth middleware in production.
 app.use('/admin/queues', bullBoardRouter);
 
 // API 404 handler
@@ -196,14 +229,14 @@ async function startServer() {
     // exist), but subsequent starts are instant (indexes already exist).
     try {
       await ProductTemplate.createIndexes();
-      console.log('âœ“ ProductTemplate indexes ready');
+      console.log('✓ ProductTemplate indexes ready');
     } catch (idxErr) {
       console.warn('! Index creation failed (non-fatal):', (idxErr as Error).message);
     }
 
     // --- AUTO SEED LOGIC: Insert default templates if none exist ---
     const templateCount = await ProductTemplate.countDocuments();
-    console.log(`âœ“ ProductTemplate count: ${templateCount}`);
+    console.log(`✓ ProductTemplate count: ${templateCount}`);
     if (templateCount === 0) {
       await ProductTemplate.insertMany([
         {
@@ -215,7 +248,7 @@ async function startServer() {
           tags: ['default'],
         }
       ]);
-      console.log('âœ“ Seeded default ProductTemplate');
+      console.log('✓ Seeded default ProductTemplate');
     }
 
     // --- MIGRATION: promote TRUE orphan templates (no owner at all) to isGlobal=true ---
@@ -228,13 +261,13 @@ async function startServer() {
         { $set: { isGlobal: true } },
       );
       if (promoted.modifiedCount > 0) {
-        console.log(`âœ“ Promoted ${promoted.modifiedCount} orphan template(s) to isGlobal=true`);
+        console.log(`✓ Promoted ${promoted.modifiedCount} orphan template(s) to isGlobal=true`);
       }
     } catch (migErr) {
       console.warn('! Could not promote orphan templates to global (non-fatal):', (migErr as Error).message);
     }
 
-    // Kick off gallery cache warmup in the background â€” it runs the slow Atlas document
+    // Kick off gallery cache warmup in the background — it runs the slow Atlas document
     // read after the server is already accepting traffic (non-blocking startup).
     // The first gallery request may still be slow if it arrives before the warmup finishes,
     // but the amber-banner + auto-retry in the frontend handles that gracefully.
@@ -243,7 +276,7 @@ async function startServer() {
       if (typeof warmGalleryCache === 'function') {
         warmGalleryCache().catch(() => {});
       } else {
-        console.warn('! warmGalleryCache not yet available â€” gallery cache will be warmed on next request.');
+        console.warn('! warmGalleryCache not yet available — gallery cache will be warmed on next request.');
       }
     });
 
@@ -255,7 +288,7 @@ async function startServer() {
         const totalTemplates = await ProductTemplate.countDocuments();
         const existingMetaCount = await TemplateGalleryMeta.countDocuments();
         if (existingMetaCount >= totalTemplates) {
-          console.log(`âœ“ TemplateGalleryMeta already populated (${existingMetaCount} records)`);
+          console.log(`✓ TemplateGalleryMeta already populated (${existingMetaCount} records)`);
           return;
         }
         console.log(`[migration] Populating TemplateGalleryMeta (${existingMetaCount}/${totalTemplates} done)...`);
@@ -287,12 +320,12 @@ async function startServer() {
               { upsert: true, new: false }
             );
             upserted++;
-            console.log(`[migration] âœ“ [${upserted}/${totalTemplates}] ${t.templateName}`);
+            console.log(`[migration] ✓ [${upserted}/${totalTemplates}] ${t.templateName}`);
           } catch (docErr) {
-            console.warn(`[migration] âœ— ${t.templateName}: ${(docErr as Error).message}`);
+            console.warn(`[migration] ✗ ${t.templateName}: ${(docErr as Error).message}`);
           }
         }
-        console.log(`âœ“ TemplateGalleryMeta migration done: ${upserted}/${totalTemplates} upserted`);
+        console.log(`✓ TemplateGalleryMeta migration done: ${upserted}/${totalTemplates} upserted`);
       } catch (migErr) {
         console.warn('! TemplateGalleryMeta migration failed (non-fatal):', (migErr as Error).message);
       }
@@ -304,20 +337,20 @@ async function startServer() {
       console.warn('! PostgreSQL auth config not found. Auth endpoints require PostgreSQL configuration.');
     }
     app.listen(PORT, () => {
-      console.log(`\nâœ“ Backend server running on http://localhost:${PORT}`);
+      console.log(`\n✓ Backend server running on http://localhost:${PORT}`);
       if (hasPostgresConfig()) {
-        console.log('âœ“ PostgreSQL auth database connected successfully');
+        console.log('✓ PostgreSQL auth database connected successfully');
       }
-      console.log(`âœ“ Serving uploads from: ${uploadsDir}`);
-      console.log(`âœ“ Serving images from: ${uploadsDir}`);
+      console.log(`✓ Serving uploads from: ${uploadsDir}`);
+      console.log(`✓ Serving images from: ${uploadsDir}`);
       if (fs.existsSync(frontendIndexPath)) {
-        console.log(`âœ“ Serving frontend build from: ${frontendDistDir}`);
+        console.log(`✓ Serving frontend build from: ${frontendDistDir}`);
       }
       if (studentPhotosDir && fs.existsSync(path.resolve(studentPhotosDir))) {
-        console.log(`âœ“ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
+        console.log(`✓ Uploads fallback from student photos: ${path.resolve(studentPhotosDir)}`);
       }
-      console.log(`âœ“ Uploads URL base: http://localhost:${PORT}/uploads/`);
-      console.log(`âœ“ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n  - /api/auth\n  - /api/preview\n`);
+      console.log(`✓ Uploads URL base: http://localhost:${PORT}/uploads/`);
+      console.log(`✓ API endpoints:\n  - GET /health\n  - /api/projects\n  - /api/clients\n  - /api/products\n  - /api/templates\n  - /api/orders\n  - /api/auth\n  - /api/preview\n`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
@@ -326,3 +359,4 @@ async function startServer() {
 }
 
 startServer();
+

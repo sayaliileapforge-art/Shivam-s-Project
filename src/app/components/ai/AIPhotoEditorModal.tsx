@@ -309,6 +309,20 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   // Keep settingsRef in sync on every render
   settingsRef.current = settings;
 
+  // ── AI service health check with retry ───────────────────────────────────
+  const waitForAIService = useCallback(async (maxWaitMs = 15000): Promise<boolean> => {
+    const interval = 1500;
+    const attempts = Math.ceil(maxWaitMs / interval);
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const res = await fetch("/api/ai/health", { signal: AbortSignal.timeout(3000) });
+        if (res.ok) return true;
+      } catch { /* still starting */ }
+      await new Promise((r) => setTimeout(r, interval));
+    }
+    return false;
+  }, []);
+
   // ── Upload current record to Phase 1 ─────────────────────────────────────
 
   const uploadForEditing = useCallback(async (rec: ProjectDataRecord) => {
@@ -323,6 +337,11 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
     setBatchDone(false);
 
     try {
+      // Health check with retry before attempting upload
+      const isUp = await waitForAIService(15000);
+      if (!isUp) {
+        throw new Error("__SERVICE_DOWN__");
+      }
       // For data: and blob: URLs we convert client-side.
       // For all other URLs (relative /uploads/... or absolute https://...) we pass the URL
       // to the Python service so it fetches the image server-side — this avoids CORS.
@@ -374,16 +393,22 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       }
     } catch (e: any) {
       const msg: string = e.message ?? "Failed to process image";
-      const isServiceDown = msg === "Failed to fetch" || msg.includes("NetworkError");
+      const isServiceDown = msg === "__SERVICE_DOWN__" || msg === "Failed to fetch" || msg.includes("NetworkError") || msg.includes("ECONNREFUSED");
       setError(
         isServiceDown
-          ? "AI service is not running. Start it with: cd backend/ai_service && python main.py"
+          ? "AI service is starting up. Retrying in 5 seconds…"
           : msg
       );
+      // Auto-retry once after 5s if service was down
+      if (isServiceDown) {
+        setTimeout(() => {
+          if (uploadForEditingRef.current) void uploadForEditingRef.current(rec);
+        }, 5000);
+      }
     } finally {
       setPhase1Loading(false);
     }
-  }, [getPhotoSrc, settings.cropMode, settings.padding, settings.headroom, settings.gfpgan]);
+  }, [getPhotoSrc, settings.cropMode, settings.padding, settings.headroom, settings.gfpgan, waitForAIService]);
 
   // Always keep ref in sync so composition debounce can call latest version
   uploadForEditingRef.current = uploadForEditing;
@@ -423,7 +448,13 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       } catch (err: any) {
         const msg: string = err?.message ?? "";
         if (msg === "Failed to fetch" || msg.includes("NetworkError") || msg.includes("ECONNREFUSED")) {
-          toast.error("AI service is offline. Run: cd backend/ai_service && python main.py");
+          toast.error("AI service offline — auto-retrying in 5s");
+          setTimeout(() => {
+            if (uploadForEditingRef.current) {
+              const rec = recordsWithPhoto[selectedRecordIdx];
+              if (rec) void uploadForEditingRef.current(rec);
+            }
+          }, 5000);
         } else {
           toast.error(`Render error: ${msg}`);
         }
