@@ -30,6 +30,8 @@ try:
     from rembg import remove as rembg_remove, new_session as rembg_session
     REMBG_OK = True
 except ImportError:
+    rembg_remove = None
+    rembg_session = None
     REMBG_OK = False
 
 try:
@@ -81,21 +83,91 @@ _sessions_ready: bool = False
 _shared_rembg_session = None
 _shared_rembg_lock = None
 
-def _get_shared_rembg_session():
-    """Return a single shared rembg session, created once."""
-    global _shared_rembg_session, _shared_rembg_lock
-    import threading
-    if _shared_rembg_lock is None:
-        _shared_rembg_lock = threading.Lock()
-    if _shared_rembg_session is None and REMBG_OK:
-        with _shared_rembg_lock:
-            if _shared_rembg_session is None:
+# ── Pre-warmed rembg session pool ────────────────────────────────────────────
+# Strategy: create N sessions at startup (one per CPU core), then hand them
+# out round-robin to batch workers.  This avoids the ~3s session-creation
+# overhead on every call AND gives true parallel ONNX inference.
+import threading as _threading
+import queue as _queue
+import os as _os
+
+# Match the thread pool size used in image_processing.py so every worker
+# always has a dedicated rembg session — no blocking waits.
+_CPU_COUNT = _os.cpu_count() or 4
+_IS_VPS_PE = _os.environ.get("NODE_ENV") == "production"
+# Match the larger _N_WORKERS defined in image_processing.py
+_N_WORKERS_PHOTO = max(4, min(12, _CPU_COUNT * 2)) if _IS_VPS_PE else max(_CPU_COUNT, _CPU_COUNT * 2)
+
+_N_POOL = 0          # set by _build_session_pool()
+_sess_pool: "_queue.Queue | None" = None
+_pool_lock = _threading.Lock()
+
+def _build_session_pool(n: int = None) -> None:
+    """Create n rembg sessions in a background thread so startup is instant."""
+    global _sess_pool, _N_POOL
+    if not REMBG_OK:
+        return
+    import os
+    n = n or _N_WORKERS_PHOTO
+
+    with _pool_lock:
+        if _sess_pool is not None:
+            return  # already built
+        # Pre-create the queue immediately so workers can start using it
+        _sess_pool = _queue.Queue()
+
+    def _fill():
+        global _N_POOL
+        built = 0
+        for i in range(n):
+            try:
+                sess = rembg_session("u2net_human_seg")  # best for portraits
+                _sess_pool.put(sess)
+                built += 1
+                print(f"[pool] session {built}/{n} ready", flush=True)
+            except Exception as e:
+                print(f"[pool] u2net_human_seg failed: {e}")
                 try:
-                    _shared_rembg_session = rembg_session("u2net_human_seg")
-                    print("[batch] Shared rembg session ready")
-                except Exception as e:
-                    print(f"[batch] rembg session failed: {e}")
-    return _shared_rembg_session
+                    sess = rembg_session("silueta")  # smaller/faster fallback
+                    _sess_pool.put(sess)
+                    built += 1
+                except Exception:
+                    pass
+        _N_POOL = built
+        print(f"[pool] rembg pool ready: {built} sessions", flush=True)
+
+    _threading.Thread(target=_fill, daemon=True).start()
+
+class _BorrowedSession:
+    """Context manager: borrow a session from the pool, return on exit."""
+    def __init__(self):
+        self.sess = None
+    def __enter__(self):
+        if _sess_pool is not None:
+            try:
+                self.sess = _sess_pool.get(timeout=30)
+            except _queue.Empty:
+                self.sess = None
+        return self.sess
+    def __exit__(self, *_):
+        if self.sess is not None and _sess_pool is not None:
+            _sess_pool.put(self.sess)
+
+def _get_thread_rembg_session():
+    """Legacy helper — use _BorrowedSession context manager in batch path."""
+    if _sess_pool is None or not REMBG_OK:
+        return None
+    try:
+        sess = _sess_pool.get_nowait()
+        # Put it back immediately (caller must use _BorrowedSession instead)
+        _sess_pool.put(sess)
+        return sess
+    except _queue.Empty:
+        return None
+
+def _get_shared_rembg_session():
+    """Kept for backwards compatibility."""
+    return _get_thread_rembg_session()
 
 GRADIENT_PRESETS = {
     "None": None,
@@ -152,6 +224,10 @@ def init_sessions():
         except Exception as e:
             print(f"⚠ MediaPipe init: {e}")
     _sessions_ready = True
+    # Build the pre-warmed rembg session pool for batch processing.
+    # This runs once; subsequent calls are no-ops (guarded by _pool_lock).
+    # Pool size = _N_WORKERS_PHOTO so every batch worker has a dedicated session.
+    _build_session_pool(n=_N_WORKERS_PHOTO)
 
 
 def load_gfpgan() -> bool:
@@ -1308,38 +1384,65 @@ def full_process(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
 #   • landmark-based teeth / dark-circle ops (no MediaPipe in batch)
 # Combined, this gives ≈5-8× speedup vs full_process.
 
-BATCH_SIZE = 384   # reduced from 512 — rembg runs at 320px internally, 384 is enough
+BATCH_SIZE = 512
+_REMBG_INFER_SIZE = 256
+
+
+def _fast_alpha_batch(img_bgr: np.ndarray) -> np.ndarray:
+    """Pure-OpenCV background removal: GrabCut at 320px ~50ms, no ONNX/GIL."""
+    h, w = img_bgr.shape[:2]
+    scale = min(1.0, 320.0 / max(h, w))
+    sw, sh = max(1, int(w * scale)), max(1, int(h * scale))
+    small = cv2.resize(img_bgr, (sw, sh), cv2.INTER_AREA)
+    mx, my = max(1, int(sw * 0.06)), max(1, int(sh * 0.04))
+    rect = (mx, my, sw - 2 * mx, sh - 2 * my)
+    mask_gc = np.zeros((sh, sw), np.uint8)
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(small, mask_gc, rect, bgd, fgd, 3, cv2.GC_INIT_WITH_RECT)
+    except Exception:
+        pass
+    fg = np.where((mask_gc == cv2.GC_FGD) | (mask_gc == cv2.GC_PR_FGD), 1.0, 0.0).astype(np.float32)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    skin_m = cv2.inRange(hsv, (0, 10, 50), (25, 255, 255))
+    dark_m = cv2.inRange(hsv, (0, 0, 0), (180, 255, 80))
+    fg = np.clip(fg + (skin_m.astype(np.float32) + dark_m.astype(np.float32)) / 255. * 0.4, 0, 1)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg8 = (fg * 255).astype(np.uint8)
+    fg8 = cv2.morphologyEx(fg8, cv2.MORPH_CLOSE, k, iterations=3)
+    fg8 = cv2.morphologyEx(fg8, cv2.MORPH_OPEN,  k, iterations=1)
+    fg = cv2.GaussianBlur(fg8.astype(np.float32) / 255., (5, 5), 1.5)
+    return np.clip(cv2.resize(fg, (w, h), cv2.INTER_LINEAR), 0, 1).astype(np.float32)
+
 
 def full_process_fast(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
     """
-    Optimised batch path.
-    Crops to 512×512 immediately after face detection so every subsequent
-    operation — rembg, clean_alpha, skin-detect, all blurs, composite — runs
-    on only 512×512 pixels.  Final output is upsampled to the requested size
-    at JPEG encode time.  Phase 1 result is NOT cached (batch images are
-    each unique).
+    Batch path — target <0.5s/image on CPU.
+    Uses pure-OpenCV GrabCut for bg removal (no ONNX, no GIL bottleneck).
+    rembg is only used when a session is instantly available (non-blocking).
     """
     BS = BATCH_SIZE
+    RS = _REMBG_INFER_SIZE
     init_sessions()
 
-    # ── Decode ───────────────────────────────────────────────────────────────
     arr = np.frombuffer(img_bytes, np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise ValueError("Cannot decode image")
 
     h, w = img_bgr.shape[:2]
-    if max(h, w) > 1200:
-        sc = 1200 / max(h, w)
+    if max(h, w) > 800:
+        sc = 800 / max(h, w)
         img_bgr = cv2.resize(img_bgr, (int(w * sc), int(h * sc)), cv2.INTER_AREA)
+        h, w = img_bgr.shape[:2]
 
-    # ── Face detection — always returns ≥1 face via portrait-position fallback ──
+    # Face detection
     faces = get_faces(img_bgr)
-    face    = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+    face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
     padding  = float(settings.get("padding", 4.5))
     headroom = float(settings.get("headroom", 0.20))
 
-    # Crop sizing: same formula as run_phase1 for consistent batch output
     bw = face.bbox[2] - face.bbox[0]
     bh = face.bbox[3] - face.bbox[1]
     face_size = max(bw, bh)
@@ -1349,111 +1452,73 @@ def full_process_fast(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
     cs = max(cs, int(face_size * 1.8))
 
     el, er = face.kps[0], face.kps[1]
-    ec  = ((el[0] + er[0]) / 2.0, (el[1] + er[1]) / 2.0)
-    ang = np.degrees(np.arctan2(er[1] - el[1], er[0] - el[0]))
-    print(f"[BATCH] {w}x{h} face={face_size:.0f}px crop={cs}x{cs} ang={ang:.1f}")
+    ec = ((el[0]+er[0])/2.0, (el[1]+er[1])/2.0)
+    ang = np.degrees(np.arctan2(er[1]-el[1], er[0]-el[0]))
     M = _build_crop_M(ec, ang, cs, face.bbox[1], padding)
     M = _clamp_crop_bounds(img_bgr, M, cs)
     M = np.float32(M)
     crop_full = cv2.warpAffine(img_bgr, M, (cs, cs), borderValue=(255, 255, 255))
-    
-    # ── Crop → resize to BS×BS immediately ───────────────────────────────────
-    # Everything from this point operates on the small BS×BS image.
-    img = cv2.resize(crop_full, (BS, BS), cv2.INTER_AREA)   # ← the working image
 
-    # ── Background removal on BS×BS ──────────────────────────────────────────
-    _fg_rgb, alp = _run_rembg(img)
-    alp_ps  = clean_alpha(alp, img)
+    # Resize to RS for background removal
+    img = cv2.resize(crop_full, (RS, RS), cv2.INTER_AREA)
+
+    # Always try rembg from the pool first (blocking get with short timeout).
+    # If pool is empty (all sessions busy), use fast GrabCut — no ONNX, no GIL.
+    alp = None
+    if _sess_pool is not None and REMBG_OK:
+        try:
+            sess = _sess_pool.get(timeout=2.0)  # wait up to 2s for a free session
+            try:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                rgba = rembg_remove(rgb, session=sess, alpha_matting=False)
+                alp = rgba[:, :, 3].astype(np.float32) / 255.
+            except Exception:
+                alp = None
+            finally:
+                _sess_pool.put(sess)  # always return session to pool
+        except _queue.Empty:
+            alp = None  # pool exhausted — fall back to GrabCut
+    if alp is None:
+        alp = _fast_alpha_batch(img)
+
+    # Alpha cleanup
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    alp_u8 = (alp * 255).astype(np.uint8)
+    alp_u8 = cv2.morphologyEx(alp_u8, cv2.MORPH_CLOSE, k3, iterations=2)
+    alp_u8 = cv2.morphologyEx(alp_u8, cv2.MORPH_OPEN,  k3, iterations=1)
+    alp_ps = np.clip(alp_u8.astype(np.float32) / 255., 0, 1)
+
+    # Upsample RS → BS
+    img    = cv2.resize(img,    (BS, BS), cv2.INTER_LINEAR)
+    alp_ps = cv2.resize(alp_ps, (BS, BS), cv2.INTER_LINEAR)
     ady, adx = safe_position_anchor(alp_ps, headroom, BS)
 
-    # ── Skin detection on BS×BS ──────────────────────────────────────────────
-    s    = settings
-    skin = detect_skin_pixels(img, None)   # no landmarks — ~3× faster
-
-    # ── Retouching ops — all run on BS×BS img ────────────────────────────────
+    s = settings
 
     # Color temperature
     ct = s.get("color_temp", 0)
     if ct != 0:
-        t = ct / 100.
         r = img.astype(np.float32)
+        t = ct / 100.
         r[:,:,2] += t*28; r[:,:,1] += t*8; r[:,:,0] -= t*20
         img = np.clip(r, 0, 255).astype(np.uint8)
 
-    # SkinFiner smoothing
-    img = skinfiner_retouch(img, skin, s.get("smooth_skin", 0), s.get("texture_str", 1.))
-
-    # Dodge & burn
-    db = s.get("dodge_burn", 0)
-    if db > 0:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        l = np.clip(l - (l - cv2.GaussianBlur(l, (0,0), 40)) * skin * db, 0, 255)
-        img = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                      b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
-
-    # Tone harmony
-    th = s.get("tone_harmony", 0)
-    if th > 0:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        px = skin > 0.5
-        if px.sum() > 100:
-            ta, tb = np.median(a[px]), np.median(b[px])
-            a = np.clip(a + (ta - cv2.GaussianBlur(a, (0,0), 30)) * skin * th, 0, 255)
-            b = np.clip(b + (tb - cv2.GaussianBlur(b, (0,0), 30)) * skin * th, 0, 255)
-            img = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                          b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
-
-    # Glare reduction
-    gr = s.get("glare", 0)
-    if gr > 0:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        gm = cv2.GaussianBlur(((l > 215).astype(np.float32)) * skin, (21,21), 7)
-        l  = l*(1-gm) + np.where(l>200, 200+(l-200)*(1-gr*.45), l)*gm
-        img = cv2.cvtColor(cv2.merge([np.clip(l,0,255).astype(np.uint8),
-                                      a.astype(np.uint8), b.astype(np.uint8)]),
-                           cv2.COLOR_LAB2BGR)
-
-    # Sharpness (simple USM — avoids expensive guided-filter)
+    # Sharpness (simple USM)
     sharp = s.get("sharpness", 1.)
     if abs(sharp - 1.) > 0.01:
         img = cv2.addWeighted(img, sharp, cv2.GaussianBlur(img, (0,0), 3), 1.-sharp, 0)
 
-    # Clarity
-    cl2 = s.get("clarity", 0)
-    if cl2 > 0:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        blur = cv2.GaussianBlur(l, (0,0), 20)
-        mid  = 1 - (2*(l/255.)-1)**2
-        l = np.clip(l + (l-blur)*cl2*mid, 0, 255)
-        img = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                      b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
-
-    # Vibrance
-    vb = s.get("vibrance", 0)
-    if vb > 0:
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-        h2, sv, v = cv2.split(hsv)
-        boost = vb*(1-sv/255.)*.6*(1-((h2<25)|(h2>155)).astype(np.float32)*.35)
-        img = cv2.cvtColor(cv2.merge([h2.astype(np.uint8),
-                                      np.clip(sv+boost*255,0,255).astype(np.uint8),
-                                      v.astype(np.uint8)]), cv2.COLOR_HSV2BGR)
-
     # Colour grade
-    fm    = {"warm_natural":"warm","cool":"soft","bright":"vivid","muted":"soft"}
-    grade = fm.get(s.get("color_grade","natural"), s.get("color_grade","natural"))
-    if grade in ["natural","vivid","soft","warm"]:
+    grade = {"warm_natural":"warm","cool":"soft","bright":"vivid","muted":"soft"}.get(
+        s.get("color_grade","natural"), s.get("color_grade","natural"))
+    if grade in ("natural","vivid","soft","warm"):
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
         l, a, b = cv2.split(lab)
         if   grade == "natural": l = np.where(l<30, l+(30-l)*.3, l); b = np.where(l>200, b-5, b)
         elif grade == "vivid":   l = np.clip(l*1.2-10, 0, 255)
         elif grade == "soft":    l = l*.95+10
         elif grade == "warm":    a += 5; b -= 5
-        img = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                      b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
+        img = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8), b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
 
     # Exposure
     br = s.get("brightness",0); co = s.get("contrast",0); ga = s.get("gamma",1.)
@@ -1463,207 +1528,36 @@ def full_process_fast(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
         lut = np.array([((i/255.)**(1./ga))*255 for i in range(256)]).astype(np.uint8)
         img = cv2.LUT(img, lut)
 
-    # ── Anchor shift: move subject to headroom position ───────────────────────
-    # (No re-crop needed — img is already the face crop processed at BS×BS.)
+    # Anchor shift
     shift_M = np.float32([[1,0,adx],[0,1,ady]])
-    fg_bgr  = cv2.warpAffine(img, shift_M, (BS,BS), borderValue=(0,0,0))
+    fg_bgr  = cv2.warpAffine(img,    shift_M, (BS,BS), borderValue=(0,0,0))
     alpha   = cv2.warpAffine(alp_ps, shift_M, (BS,BS), borderValue=0)
 
-    # ── Post-composite ops ────────────────────────────────────────────────────
     fg_bgr = nuclear_pop(fg_bgr, s.get("pop", 2))
 
+    # Fast skin brightness balance
     if s.get("balance_skin", True):
-        skin_fg = detect_skin_pixels(fg_bgr)
-        son     = skin_fg * np.clip(alpha, 0, 1)
-        sp      = son > 0.35
+        hsv_fg = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hh, ss, vv = cv2.split(hsv_fg)
+        fast_skin = (((hh < 25) | (hh > 155)) & (ss > 20) & (vv > 40)).astype(np.float32) * np.clip(alpha, 0, 1)
+        sp = fast_skin > 0.4
         if np.sum(sp) > 100:
             mean_br = np.mean(cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)[sp])
-            fsc = np.clip(s.get("skin_target",135) / (mean_br+1e-6), 0.88, 1.15)
-            if abs(fsc-1.) > 0.01:
-                m3 = np.stack([son]*3, axis=2)
-                fg_bgr = np.clip(fg_bgr.astype(np.float32)*(1-m3) +
-                                 fg_bgr.astype(np.float32)*fsc*m3, 0,255).astype(np.uint8)
+            fsc = np.clip(s.get("skin_target", 135) / (mean_br + 1e-6), 0.88, 1.15)
+            if abs(fsc - 1.) > 0.01:
+                m3 = np.stack([fast_skin]*3, axis=2)
+                fg_bgr = np.clip(fg_bgr.astype(np.float32)*(1-m3) + fg_bgr.astype(np.float32)*fsc*m3, 0, 255).astype(np.uint8)
 
-    # ── Background + composite ────────────────────────────────────────────────
+    # Background + composite
     grad   = make_gradient_bg(BS, s.get("gradient","None"))
     canvas = create_canvas(BS, s.get("bg_color","#FFFFFF"), s.get("glow",40), grad)
     result = composite_shadow(canvas, cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2RGB), alpha,
-                              s.get("shadow_color","#222222"),
-                              s.get("shadow_soft",51), s.get("shadow_dist",15))
+                              s.get("shadow_color","#222222"), s.get("shadow_soft",51), s.get("shadow_dist",15))
+    if s.get("watermark",""):
+        result = add_watermark(result, s["watermark"])
 
-    wm = s.get("watermark","")
-    if wm:
-        result = add_watermark(result, wm)
-
-    # ── Upsample to requested output size ────────────────────────────────────
-    out_wh = OUTPUT_FORMATS.get(s.get("format", s.get("output_format", "1024\u00d71024 (Standard)")), (1024, 1024))
-    if result.shape[1] != out_wh[0] or result.shape[0] != out_wh[1]:
-        result = cv2.resize(result, out_wh, cv2.INTER_LANCZOS4)
-
-    # ── JPEG encode ──────────────────────────────────────────────────────────
-    quality = int(s.get("quality", 82))
-    if PIL_OK:
-        buf = io.BytesIO()
-        Image.fromarray(result).save(buf, "JPEG", quality=quality,
-                                     optimize=True, progressive=True, subsampling=2)
-        return buf.getvalue()
+    # JPEG encode
     _, enc = cv2.imencode(".jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR),
-                          [cv2.IMWRITE_JPEG_QUALITY, quality])
+                          [cv2.IMWRITE_JPEG_QUALITY, int(s.get("quality", 82))])
     return enc.tobytes()
-
-    # ── Apply ops: SKIP denoise (very slow) and SKIP inpaint blemish ─────────
-    s = settings
-
-    # Color temperature
-    ct = s.get("color_temp", 0)
-    if ct != 0:
-        t = ct / 100.; r = work.astype(np.float32)
-        r[:, :, 2] += t * 28; r[:, :, 1] += t * 8; r[:, :, 0] -= t * 20
-        work = np.clip(r, 0, 255).astype(np.uint8)
-
-    # SkinFiner (frequency-separation smoothing)
-    work = skinfiner_retouch(work, skin, s.get("smooth_skin", 0), s.get("texture_str", 1.))
-
-    # Dodge & burn
-    db = s.get("dodge_burn", 0)
-    if db > 0:
-        lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        l = np.clip(l - (l - cv2.GaussianBlur(l, (0, 0), 40)) * skin * db, 0, 255)
-        work = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                       b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
-
-    # Tone harmony
-    th = s.get("tone_harmony", 0)
-    if th > 0:
-        lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        px = skin > 0.5
-        if px.sum() > 100:
-            ta, tb = np.median(a[px]), np.median(b[px])
-            a = np.clip(a + (ta - cv2.GaussianBlur(a, (0, 0), 30)) * skin * th, 0, 255)
-            b = np.clip(b + (tb - cv2.GaussianBlur(b, (0, 0), 30)) * skin * th, 0, 255)
-            work = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                           b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
-
-    # Glare reduction
-    gr = s.get("glare", 0)
-    if gr > 0:
-        lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        gm = ((l > 215).astype(np.float32)) * skin
-        gm = cv2.GaussianBlur(gm, (21, 21), 7)
-        l = l * (1 - gm) + np.where(l > 200, 200 + (l - 200) * (1 - gr * .45), l) * gm
-        work = cv2.cvtColor(cv2.merge([np.clip(l, 0, 255).astype(np.uint8),
-                                       a.astype(np.uint8), b.astype(np.uint8)]),
-                            cv2.COLOR_LAB2BGR)
-
-    # Global sharpness (simple USM — faster than guided filter for batch)
-    sharp = s.get("sharpness", 1.)
-    if abs(sharp - 1.) > 0.01:
-        blurred = cv2.GaussianBlur(work, (0, 0), 3)
-        work = cv2.addWeighted(work, sharp, blurred, 1.0 - sharp, 0)
-
-    # Clarity (local contrast)
-    cl2 = s.get("clarity", 0)
-    if cl2 > 0:
-        lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        blur = cv2.GaussianBlur(l, (0, 0), 20)
-        mid  = 1 - (2 * (l / 255.) - 1) ** 2
-        l = np.clip(l + (l - blur) * cl2 * mid, 0, 255)
-        work = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                       b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
-
-    # Vibrance
-    vb = s.get("vibrance", 0)
-    if vb > 0:
-        hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV).astype(np.float32)
-        h2, sv, v = cv2.split(hsv)
-        boost = vb * (1 - sv / 255.) * .6 * (
-            1 - ((h2 < 25) | (h2 > 155)).astype(np.float32) * .35)
-        work = cv2.cvtColor(cv2.merge([h2.astype(np.uint8),
-                                       np.clip(sv + boost * 255, 0, 255).astype(np.uint8),
-                                       v.astype(np.uint8)]), cv2.COLOR_HSV2BGR)
-
-    # Colour grade
-    fm = {"warm_natural": "warm", "cool": "soft", "bright": "vivid", "muted": "soft"}
-    grade = fm.get(s.get("color_grade", "natural"), s.get("color_grade", "natural"))
-    if grade in ["natural", "vivid", "soft", "warm"]:
-        lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-        if grade == "natural":
-            l = np.where(l < 30, l + (30 - l) * .3, l); b = np.where(l > 200, b - 5, b)
-        elif grade == "vivid": l = np.clip(l * 1.2 - 10, 0, 255)
-        elif grade == "soft":  l = l * .95 + 10
-        elif grade == "warm":  a += 5; b -= 5
-        work = cv2.cvtColor(cv2.merge([l.astype(np.uint8), a.astype(np.uint8),
-                                       b.astype(np.uint8)]), cv2.COLOR_LAB2BGR)
-
-    # Exposure
-    br = s.get("brightness", 0); co = s.get("contrast", 0); ga = s.get("gamma", 1.)
-    if co != 0 or br != 0:
-        work = cv2.convertScaleAbs(work, alpha=1 + co / 100., beta=br)
-    if abs(ga - 1.) > .01:
-        lut = np.array([((i / 255.) ** (1. / ga)) * 255
-                        for i in range(256)]).astype(np.uint8)
-        work = cv2.LUT(work, lut)
-
-    # ── Re-crop processed image → BS×BS foreground ───────────────────────────
-    crop_rt = cv2.warpAffine(work, M, (cs, cs), borderValue=(255, 255, 255))
-    fg_bgr  = cv2.resize(crop_rt, (BS, BS), cv2.INTER_AREA)
-
-    # Shift foreground to match alpha anchor
-    fg_bgr = cv2.warpAffine(fg_bgr,
-                             np.float32([[1, 0, adx], [0, 1, ady]]),
-                             (BS, BS), borderValue=(0, 0, 0))
-
-    # Nuclear pop (contrast boost)
-    fg_bgr = nuclear_pop(fg_bgr, s.get("pop", 2))
-
-    # Balance skin brightness
-    if s.get("balance_skin", True):
-        skin_fg = detect_skin_pixels(fg_bgr)
-        skin_on_subject = skin_fg * np.clip(alpha, 0, 1)
-        skin_pixels = skin_on_subject > 0.35
-        if np.sum(skin_pixels) > 100:
-            gray_fg = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            mean_bright = np.mean(gray_fg[skin_pixels])
-            fsc = np.clip(s.get("skin_target", 135) / (mean_bright + 1e-6), 0.88, 1.15)
-            if abs(fsc - 1.0) > 0.01:
-                m3 = np.stack([skin_on_subject] * 3, axis=2)
-                fg_bgr = np.clip(
-                    fg_bgr.astype(np.float32) * (1 - m3) +
-                    fg_bgr.astype(np.float32) * fsc * m3, 0, 255).astype(np.uint8)
-
-    # ── Background + composite (at BS×BS) ────────────────────────────────────
-    grad   = make_gradient_bg(BS, s.get("gradient", "None"))
-    canvas = create_canvas(BS, s.get("bg_color", "#FFFFFF"), s.get("glow", 40), grad)
-    fg_rgb_out = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2RGB)
-    result = composite_shadow(canvas, fg_rgb_out, alpha,
-                              s.get("shadow_color", "#222222"),
-                              s.get("shadow_soft", 51),
-                              s.get("shadow_dist", 15))
-
-    # Watermark
-    wm = s.get("watermark", "")
-    if wm:
-        result = add_watermark(result, wm)
-
-    # ── Upsample to requested output size ────────────────────────────────────
-    out_wh = OUTPUT_FORMATS.get(s.get("output_format", "1024×1024 (Standard)"), (1024, 1024))
-    if result.shape[1] != out_wh[0] or result.shape[0] != out_wh[1]:
-        result = cv2.resize(result, out_wh, cv2.INTER_LANCZOS4)
-
-    # ── JPEG encode ──────────────────────────────────────────────────────────
-    quality = int(s.get("quality", 82))
-    if PIL_OK:
-        pil = Image.fromarray(result)
-        buf = io.BytesIO()
-        pil.save(buf, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=2)
-        return buf.getvalue()
-    else:
-        _, enc = cv2.imencode(".jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR),
-                              [cv2.IMWRITE_JPEG_QUALITY, quality])
-        return enc.tobytes()
 

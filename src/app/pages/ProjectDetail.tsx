@@ -1396,11 +1396,19 @@ export function ProjectDetail() {
       const normalized: ProjectDataRecord[] = remote.map((record, idx) => {
         const rawId = String((record as Record<string, unknown>).id ?? "").trim();
         const safeId = rawId || `REC-${Date.now()}-${idx}`;
+        // Preserve any photo already set in localStorage (e.g. just applied via bulk upload).
+        // The backend may not yet have the photo field if saveProjectRecords is still in-flight.
+        const localRecords = loadDataRecords(id, dataCategory);
+        const existingLocal = localRecords.find((r) => String(r.id ?? '').trim() === safeId);
+        const incomingPhoto = (record as Record<string, unknown>).photo as string | undefined;
+        const localPhoto = existingLocal?.photo as string | undefined;
+        const resolvedPhoto = incomingPhoto || localPhoto;
         return {
           ...record,
           id: safeId,
           projectId: id,
           category: dataCategory,
+          ...(resolvedPhoto ? { photo: resolvedPhoto } : {}),
         } as ProjectDataRecord;
       });
 
@@ -1733,11 +1741,18 @@ export function ProjectDetail() {
           const normalizedKey = h.toLowerCase().replace(/[\s_-]/g, '');
           const isPhotoKey = ['photo', 'link', 'image', 'picture', 'profilepic', 'avatar', 'profilepicture', 'profileimage', 'studentphoto', 'photourl', 'imageurl', 'pictureurl'].includes(normalizedKey);
           if (isPhotoKey) {
-            // Preserve bare filenames for exact bulk-upload matching.
-            // Discard full URLs (http://…) — they are external links, not filenames.
             const raw = (vals[idx] ?? '').trim();
-            if (raw && !raw.includes('://') && !raw.startsWith('/') && normalizedKey !== 'link') {
-              rec['_photoFilename'] = raw;
+            if (raw && normalizedKey !== 'link') {
+              if (raw.includes('://')) {
+                // Absolute URL — store directly so avatar renders it.
+                rec['photo'] = raw;
+                // Also store the bare filename so bulk-upload exact matching works.
+                const basename = raw.split('/').pop()?.trim();
+                if (basename) rec['_photoFilename'] = basename;
+              } else if (!raw.startsWith('/')) {
+                // Bare filename — preserve for exact bulk-upload matching.
+                rec['_photoFilename'] = raw;
+              }
             }
             return;
           }
@@ -1955,12 +1970,31 @@ export function ProjectDetail() {
   // ── Shared helper: apply photo/barcode updates from AI modals ───────────────
   const applyPhotoUpdates = (updates: Array<{ id: string; photo: string }>) => {
     if (!id || !updates.length) return;
+    // Bump generation BEFORE anything else so any in-flight hydrateFromBackend
+    // (or one that starts after this) sees the mismatch and discards stale data.
+    hydrateGenerationRef.current += 1;
+    const generation = hydrateGenerationRef.current;
+    const updMap = new Map(updates.map((u) => [u.id, u.photo]));
     const updated = dataRecords.map((r) => {
-      const upd = updates.find((u) => u.id === r.id);
-      return upd ? { ...r, photo: upd.photo } : r;
+      const photo = updMap.get(r.id);
+      if (!photo) return r;
+      // Only set the primary `photo` field — avoid bloating every record with
+      // 14 redundant copies that inflate the payload and localStorage.
+      // getRecordPhoto() checks `rec.photo` which is always set here.
+      return { ...r, photo };
     });
-    persistDataRecords(updated);
-    toast.success(`Updated ${updates.length} photo${updates.length !== 1 ? "s" : ""}`);
+    // Update React state immediately so the UI reflects photos right away.
+    setDataRecords(updated);
+    // Persist to localStorage synchronously so a page refresh also shows photos.
+    if (id) saveDataRecords(id, dataCategory, updated);
+    // Sync to backend asynchronously; keep generation locked so hydration won't overwrite.
+    void saveProjectRecords(id, dataCategory, updated).then((ok) => {
+      if (!ok) console.warn('[ProjectDetail] applyPhotoUpdates: backend sync failed; local copy kept.');
+      // After backend save succeeds, bump generation again so that any
+      // subsequent hydrateFromBackend triggered by other effects uses fresh data.
+      hydrateGenerationRef.current = generation + 1;
+    });
+    toast.success(`Applied ${updates.length} photo${updates.length !== 1 ? 's' : ''}`);
   };
 
   const applyBarcodeUpdates = (updates: Array<{ id: string; barcode: string }>) => {
@@ -2161,8 +2195,19 @@ export function ProjectDetail() {
         imageUrl: imageUrls[idx] || '/uploads/assets/default.jpg'
       }));
 
+      // Resolve each URL to an absolute URL before matching so that the photo
+      // stored in the record is always absolute. This prevents hydrateFromBackend
+      // from overwriting photos when the backend hasn’t persisted yet, and ensures
+      // the avatar <img> and the results preview both load from the correct origin.
+      const backendOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+      const resolveUrl = (url: string) => {
+        if (!url) return url;
+        if (url.startsWith('http')) return url;
+        return `${backendOrigin}${url.startsWith('/') ? '' : '/'}${url}`;
+      };
+
       const bulkResult = matchImages(
-        loaded.map(({ file, imageUrl }) => ({ name: file.name, dataUrl: imageUrl })),
+        loaded.map(({ file, imageUrl }) => ({ name: file.name, dataUrl: resolveUrl(imageUrl) })),
         dataRecords,
       );
 
@@ -2230,12 +2275,9 @@ export function ProjectDetail() {
 
   const handleApplyBulkImages = () => {
     if (!id || !bulkImageResults) return;
-    const updated = [...dataRecords];
-    bulkImageResults.matched.forEach(({ userId, imageUrl }) => {
-      const i = updated.findIndex((r) => r.id === userId);
-      if (i >= 0) updated[i] = { ...updated[i], photo: imageUrl };
-    });
-    persistDataRecords(updated);
+    applyPhotoUpdates(
+      bulkImageResults.matched.map(({ userId, imageUrl }) => ({ id: userId, photo: imageUrl }))
+    );
     setIsBulkImageUploadOpen(false);
     setBulkImageResults(null);
   };

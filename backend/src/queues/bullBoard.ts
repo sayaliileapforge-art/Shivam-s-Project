@@ -20,6 +20,7 @@
 import { Router }              from 'express';
 import { REDIS_ENABLED }       from '../redis/connection';
 import { bulkImportQueue }     from '../queues/bulkImportQueue';
+import { photoProcessingQueue } from '../queues/photoProcessingQueue';
 
 let bullBoardRouter: Router;
 
@@ -33,7 +34,10 @@ if (REDIS_ENABLED && bulkImportQueue) {
   serverAdapter.setBasePath('/admin/queues');
 
   createBullBoard({
-    queues: [new BullMQAdapter(bulkImportQueue)],
+    queues: [
+      new BullMQAdapter(bulkImportQueue),
+      ...(photoProcessingQueue ? [new BullMQAdapter(photoProcessingQueue)] : []),
+    ],
     serverAdapter,
   });
 

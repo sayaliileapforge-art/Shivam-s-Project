@@ -93,6 +93,15 @@ export function resolveProfileImageUrl(profilePic?: string): string {
     return raw.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i, '/');
   }
 
+  // Hostinger / VPS absolute URLs stored when SFTP was enabled:
+  // Rewrite to a relative path so the Vite proxy (dev) or same-origin Express
+  // (prod) serves the file from local disk — avoids ERR_CONNECTION_TIMED_OUT
+  // when the remote server is unreachable.
+  if (/^https?:\/\/72\.62\.241\.170\//i.test(raw)) {
+    // e.g. http://72.62.241.170/uploads/assets/FOO.jpg → /uploads/assets/FOO.jpg
+    return raw.replace(/^https?:\/\/72\.62\.241\.170//i, '/');
+  }
+
   // Other absolute URLs: return as-is (Hostinger SFTP absolute URL, CDN, etc.).
   if (/^https?:\/\//i.test(raw)) {
     return raw;

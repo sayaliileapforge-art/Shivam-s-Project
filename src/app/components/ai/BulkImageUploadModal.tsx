@@ -79,9 +79,17 @@ export function BulkImageUploadModal({ open, onClose, records, onApply }: BulkIm
       setProgressLabel("Matching images to records…");
 
       // ── Match images to student records ──────────────────────────────────
+      // Resolve relative paths to absolute URLs so the preview thumbnails
+      // and stored photo fields both work across origins / after hydration.
+      const backendOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+      const resolveUrl = (url: string) => {
+        if (!url || url.startsWith('http')) return url;
+        return `${backendOrigin}${url.startsWith('/') ? '' : '/'}${url}`;
+      };
+
       const loaded = imageFiles.map((file, idx) => ({
         name: file.name,
-        dataUrl: imageUrls[idx] || "/uploads/assets/default.jpg",
+        dataUrl: resolveUrl(imageUrls[idx] || "/uploads/assets/default.jpg"),
       }));
 
       const bulkResult = matchImages(loaded, records);

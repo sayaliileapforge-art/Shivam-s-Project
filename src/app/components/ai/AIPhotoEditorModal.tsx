@@ -35,12 +35,24 @@ import { API_BASE, uploadImages } from "../../../lib/apiService";
 import { toast } from "sonner";
 
 // Derive the Express backend origin — always an absolute URL so the Python
-// service can fetch images server-side. Falls back to window.location.origin
-// when API_BASE is a relative path (same-origin production deploy).
+// service can fetch images server-side.
+// In development, uploads are served by Express on port 5000, NOT the Vite
+// dev server on port 5173. Using window.location.origin here would point to
+// Vite (5173) which doesn't serve /uploads/, causing WinError 10060 in Python.
 const BACKEND_ORIGIN = (() => {
   const stripped = API_BASE.replace(/\/api\/?$/, "");
   if (stripped.startsWith("http")) return stripped;
-  return typeof window !== "undefined" ? window.location.origin : "";
+  // In dev: API_BASE is '/api' (relative), so stripped is '' or '/'
+  // Force port 5000 (Express) so Python can fetch /uploads/* files.
+  if (typeof window !== "undefined") {
+    const loc = window.location;
+    // If frontend is on 5173 (Vite dev), backend is always on 5000
+    if (loc.port === "5173" || loc.port === "5174" || loc.port === "5175") {
+      return `${loc.protocol}//${loc.hostname}:5000`;
+    }
+    return loc.origin;
+  }
+  return "";
 })();
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -288,6 +300,11 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   const [batchFailedCount, setBatchFailedCount] = useState(0);
   const [batchEta, setBatchEta] = useState<number | null>(null);
   const [batchFailedItems, setBatchFailedItems] = useState<BatchTaskStatus["errors"]>([]);
+  // Use ref instead of state — 303 base64 strings in state causes OOM + re-render storm
+  const batchResultsRef = useRef<Array<{ id: string; photo: string }>>([]);
+  const [batchResultCount, setBatchResultCount] = useState(0);
+  const [batchUploadProgress, setBatchUploadProgress] = useState(0);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [batchResults, setBatchResults] = useState<Array<{ id: string; photo: string }>>([]);
   const [batchDone, setBatchDone] = useState(false);
   const [batchUploading, setBatchUploading] = useState(false);
@@ -309,16 +326,16 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   // Keep settingsRef in sync on every render
   settingsRef.current = settings;
 
-  // ── AI service health check with retry ───────────────────────────────────
-  const waitForAIService = useCallback(async (maxWaitMs = 15000): Promise<boolean> => {
-    const interval = 1500;
+  // ── AI service health check (single attempt, fast) ────────────────────────
+  const waitForAIService = useCallback(async (maxWaitMs = 30000): Promise<boolean> => {
+    const interval = 2000;
     const attempts = Math.ceil(maxWaitMs / interval);
     for (let i = 0; i < attempts; i++) {
       try {
-        const res = await fetch("/api/ai/health", { signal: AbortSignal.timeout(3000) });
+        const res = await fetch("/api/ai/health", { signal: AbortSignal.timeout(4000) });
         if (res.ok) return true;
       } catch { /* still starting */ }
-      await new Promise((r) => setTimeout(r, interval));
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, interval));
     }
     return false;
   }, []);
@@ -346,7 +363,6 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       // For all other URLs (relative /uploads/... or absolute https://...) we pass the URL
       // to the Python service so it fetches the image server-side — this avoids CORS.
       let file: File | null = null;
-      let imageUrl: string | undefined;
 
       if (src.startsWith("data:")) {
         const [header, b64] = src.split(",");
@@ -360,12 +376,24 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
         const blob = await res.blob();
         file = new File([blob], `photo_${rec.id}.jpg`, { type: blob.type || "image/jpeg" });
       } else {
-        // Relative path → make absolute so Python can fetch it from the Express backend
-        imageUrl = src.startsWith("/") ? `${BACKEND_ORIGIN}${src}` : src;
+        // Use the relative URL so the Vite proxy forwards the request to Express
+        // (localhost:5000). Direct cross-origin fetch from 5173→5000 can fail in
+        // Chrome on Windows even when CORS headers are present.
+        const relativeUrl = src.startsWith("http")
+          ? src  // already absolute (e.g. production URL) — use as-is
+          : src.startsWith("/") ? src : `/${src}`;
+        try {
+          const res = await fetch(relativeUrl, { cache: "no-store" });
+          if (!res.ok) throw new Error(`HTTP ${res.status} — ${relativeUrl}`);
+          const blob = await res.blob();
+          file = new File([blob], `photo_${rec.id}.jpg`, { type: blob.type || "image/jpeg" });
+        } catch (fetchErr: any) {
+          throw new Error(`Could not load photo: ${fetchErr.message}`);
+        }
       }
 
       const result = await photoEditorUpload(file, {
-        imageUrl,
+        imageUrl: undefined,
         mode: settings.cropMode,
         padding: settings.padding,
         headroom: settings.headroom,
@@ -396,15 +424,10 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       const isServiceDown = msg === "__SERVICE_DOWN__" || msg === "Failed to fetch" || msg.includes("NetworkError") || msg.includes("ECONNREFUSED");
       setError(
         isServiceDown
-          ? "AI service is starting up. Retrying in 5 seconds…"
+          ? "AI service is unavailable. Please ensure the Python service is running (port 8001), then click Retry."
           : msg
       );
-      // Auto-retry once after 5s if service was down
-      if (isServiceDown) {
-        setTimeout(() => {
-          if (uploadForEditingRef.current) void uploadForEditingRef.current(rec);
-        }, 5000);
-      }
+      // No auto-retry — user must click Retry manually to avoid infinite loops
     } finally {
       setPhase1Loading(false);
     }
@@ -448,13 +471,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       } catch (err: any) {
         const msg: string = err?.message ?? "";
         if (msg === "Failed to fetch" || msg.includes("NetworkError") || msg.includes("ECONNREFUSED")) {
-          toast.error("AI service offline — auto-retrying in 5s");
-          setTimeout(() => {
-            if (uploadForEditingRef.current) {
-              const rec = recordsWithPhoto[selectedRecordIdx];
-              if (rec) void uploadForEditingRef.current(rec);
-            }
-          }, 5000);
+          toast.error("AI service offline. Please restart the Python service and click Reprocess.");
         } else {
           toast.error(`Render error: ${msg}`);
         }
@@ -508,40 +525,84 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   // parallel (asyncio.gather + ThreadPoolExecutor) and the frontend polls for
   // per-image progress every 1.5 s, displaying name, ETA, success/fail counts.
 
-  /** Resolve every record's photo to an absolute server URL ready for Python to fetch. */
+  /** Resolve every record's photo to an absolute server URL ready for Python to fetch.
+   * Optimized: relative /uploads/ paths are resolved directly without re-downloading
+   * and re-uploading — Python fetches them from Express (port 5000) directly.
+   */
   const resolveToAbsoluteUrls = async (
     recs: ProjectDataRecord[],
   ): Promise<Array<{ rec: ProjectDataRecord; url: string | null }>> => {
-    return Promise.all(
-      recs.map(async (rec) => {
-        try {
-          const src = getPhotoSrc(rec);
-          if (!src) return { rec, url: null };
-          // data: / blob: → upload to file server so Python can reach it
-          if (src.startsWith("data:") || src.startsWith("blob:")) {
-            let file: File;
-            if (src.startsWith("data:")) {
-              const [header, b64] = src.split(",");
-              const mime = header.match(/:(.*?);/)?.[1] ?? "image/jpeg";
-              const bytes = atob(b64);
-              const arr = new Uint8Array(bytes.length);
-              for (let j = 0; j < bytes.length; j++) arr[j] = bytes.charCodeAt(j);
-              file = new File([arr], `pre_${rec.id}.jpg`, { type: mime });
-            } else {
-              const blob = await (await fetch(src)).blob();
-              file = new File([blob], `pre_${rec.id}.jpg`, { type: blob.type || "image/jpeg" });
-            }
-            const [serverUrl] = await uploadImages([file]);
-            return { rec, url: `${BACKEND_ORIGIN}${serverUrl}` };
-          }
-          // relative /uploads/... → prefix with origin
-          if (src.startsWith("/")) return { rec, url: `${BACKEND_ORIGIN}${src}` };
-          return { rec, url: src };
-        } catch {
-          return { rec, url: null };
+    const UPLOAD_CONCURRENCY = 16; // only used for data:/blob: URLs
+    const results: Array<{ rec: ProjectDataRecord; url: string | null }> = new Array(recs.length);
+
+    const resolveOne = async (rec: ProjectDataRecord, idx: number) => {
+      try {
+        const src = getPhotoSrc(rec);
+        if (!src) { results[idx] = { rec, url: null }; return; }
+
+        // Relative /uploads/ or /images/ path — Python fetches directly from Express.
+        // No need to download and re-upload on the frontend.
+        if (src.startsWith("/uploads/") || src.startsWith("/images/")) {
+          results[idx] = { rec, url: `${BACKEND_ORIGIN}${src}` };
+          return;
         }
-      }),
-    );
+
+        // Already absolute URL (Hostinger, CDN, etc.) — pass through directly.
+        if (/^https?:\/\//i.test(src)) {
+          results[idx] = { rec, url: src };
+          return;
+        }
+
+        // data: or blob: — must upload to server first so Python can fetch via URL
+        if (src.startsWith("data:") || src.startsWith("blob:")) {
+          let file: File;
+          if (src.startsWith("data:")) {
+            const [header, b64] = src.split(",");
+            const mime = header.match(/:(.*?);/)?.[1] ?? "image/jpeg";
+            const bytes = atob(b64);
+            const arr = new Uint8Array(bytes.length);
+            for (let j = 0; j < bytes.length; j++) arr[j] = bytes.charCodeAt(j);
+            file = new File([arr], `pre_${rec.id}.jpg`, { type: mime });
+          } else {
+            const blob = await (await fetch(src)).blob();
+            file = new File([blob], `pre_${rec.id}.jpg`, { type: blob.type || "image/jpeg" });
+          }
+          const [serverUrl] = await uploadImages([file]);
+          results[idx] = { rec, url: `${BACKEND_ORIGIN}${serverUrl}` };
+          return;
+        }
+
+        // Bare relative path — prepend backend origin
+        const normalized = src.startsWith("/") ? src : `/${src}`;
+        results[idx] = { rec, url: `${BACKEND_ORIGIN}${normalized}` };
+      } catch {
+        results[idx] = { rec, url: null };
+      }
+    };
+
+    // Only data:/blob: URLs need uploading — process all in parallel batches
+    const dataBlobRecs = recs.map((rec, idx) => ({ rec, idx })).filter(({ rec }) => {
+      const src = getPhotoSrc(rec);
+      return src.startsWith("data:") || src.startsWith("blob:");
+    });
+    const directRecs = recs.map((rec, idx) => ({ rec, idx })).filter(({ rec }) => {
+      const src = getPhotoSrc(rec);
+      return !src.startsWith("data:") && !src.startsWith("blob:");
+    });
+
+    // Resolve direct URLs synchronously (no network)
+    for (const { rec, idx } of directRecs) {
+      await resolveOne(rec, idx);
+    }
+
+    // Upload data:/blob: in parallel batches
+    for (let i = 0; i < dataBlobRecs.length; i += UPLOAD_CONCURRENCY) {
+      await Promise.all(
+        dataBlobRecs.slice(i, i + UPLOAD_CONCURRENCY).map(({ rec, idx }) => resolveOne(rec, idx))
+      );
+    }
+
+    return results;
   };
 
   const stopPolling = () => {
@@ -565,6 +626,9 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
     setBatchFailedItems([]);
     setBatchDone(false);
     setBatchResults([]);
+    batchResultsRef.current = [];
+    setBatchResultCount(0);
+    setBatchUploadProgress(0);
     setError("");
     stopPolling();
 
@@ -594,7 +658,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       const { task_id } = await photoEditorBatchStart(urls, names, settings);
       taskId = task_id;
 
-      // Step 3: poll every 1.5 s for progress updates
+      // Step 3: poll every 600 ms for progress updates
       const startedTaskId = task_id;
       pollIntervalRef.current = setInterval(async () => {
         try {
@@ -604,20 +668,27 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
           setBatchCompleted(status.completed);
           setBatchSuccessCount(status.success);
           setBatchFailedCount((prev) => Math.max(prev, status.failed));
-          setBatchCurrentName(status.current ?? "");
+          // Show current name, but during download phase show a friendlier label
+          const currentLabel = status.current?.startsWith('Downloading')
+            ? status.current
+            : status.current ?? '';
+          setBatchCurrentName(currentLabel);
           setBatchEta(status.eta_seconds ?? null);
 
           if (status.done) {
             stopPolling();
 
             // Build final results mapping task result index → record id
+            // Store in ref, NOT state, to avoid holding 303 base64 strings in React
             const allResults: Array<{ id: string; photo: string }> = [];
             for (const r of status.results ?? []) {
               const item = validItems[r.index];
               if (item) allResults.push({ id: item.rec.id, photo: r.data_url });
             }
 
-            setBatchResults(allResults);
+            batchResultsRef.current = allResults;
+            setBatchResultCount(allResults.length);
+            setBatchResults([]); // keep state empty — ref holds the data
             setBatchFailedItems(status.errors ?? []);
             setBatchFailedCount((status.errors?.length ?? 0) + invalidCount);
             setBatchDone(true);
@@ -641,7 +712,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
         } catch (pollErr: any) {
           console.warn("[batch] poll error:", pollErr.message);
         }
-      }, 1500);
+      }, 800);
     } catch (e: any) {
       stopPolling();
       setBatchLoading(false);
@@ -673,49 +744,76 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   // (~15MB limit) well under their size limits, so photos persist on reload.
 
   const handleApplyBatch = async () => {
-    if (batchResults.length === 0) return;
+    const results = batchResultsRef.current;
+    if (results.length === 0) return;
     setBatchUploading(true);
+    setBatchUploadProgress(0);
+    // Process ONE chunk at a time: decode → upload → record URL → release memory.
+    // Never hold more than UPLOAD_CHUNK decoded images in memory simultaneously.
+    const UPLOAD_CHUNK = 3;
+    const serverUrls: (string | null)[] = new Array(results.length).fill(null);
     try {
-      const UPLOAD_CHUNK = 50;
-      const serverUrls: (string | null)[] = new Array(batchResults.length).fill(null);
-
-      for (let i = 0; i < batchResults.length; i += UPLOAD_CHUNK) {
-        const slice = batchResults.slice(i, Math.min(i + UPLOAD_CHUNK, batchResults.length));
+      for (let i = 0; i < results.length; i += UPLOAD_CHUNK) {
+        const slice = results.slice(i, Math.min(i + UPLOAD_CHUNK, results.length));
+        // Decode this chunk only — previous chunks are already freed
         const files = slice.map((r, j) => {
-          const [header, b64] = r.photo.split(",");
-          const mime = header.match(/:(.*?);/)?.[1] ?? "image/jpeg";
-          const bytes = atob(b64);
-          const arr = new Uint8Array(bytes.length);
-          for (let k = 0; k < bytes.length; k++) arr[k] = bytes.charCodeAt(k);
+          const comma = r.photo.indexOf(",");
+          const meta  = r.photo.slice(0, comma);
+          const b64   = r.photo.slice(comma + 1);
+          const mime  = meta.match(/:(.*?);/)?.[1] ?? "image/jpeg";
+          const raw   = atob(b64);
+          const arr   = new Uint8Array(raw.length);
+          for (let k = 0; k < raw.length; k++) arr[k] = raw.charCodeAt(k);
           return new File([arr], `ai_${r.id}_${i + j}.jpg`, { type: mime });
         });
-        try {
-          const urls = await uploadImages(files);
-          urls.forEach((url, j) => { serverUrls[i + j] = url; });
-        } catch {
-          // chunk upload failed — fall back to data URL for those records
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const urls = await uploadImages(files);
+            urls.forEach((url, j) => { serverUrls[i + j] = url; });
+            break;
+          } catch (err) {
+            if (attempt === 1) console.warn(`[ApplyBatch] chunk ${i} failed:`, err);
+          }
         }
+        // Release chunk from ref immediately after upload to free memory
+        for (let j = 0; j < slice.length; j++) {
+          results[i + j] = { id: results[i + j].id, photo: "" };
+        }
+        setBatchUploadProgress(Math.round(((i + slice.length) / results.length) * 100));
+        // Yield to the event loop so the browser doesn't freeze
+        await new Promise((res) => setTimeout(res, 0));
       }
 
-      const resolved = batchResults.map((r, i) => ({
-        id: r.id,
-        photo: serverUrls[i] ?? r.photo,
-      }));
+      const resolved = serverUrls
+        .map((url, i) => ({ id: results[i].id, photo: url }))
+        .filter((r): r is { id: string; photo: string } => Boolean(r.photo));
+
+      if (resolved.length === 0) {
+        toast.error("Upload to server failed — check backend is running.");
+        return;
+      }
+      if (resolved.length < results.length) {
+        toast.warning(`${results.length - resolved.length} photos failed to upload and were skipped.`);
+      }
       onApply(resolved);
       toast.success(`Applied ${resolved.length} photos`);
       onClose();
     } finally {
       setBatchUploading(false);
+      batchResultsRef.current = [];
+      setBatchResultCount(0);
     }
   };
 
   // ── Download all batch results as ZIP ─────────────────────────────────────
 
   const handleDownloadZip = async () => {
-    if (batchResults.length === 0) return;
+    const results = batchResultsRef.current;
+    if (results.length === 0) return;
     const zip = new JSZip();
-    batchResults.forEach((r, i) => {
-      const [, b64] = r.photo.split(",");
+    results.forEach((r, i) => {
+      const comma = r.photo.indexOf(",");
+      const b64 = r.photo.slice(comma + 1);
       const name = recordsWithPhoto.find((rec) => rec.id === r.id);
       const label = (name as any)?.name || (name as any)?.studentName || r.id;
       zip.file(`${i + 1}_${label}.jpg`, b64, { base64: true });
@@ -1003,7 +1101,11 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
                   <div className="mt-2 space-y-1.5">
                     {/* Progress bar */}
                     <div className="flex justify-between text-[11px] text-gray-500 mb-0.5">
-                      <span>Processing batch…</span>
+                      <span>
+                        {batchCurrentName?.startsWith('Downloading')
+                          ? batchCurrentName
+                          : 'Processing batch...'}
+                      </span>
                       <span>{batchProgress}%</span>
                     </div>
                     <div className="h-1.5 bg-[#1a1a1a] rounded-full overflow-hidden">
@@ -1041,7 +1143,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2 flex-wrap">
                         <CheckCircle2 size={14} className="text-green-400" />
-                        <span className="text-[12px] text-green-300">{batchResults.length} succeeded</span>
+                        <span className="text-[12px] text-green-300">{batchResultCount} succeeded</span>
                         {batchFailedCount > 0 && (
                           <span className="text-[12px] text-red-400">{batchFailedCount} failed</span>
                         )}
@@ -1056,7 +1158,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
                             <RefreshCw size={11} /> Retry {batchFailedItems.length} failed
                           </button>
                         )}
-                        {batchResults.length > 0 && (
+                        {batchResultCount > 0 && (
                           <button
                             onClick={() => void handleDownloadZip()}
                             className="text-[11px] px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 text-white transition-colors flex items-center gap-1"
@@ -1065,14 +1167,14 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
                             <Download size={11} /> ZIP
                           </button>
                         )}
-                        {batchResults.length > 0 && (
+                        {batchResultCount > 0 && (
                           <button
                             onClick={() => void handleApplyBatch()}
                             disabled={batchUploading}
                             className="text-[11px] px-3 py-1 rounded bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-60 flex items-center gap-1"
                           >
                             {batchUploading
-                              ? <><Loader2 size={11} className="animate-spin" /> Saving…</>
+                              ? <><Loader2 size={11} className="animate-spin" /> {batchUploadProgress}%</>
                               : "Apply All"}
                           </button>
                         )}

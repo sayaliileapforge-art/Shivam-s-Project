@@ -382,16 +382,30 @@ function getPhotoColumnValue(rec: AnyRecord): string {
     const v = rec[k];
     if (v !== undefined && v !== null) {
       const s = String(v).trim();
-      // Skip full URLs — they are display values, not useful for exact filename matching.
-      // Only a bare filename (e.g. "101_Yash.jpg") belongs in the photo index.
-      if (s && !s.includes('://') && !s.startsWith('/')) return s;
+      if (!s) continue;
+      // If the value is a URL or path, extract just the basename for matching.
+      // e.g. "http://host/uploads/145_Yash.jpg" → "145_Yash.jpg"
+      //      "/uploads/assets/145_Yash.jpg"      → "145_Yash.jpg"
+      if (s.includes('://') || s.startsWith('/') || s.startsWith('uploads/')) {
+        const basename = s.split('/').pop()?.trim() ?? '';
+        if (basename && !basename.includes('://')) return basename;
+        continue;
+      }
+      // Bare filename — use directly.
+      return s;
     }
   }
   const photoPattern = /^(profile\s*pic(ture)?|photo|photo\s*file|photo\s*filename|filename|file\s*name|image|image\s*file)$/i;
   for (const [k, v] of Object.entries(rec)) {
     if (photoPattern.test(k.trim()) && v) {
       const s = String(v).trim();
-      if (s && !s.includes('://') && !s.startsWith('/')) return s;
+      if (!s) continue;
+      if (s.includes('://') || s.startsWith('/') || s.startsWith('uploads/')) {
+        const basename = s.split('/').pop()?.trim() ?? '';
+        if (basename && !basename.includes('://')) return basename;
+        continue;
+      }
+      return s;
     }
   }
   return '';

@@ -93,6 +93,13 @@ async def health():
 # ── Dev entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("AI_PORT", 8001))
+    workers = int(os.environ.get("AI_WORKERS", 1))  # set AI_WORKERS=4 in production
     # reload=False: on Windows, uvicorn's WatchFiles reload triggers
     # "Terminate batch job (Y/N)?" which kills the concurrently process group.
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        workers=workers,
+    )

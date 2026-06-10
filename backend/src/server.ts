@@ -19,11 +19,11 @@ import uploadImagesRoute from './routes/uploads';
 import realtimeRoutes from './routes/realtime';
 import rulesRoutes from './routes/rules';
 import importsRoutes from './routes/imports';
+import studentPhotosRoutes from './routes/studentPhotos';
 import { bullBoardRouter } from './queues/bullBoard';
-// Start the BullMQ worker in-process (runs concurrently alongside Express).
-// For independent horizontal scaling, move this import to a separate entry
-// point (e.g. backend/src/worker.ts) and run it as its own process/container.
+// Start the BullMQ workers in-process.
 import './workers/bulkImportWorker';
+import './workers/photoProcessingWorker';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
@@ -75,7 +75,7 @@ const uploadsDir = process.env.UPLOADS_DIR?.trim()
 
 // Auto-create the uploads root and required subdirectories.
 // These directories must exist before multer or fs.promises.writeFile is called.
-const uploadSubdirs = ['templates', 'assets'];
+const uploadSubdirs = ['templates', 'assets', 'student-photos'];
 for (const subdir of [uploadsDir, ...uploadSubdirs.map((s) => path.join(uploadsDir, s))]) {
   if (!fs.existsSync(subdir)) {
     fs.mkdirSync(subdir, { recursive: true });
@@ -111,8 +111,8 @@ const studentPhotosDir = process.env.STUDENT_PHOTOS_DIR?.trim()
 if (studentPhotosDir) {
   const resolvedStudentDir = path.resolve(studentPhotosDir);
   if (fs.existsSync(resolvedStudentDir)) {
-    app.use('/uploads', express.static(resolvedStudentDir));
-    app.use('/student-photos', express.static(resolvedStudentDir));
+    app.use('/uploads', staticCors, express.static(resolvedStudentDir));
+    app.use('/student-photos', staticCors, express.static(resolvedStudentDir));
   } else {
     console.warn(`Student photos directory not found (skipped): ${resolvedStudentDir}`);
   }
@@ -135,6 +135,7 @@ app.use('/api/upload-images', uploadImagesRoute);
 app.use('/api/realtime', realtimeRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/imports', importsRoutes);
+app.use('/api/student-photos', studentPhotosRoutes);
 
 // -- AI Image Processing proxy ? Python FastAPI on port 8001 ------------------
 // The Python service is auto-started by the backend on startup.
@@ -155,13 +156,27 @@ app.use(
 );
 
 // Auto-start AI Python service in background
-function startAIService() {
+async function startAIService() {
   const { spawn } = require('child_process');
+  const http = require('http');
   const isWindows = process.platform === 'win32';
   const aiServiceDir = path.resolve(backendRootDir, 'ai_service');
 
   if (!fs.existsSync(path.join(aiServiceDir, 'main.py'))) {
     console.warn('[AI Service] main.py not found, skipping auto-start');
+    return;
+  }
+
+  // Skip if already running
+  const isAlreadyUp = await new Promise<boolean>((resolve) => {
+    const req = http.get('http://localhost:8001/health', (r: any) => {
+      resolve(r.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(1500, () => { req.destroy(); resolve(false); });
+  });
+  if (isAlreadyUp) {
+    console.log('[AI Service] Already running on port 8001 — skipping auto-start');
     return;
   }
 
@@ -336,6 +351,9 @@ async function startServer() {
     } else {
       console.warn('! PostgreSQL auth config not found. Auth endpoints require PostgreSQL configuration.');
     }
+    // Auto-start the Python AI service (non-blocking)
+    startAIService().catch((e) => console.warn('[AI Service] Auto-start error:', e.message));
+
     app.listen(PORT, () => {
       console.log(`\n✓ Backend server running on http://localhost:${PORT}`);
       if (hasPostgresConfig()) {

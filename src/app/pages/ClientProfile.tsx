@@ -34,6 +34,7 @@ import { Textarea } from "../components/ui/textarea";
 import { RadioGroup, RadioGroupItem } from "../components/ui/radio-group";
 import { Can } from "../../lib/rbac";
 import { Permission } from "../../lib/rbac";
+import { StudentPhotoManager } from "../components/StudentPhotoManager";
 import { loadClients, updateClient, addTransaction, loadTransactions, type Client } from "../../lib/clientStore";
 import { type Project } from "../../lib/projectStore";
 import { fetchProjects, createProject } from "../../lib/apiService";
@@ -680,6 +681,7 @@ export function ClientProfile() {
           <TabsTrigger value="wallet">Wallet & Transactions</TabsTrigger>
           <TabsTrigger value="documents">Documents</TabsTrigger>
           <TabsTrigger value="communications">Communications</TabsTrigger>
+          <TabsTrigger value="photos">Student Photos</TabsTrigger>
         </TabsList>
 
         <TabsContent value="projects" className="space-y-4">
@@ -894,6 +896,19 @@ export function ClientProfile() {
                 <FileText className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
                 <p className="text-muted-foreground">No documents uploaded yet</p>
               </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="photos" className="space-y-4">
+          <Card className="shadow-md">
+            <CardContent className="p-6">
+              {id && (
+                <StudentPhotoManager
+                  clientId={id}
+                  studentName={clientData.clientName}
+                />
+              )}
             </CardContent>
           </Card>
         </TabsContent>

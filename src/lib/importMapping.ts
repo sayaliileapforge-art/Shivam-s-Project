@@ -276,8 +276,14 @@ export function mapRowToRecord(
       const mappedColumn = mapping[field.key];
       if (isMappedColumn(mappedColumn)) {
         const raw = sanitizeCell(row[mappedColumn] ?? '');
-        if (raw && !raw.includes('://') && !raw.startsWith('/')) {
-          rec['_photoFilename'] = raw;
+        if (raw) {
+          if (raw.includes('://')) {
+            // Absolute URL (e.g. Hostinger SFTP URL) — store as photo so avatar renders it.
+            rec['photo'] = raw;
+          } else if (!raw.startsWith('/')) {
+            // Bare filename — store for exact bulk-upload matching.
+            rec['_photoFilename'] = raw;
+          }
         }
       }
       continue;
