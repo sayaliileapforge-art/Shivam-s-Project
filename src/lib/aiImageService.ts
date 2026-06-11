@@ -651,7 +651,15 @@ export async function photoEditorBatchStart(
 export async function photoEditorBatchStatus(taskId: string): Promise<BatchTaskStatus> {
   const res = await fetch(`${AI_BASE}/photo-edit/batch-status/${encodeURIComponent(taskId)}`);
   const json = await parseJsonOrThrow(res);
-  if (!res.ok) throw new Error(json.detail ?? json.error ?? 'Failed to get batch status');
+  if (!res.ok) {
+    // Preserve the HTTP status on the error so the poller can tell a transient
+    // "service restarting" (503) from a terminal "task gone" (404): the AI
+    // service keeps its tasks in memory, so a 404 after a restart is unrecoverable
+    // while a 503 just means we should keep waiting.
+    const err = new Error(json.detail ?? json.error ?? 'Failed to get batch status') as Error & { status?: number };
+    err.status = res.status;
+    throw err;
+  }
   return json as BatchTaskStatus;
 }
 

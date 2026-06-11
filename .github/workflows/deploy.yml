@@ -75,9 +75,15 @@ jobs:
             pm2 restart saasapp --update-env || pm2 start /var/www/saasapp/backend/dist/server.js --name saasapp --env production
 
             echo "=== Restarting AI service with PM2 ==="
+            # NODE_ENV=production tells the AI service it's on the VPS so it uses the
+            # RAM-aware worker cap. max_memory_restart lets PM2 restart the service
+            # *gracefully* if it bloats, instead of letting the Linux OOM-killer
+            # SIGKILL it (which loses the in-flight batch and 503s every poll).
+            export NODE_ENV=production
             pm2 restart saasapp-ai --update-env || pm2 start /var/www/saasapp/backend/ai_service/main.py \
               --name saasapp-ai \
               --interpreter python3 \
+              --max-memory-restart 1500M \
               --cwd /var/www/saasapp/backend/ai_service
             pm2 save
 

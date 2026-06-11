@@ -744,8 +744,11 @@ router.post('/', maybeUploadImage, async (req: Request, res: Response) => {
       createdAt: savedTemplate.createdAt,
     });
 
-    // Keep TemplateGalleryMeta in sync for fast gallery/project reads (non-blocking).
-    TemplateGalleryMeta.findOneAndUpdate(
+    // Keep TemplateGalleryMeta in sync for fast gallery/project reads.
+    // Awaited (like the PUT route) so the lean gallery mirror is written BEFORE the
+    // realtime 'template:created' event fires below — otherwise a client that refetches
+    // the gallery on that event can miss the just-created template (create→refetch race).
+    await TemplateGalleryMeta.findOneAndUpdate(
       { templateId: savedTemplate._id },
       {
         templateId: savedTemplate._id,

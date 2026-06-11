@@ -2337,6 +2337,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
             } else if (item.type === "icon" && item.preview) {
               // Add icon as SVG
               (fabric as any).loadSVGFromString(item.preview).then((result: any) => {
+                // Re-read the canvas: it may have been disposed/swapped during the
+                // async SVG parse (e.g. user switched template right after the drop).
+                const fc = fabricRef.current;
+                if (!fc) return;
                 const objs = (result.objects ?? []).filter(Boolean);
                 if (!objs.length) return;
                 const element =
@@ -2795,6 +2799,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         QRCode.toDataURL(text || "https://example.com", { margin: 1, width: 200 })
           .then((url) => {
             fabric.FabricImage.fromURL(url).then((img) => {
+              // Re-read the canvas: it may have been disposed/swapped during the
+              // async QR generation + image decode (e.g. user switched template).
+              const fc = fabricRef.current;
+              if (!fc) return;
               const size = Math.min(fc.getWidth(), fc.getHeight()) * 0.25;
               img.scaleToWidth(size);
               img.scaleToHeight(size);
@@ -2845,6 +2853,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         const dataUrl = c.toDataURL("image/png");
         
         fabric.FabricImage.fromURL(dataUrl).then((img) => {
+          // Re-read the canvas: it may have been disposed/swapped during the
+          // async image decode (e.g. user switched template).
+          const fc = fabricRef.current;
+          if (!fc) return;
           const size = Math.min(fc.getWidth(), fc.getHeight()) * 0.2;
           img.scaleToWidth(size);
           const { margin: bMargin } = configRef.current;
@@ -3260,9 +3272,13 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         // Load SVG and apply appropriate scaling
         (fabric as any).loadSVGFromString(svgString)
           .then((result: any) => {
+            // Re-read the canvas: it may have been disposed/swapped during the
+            // async SVG parse (e.g. user switched template).
+            const fc = fabricRef.current;
+            if (!fc) return;
             const objs: fabric.FabricObject[] = (result.objects ?? []).filter(Boolean);
             if (!objs.length) return;
-            
+
             const svgElement: fabric.FabricObject =
               objs.length === 1
                 ? objs[0]
@@ -3374,7 +3390,7 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         removeLegacyBackgroundArtifacts(fc);
         fc.backgroundColor = "#ffffff";
         fc.discardActiveObject();
-        onSelectionChange(null);
+        onSelectionChangeRef.current(null);
         onBgChangeRef.current?.("none");
         fc.renderAll();
         pushUndoSnapshot(true);
@@ -3577,6 +3593,10 @@ export const FabricCanvas = forwardRef<FabricCanvasHandle, Props>(
         // fabric.loadSVGFromString returns Promise<{objects, options}> in Fabric v6
         (fabric as any).loadSVGFromString(svgString)
           .then((result: any) => {
+            // Re-read the canvas: it may have been disposed/swapped during the
+            // async SVG parse (e.g. user switched template).
+            const fc = fabricRef.current;
+            if (!fc) return;
             const objs: fabric.FabricObject[] = (result.objects ?? []).filter(Boolean);
             if (!objs.length) return;
             const element: fabric.FabricObject =

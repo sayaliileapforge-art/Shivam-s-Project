@@ -65,16 +65,49 @@ def _safe_json_response(data, **kwargs):
 # rembg/OpenCV release the GIL — use all CPU cores for parallel inference.
 _IS_VPS = os.environ.get("NODE_ENV") == "production"
 _CPU = os.cpu_count() or 4
-# CPU pool: 2× cores in dev (I/O overlap + GIL release makes this beneficial),
-# capped at 12 on VPS to avoid OOM from too many concurrent rembg sessions.
-# Dev machines often have limited RAM (e.g. 8 GB) — each batch worker gets its
-# own pre-warmed rembg ONNX session (~150-200MB), so 2x CPU cores (e.g. 24 on a
-# 12-core box) builds a session pool that alone can exceed available memory.
-# Combined with per-chunk image buffers, this OOM-crashes the process partway
-# through large batches (process dies -> proxy 503s -> progress resets).
-# Cap dev the same as VPS to keep total session-pool memory bounded.
-_N_WORKERS = max(4, min(12, _CPU * 2)) if _IS_VPS else max(4, min(12, _CPU))
+
+
+def _total_ram_mb() -> int:
+    """Best-effort total system RAM in MB. Reads /proc/meminfo on Linux (the VPS);
+    returns a conservative default elsewhere so the worker cap is never RAM-blind."""
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024  # kB → MB
+    except Exception:
+        pass
+    return 4096  # safe fallback (assume a small 4 GB box)
+
+
+# Worker count must be bounded by RAM, not just CPU. Each batch worker holds its
+# own pre-warmed rembg ONNX session (~200 MB) PLUS, during a batch, per-image
+# buffers and the accumulating result set. A RAM-blind "CPU×2" cap is what
+# OOM-kills the process ~halfway through large batches on a small VPS
+# (process dies -> proxy 503s -> in-memory task lost -> "polling failed" in the UI).
+#
+# Budget: reserve ~1.2 GB for the OS + Node backend + base Python, then allow
+# ~320 MB per worker (session + working buffers + headroom). Honour an explicit
+# AI_N_WORKERS override for operators who have tuned for their box.
+_RAM_MB = _total_ram_mb()
+_MEM_BUDGET_MB = max(512, _RAM_MB - 1200)
+# RAM-derived ceiling on concurrent rembg sessions (~320 MB each incl. working set).
+# Applied EVERYWHERE — not just when NODE_ENV=production — so the process can't be
+# OOM-killed mid-batch even if the VPS env flag isn't set on an older pm2 process.
+_RAM_WORKER_CAP = max(2, _MEM_BUDGET_MB // 320)
+_env_workers = os.environ.get("AI_N_WORKERS")
+if _env_workers and _env_workers.isdigit() and int(_env_workers) > 0:
+    _N_WORKERS = int(_env_workers)
+else:
+    # Never exceed CPU count (more CPU-bound threads than cores just thrashes),
+    # never exceed the RAM budget, and keep a hard upper bound of 12.
+    _N_WORKERS = max(2, min(_CPU * (2 if not _IS_VPS else 1), _RAM_WORKER_CAP, 12))
 _BATCH_POOL = ThreadPoolExecutor(max_workers=_N_WORKERS)
+print(
+    f"[ai] worker pool: _N_WORKERS={_N_WORKERS} "
+    f"(cpu={_CPU}, ram={_RAM_MB}MB, ram_cap={_RAM_WORKER_CAP}, vps={_IS_VPS})",
+    flush=True,
+)
 # I/O pool: large thread count — HTTP fetches are pure I/O, no CPU/GIL contention.
 # 64 concurrent fetches means 300 images can be downloaded in ~5–10 seconds total.
 # On Windows dev machines, opening 64 simultaneous localhost connections to the
@@ -565,6 +598,25 @@ def _cleanup_old_tasks() -> None:
     expired = [k for k, v in _batch_tasks.items() if v.get("_monotonic_start", 0) < cutoff]
     for k in expired:
         del _batch_tasks[k]
+
+
+async def periodic_task_cleanup(interval_seconds: int = 60) -> None:
+    """
+    Background loop that evicts expired batch tasks on a fixed interval.
+
+    Without this, _cleanup_old_tasks() only runs when a NEW batch request arrives,
+    so a completed batch's large base64 ``data_url`` strings stay pinned in
+    ``_batch_tasks`` indefinitely once the server goes idle — a slow memory leak that
+    can OOM the VPS after a big batch. Started from the FastAPI startup hook.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            _cleanup_old_tasks()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:  # never let the cleanup loop die silently
+            print(f"[batch] periodic cleanup error: {exc}", flush=True)
 
 
 async def _run_batch_task(

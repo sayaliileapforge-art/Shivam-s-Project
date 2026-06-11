@@ -12,7 +12,6 @@ import fs from 'fs';
 import path from 'path';
 import http from 'http';
 import https from 'https';
-import FormData from 'form-data';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('PhotoProcessingService');

@@ -667,6 +667,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
 
   // Track consecutive poll errors to detect stuck/dead tasks
   const pollErrorCountRef = useRef(0);
+  const pollFirstErrorTsRef = useRef(0); // when the current run of poll errors began (0 = none)
   const pollLastProgressRef = useRef({ completed: 0, ts: 0 });
 
   const stopPolling = () => {
@@ -675,6 +676,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       pollIntervalRef.current = null;
     }
     pollErrorCountRef.current = 0;
+    pollFirstErrorTsRef.current = 0;
     pollLastProgressRef.current = { completed: 0, ts: 0 };
   };
 
@@ -732,7 +734,12 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
       const startedTaskId = task_id;
       const POLL_INTERVAL_MS = validItems.length > 200 ? 2000 : 800;
       const STALE_TIMEOUT_MS = 5 * 60 * 1000; // 5 min no progress = stuck
-      const MAX_CONSECUTIVE_ERRORS = 8;        // ~6.4 s of failures = dead
+      // A 404 means the task is genuinely gone (AI service restarted and lost its
+      // in-memory task) — unrecoverable, fail fast. A 503/network error just means
+      // the service is momentarily unreachable (restarting / briefly overloaded);
+      // a restart that reloads the rembg ONNX model can take 60-90s, so we must
+      // keep polling through that window instead of giving up after ~16s.
+      const TRANSIENT_ERROR_GRACE_MS = 90 * 1000; // tolerate ~90s of 503/network blips
       pollLastProgressRef.current = { completed: 0, ts: Date.now() };
       const lastLoggedPctRef = { current: -1 };
 
@@ -740,6 +747,7 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
         try {
           const status = await photoEditorBatchStatus(startedTaskId);
           pollErrorCountRef.current = 0; // reset on successful poll
+          pollFirstErrorTsRef.current = 0;
 
           const pct = status.total > 0 ? Math.round((status.completed / status.total) * 100) : 0;
           setBatchProgress(pct);
@@ -814,20 +822,41 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
           }
         } catch (pollErr: any) {
           pollErrorCountRef.current += 1;
+          if (pollFirstErrorTsRef.current === 0) pollFirstErrorTsRef.current = Date.now();
           const msg: string = pollErr?.message ?? 'unknown';
-          console.warn(`[batch] poll error #${pollErrorCountRef.current}:`, msg);
+          const httpStatus: number | undefined = pollErr?.status;
+          const erroredForMs = Date.now() - pollFirstErrorTsRef.current;
+          console.warn(
+            `[batch] poll error #${pollErrorCountRef.current} (status=${httpStatus ?? 'net'}, ` +
+            `${Math.round(erroredForMs / 1000)}s):`, msg,
+          );
 
-          if (pollErrorCountRef.current >= MAX_CONSECUTIVE_ERRORS) {
-            // Task 404 (server restarted) or persistent network failure
+          // A 404 / "not found" / "expired" means the task is genuinely gone: the AI
+          // service restarted and lost its in-memory task. This is unrecoverable —
+          // fail fast and tell the user to restart the batch.
+          const isGone =
+            httpStatus === 404 ||
+            msg.includes('404') || msg.includes('not found') || msg.includes('expired');
+          if (isGone) {
             stopPolling();
             setBatchLoading(false);
-            const isGone = msg.includes('404') || msg.includes('not found') || msg.includes('expired');
+            setError(`Batch task lost (AI service restarted). Please click Batch again to restart.`);
+            console.error(`[batch] stopping poll — task ${startedTaskId} is gone (404):`, msg);
+            return;
+          }
+
+          // Otherwise it's a transient failure (503 "starting up" / network blip).
+          // Keep polling — a restart that reloads the rembg model can take 60-90s.
+          // Only give up once the service has been continuously unreachable past the
+          // grace window, which indicates it crashed and isn't coming back.
+          if (erroredForMs >= TRANSIENT_ERROR_GRACE_MS) {
+            stopPolling();
+            setBatchLoading(false);
             setError(
-              isGone
-                ? `Batch task lost (AI service restarted). Please click Batch again to restart.`
-                : `Batch polling failed after ${MAX_CONSECUTIVE_ERRORS} attempts: ${msg}`
+              `AI service unreachable for ${Math.round(erroredForMs / 1000)}s — it may have crashed. ` +
+              `Please retry; if it keeps failing, restart the AI service on the server.`
             );
-            console.error(`[batch] stopping poll — task ${startedTaskId} unreachable:`, msg);
+            console.error(`[batch] stopping poll — task ${startedTaskId} unreachable for ${Math.round(erroredForMs / 1000)}s:`, msg);
           }
         }
       }, POLL_INTERVAL_MS);

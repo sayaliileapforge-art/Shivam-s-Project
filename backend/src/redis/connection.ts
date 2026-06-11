@@ -58,7 +58,7 @@ export const redisInfo = `${resolvedHost}:${REDIS_PORT}`;
  */
 export async function checkRedisConnection(): Promise<void> {
   if (!REDIS_ENABLED) return;
-  const IORedis = (await import('ioredis')).default;
+  const { Redis: IORedis } = await import('ioredis');
   const client = new IORedis({
     ...redisConnectionOptions,
     lazyConnect: true,

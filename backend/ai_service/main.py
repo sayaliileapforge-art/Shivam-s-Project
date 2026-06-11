@@ -39,7 +39,7 @@ if sys.version_info[0] >= 3:
     # For Python 3, ensure UTF-8 is used for JSON operations
     pass
 
-from routers.image_processing import router as img_router
+from routers.image_processing import router as img_router, periodic_task_cleanup
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -83,6 +83,12 @@ async def startup_event():
         except Exception as exc:
             print(f"[AI Service] WARN Pre-warm failed - will init on first request: {exc}")
     threading.Thread(target=_warm, daemon=True).start()
+
+    # Periodically evict expired batch tasks so a completed batch's base64 results
+    # don't stay pinned in memory when the server is idle (otherwise cleanup only
+    # runs when the next batch request arrives — a slow memory leak / OOM risk).
+    import asyncio as _asyncio
+    _asyncio.create_task(periodic_task_cleanup(60))
 
 
 @app.get("/health")
