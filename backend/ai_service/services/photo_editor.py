@@ -96,7 +96,11 @@ import os as _os
 _CPU_COUNT = _os.cpu_count() or 4
 _IS_VPS_PE = _os.environ.get("NODE_ENV") == "production"
 # Match the larger _N_WORKERS defined in image_processing.py
-_N_WORKERS_PHOTO = max(4, min(12, _CPU_COUNT * 2)) if _IS_VPS_PE else max(_CPU_COUNT, _CPU_COUNT * 2)
+# Must mirror image_processing.py's _N_WORKERS — each pool entry is a
+# pre-warmed rembg ONNX session (~150-200MB). Uncapped 2x-CPU on dev machines
+# with limited RAM builds a session pool large enough to OOM-crash the
+# process mid-batch. Cap dev the same as VPS.
+_N_WORKERS_PHOTO = max(4, min(12, _CPU_COUNT * 2)) if _IS_VPS_PE else max(4, min(12, _CPU_COUNT))
 
 _N_POOL = 0          # set by _build_session_pool()
 _sess_pool: "_queue.Queue | None" = None
@@ -196,34 +200,47 @@ def hex_to_rgb(h: str) -> Tuple[int, int, int]:
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
+_init_lock = _threading.Lock()
+
 def init_sessions():
     global _app, _session_std, _session_hum, _face_mesh, _sessions_ready
     if _sessions_ready:
         return  # already initialised — skip the 4 null-checks on every batch image
-    if _app is None and INSIGHTFACE_OK:
-        try:
-            _app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-            _app.prepare(ctx_id=-1, det_size=(640, 640))
-        except Exception as e:
-            print(f"⚠ InsightFace init: {e}")
-    if _session_std is None and REMBG_OK:
-        try:
-            _session_std = rembg_session("u2net")
-        except Exception as e:
-            print(f"⚠ rembg std session: {e}")
-    if _session_hum is None and REMBG_OK:
-        try:
-            _session_hum = rembg_session("u2net_human_seg")
-        except Exception as e:
-            print(f"⚠ rembg hum session: {e}")
-    if _face_mesh is None and MEDIAPIPE_OK:
-        try:
-            _face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True, max_num_faces=1,
-                refine_landmarks=True, min_detection_confidence=0.5)
-        except Exception as e:
-            print(f"⚠ MediaPipe init: {e}")
-    _sessions_ready = True
+    # Double-checked locking: without this, every _BATCH_POOL worker thread
+    # races into here on the first batch image and each one redundantly
+    # (and concurrently) loads InsightFace/rembg/MediaPipe models — heavy
+    # ONNX session creation done N_WORKERS times at once can stall for a
+    # very long time (or appear to hang), stalling Phase B before any
+    # image completes.
+    with _init_lock:
+        if _sessions_ready:
+            return
+        print(f"[init] loading AI models (thread={_threading.current_thread().name})...", flush=True)
+        if _app is None and INSIGHTFACE_OK:
+            try:
+                _app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+                _app.prepare(ctx_id=-1, det_size=(640, 640))
+            except Exception as e:
+                print(f"⚠ InsightFace init: {e}")
+        if _session_std is None and REMBG_OK:
+            try:
+                _session_std = rembg_session("u2net")
+            except Exception as e:
+                print(f"⚠ rembg std session: {e}")
+        if _session_hum is None and REMBG_OK:
+            try:
+                _session_hum = rembg_session("u2net_human_seg")
+            except Exception as e:
+                print(f"⚠ rembg hum session: {e}")
+        if _face_mesh is None and MEDIAPIPE_OK:
+            try:
+                _face_mesh = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=True, max_num_faces=1,
+                    refine_landmarks=True, min_detection_confidence=0.5)
+            except Exception as e:
+                print(f"⚠ MediaPipe init: {e}")
+        _sessions_ready = True
+        print("[init] AI models ready", flush=True)
     # Build the pre-warmed rembg session pool for batch processing.
     # This runs once; subsequent calls are no-ops (guarded by _pool_lock).
     # Pool size = _N_WORKERS_PHOTO so every batch worker has a dedicated session.
@@ -310,6 +327,8 @@ def _fallback_face(img_bgr):
     return [DnnFace([float(x1), float(y1), float(x2), float(y2)])]
 
 
+_faceapp_lock = _threading.Lock()
+
 def get_faces(img_bgr):
     """
     Detect faces: InsightFace → Haar cascade (lenient) → portrait-position fallback.
@@ -317,7 +336,14 @@ def get_faces(img_bgr):
     """
     if _app is not None:
         try:
-            faces = _app.get(img_bgr)
+            # _app (InsightFace FaceAnalysis) is a single shared instance reused
+            # across all _BATCH_POOL worker threads. Its detect/landmark models
+            # use shared internal buffers and are not safe under concurrent
+            # .get() calls — without this lock, batch chunks (N_WORKERS images
+            # processed in parallel) can corrupt that shared state and hang the
+            # whole chunk indefinitely.
+            with _faceapp_lock:
+                faces = _app.get(img_bgr)
             if faces:
                 faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
                 return faces
@@ -1384,7 +1410,10 @@ def full_process(img_bytes: bytes, settings: Dict[str, Any]) -> bytes:
 #   • landmark-based teeth / dark-circle ops (no MediaPipe in batch)
 # Combined, this gives ≈5-8× speedup vs full_process.
 
-BATCH_SIZE = 512
+# Lower resolution = smaller per-image numpy buffers across all batch workers,
+# which matters a lot when _N_WORKERS_PHOTO images are processed concurrently
+# on memory-constrained dev machines (rembg runs at 256px internally anyway).
+BATCH_SIZE = 384
 _REMBG_INFER_SIZE = 256
 
 

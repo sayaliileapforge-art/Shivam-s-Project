@@ -67,11 +67,21 @@ _IS_VPS = os.environ.get("NODE_ENV") == "production"
 _CPU = os.cpu_count() or 4
 # CPU pool: 2× cores in dev (I/O overlap + GIL release makes this beneficial),
 # capped at 12 on VPS to avoid OOM from too many concurrent rembg sessions.
-_N_WORKERS = max(4, min(12, _CPU * 2)) if _IS_VPS else max(_CPU, _CPU * 2)
+# Dev machines often have limited RAM (e.g. 8 GB) — each batch worker gets its
+# own pre-warmed rembg ONNX session (~150-200MB), so 2x CPU cores (e.g. 24 on a
+# 12-core box) builds a session pool that alone can exceed available memory.
+# Combined with per-chunk image buffers, this OOM-crashes the process partway
+# through large batches (process dies -> proxy 503s -> progress resets).
+# Cap dev the same as VPS to keep total session-pool memory bounded.
+_N_WORKERS = max(4, min(12, _CPU * 2)) if _IS_VPS else max(4, min(12, _CPU))
 _BATCH_POOL = ThreadPoolExecutor(max_workers=_N_WORKERS)
 # I/O pool: large thread count — HTTP fetches are pure I/O, no CPU/GIL contention.
 # 64 concurrent fetches means 300 images can be downloaded in ~5–10 seconds total.
-_FETCH_POOL = ThreadPoolExecutor(max_workers=min(64, _CPU * 8))
+# On Windows dev machines, opening 64 simultaneous localhost connections to the
+# Express server can trigger ConnectionResetError(10054) and leave some fetches
+# permanently hung (urllib doesn't always honor its timeout on a reset socket),
+# which deadlocks asyncio.gather in Phase A. Cap concurrency much lower on Windows.
+_FETCH_POOL = ThreadPoolExecutor(max_workers=16 if os.name == "nt" else min(64, _CPU * 8))
 
 # The Express backend that serves /uploads/* files.
 # In dev the AI service runs on 8001, Express runs on 5000.
@@ -574,6 +584,41 @@ async def _run_batch_task(
     if task is None:
         return
 
+    try:
+        await _run_batch_task_inner(task_id, url_items, settings)
+    except Exception as exc:
+        import traceback
+        print(f"[batch] FATAL unhandled error in task {task_id}: {exc}", flush=True)
+        traceback.print_exc()
+        if task_id in _batch_tasks:
+            t = _batch_tasks[task_id]
+            t["done"] = True
+            t["status"] = "done"
+            t["current"] = ""
+            t["eta_seconds"] = 0
+            # Mark any unprocessed items as failed
+            already = t["success"] + t["failed"]
+            remaining = t["total"] - already
+            if remaining > 0:
+                t["failed"] += remaining
+                t["completed"] = t["total"]
+                for item in url_items:
+                    idx = item["index"]
+                    if not any(r["index"] == idx for r in t["results"]) and \
+                       not any(e["index"] == idx for e in t["errors"]):
+                        t["errors"].append({"index": idx, "name": item.get("name", ""), "error": f"Worker crashed: {repr(exc)}"})
+
+
+async def _run_batch_task_inner(
+    task_id: str,
+    url_items: List[Dict[str, Any]],
+    settings: Dict[str, Any],
+) -> None:
+    task = _batch_tasks.get(task_id)
+    if task is None:
+        return
+
+    print(f"[batch:{task_id}] started total={len(url_items)} n_workers={_N_WORKERS}", flush=True)
     loop = asyncio.get_event_loop()
 
     # Phase A: fetch all images concurrently
@@ -586,26 +631,31 @@ async def _run_batch_task(
         nonlocal fetch_done
         def _fetch(_u=_resolve_image_url(item["url"])) -> bytes:
             req = urllib.request.Request(_u, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 raw = resp.read()
             if len(raw) > MAX_FILE_SIZE:
                 raise ValueError("Image exceeds 15 MB limit")
             return raw
         try:
-            img_bytes_map[item["index"]] = await loop.run_in_executor(_FETCH_POOL, _fetch)
+            img_bytes_map[item["index"]] = await asyncio.wait_for(
+                loop.run_in_executor(_FETCH_POOL, _fetch), timeout=35
+            )
+        except asyncio.TimeoutError:
+            task["errors"].append({"index": item["index"], "name": item.get("name", ""), "error": "Fetch timed out (>35s)"})
+            task["failed"] += 1
+            task["completed"] += 1
         except Exception as exc:
             task["errors"].append({"index": item["index"], "name": item.get("name", ""), "error": f"Fetch failed: {repr(exc)}"})
             task["failed"] += 1
             task["completed"] += 1
         finally:
             fetch_done += 1
-            # Report download progress so the frontend doesn't show 0% during Phase A.
-            # Scale download phase to 0-30% of total progress.
             download_pct = int((fetch_done / fetch_total) * 30) if fetch_total else 30
             task["_download_pct"] = download_pct
             task["current"] = f"Downloading... {fetch_done}/{fetch_total}"
 
     await asyncio.gather(*[fetch_one(item) for item in url_items])
+    print(f"[batch:{task_id}] phase A done — fetched={len(img_bytes_map)}/{fetch_total}", flush=True)
 
     # Phase B: process fetched images in worker-pool-sized chunks
     task["current"] = "Processing..."
@@ -618,17 +668,26 @@ async def _run_batch_task(
         idx = item["index"]
         name = item.get("name", f"Image {idx + 1}")
         task["current"] = name
+        t0 = time.monotonic()
         try:
-            result_bytes = await loop.run_in_executor(
-                _BATCH_POOL, full_process_fast, img_bytes_map[idx], settings
+            result_bytes = await asyncio.wait_for(
+                loop.run_in_executor(_BATCH_POOL, full_process_fast, img_bytes_map[idx], settings),
+                timeout=120,  # 2 min max per image; prevents one slow image blocking the whole batch
             )
             del img_bytes_map[idx]
             task["results"].append({"index": idx, "name": name, "data_url": _to_data_url(result_bytes, "image/jpeg")})
             task["success"] += 1
+            print(f"[batch:{task_id}] OK idx={idx} name={name} proc={proc_completed+1}/{len(fetched_items)} took={time.monotonic()-t0:.2f}s", flush=True)
+        except asyncio.TimeoutError:
+            task["errors"].append({"index": idx, "name": name, "error": "Processing timed out (>120s)"})
+            task["failed"] += 1
+            img_bytes_map.pop(idx, None)
+            print(f"[batch:{task_id}] TIMEOUT idx={idx} name={name} after={time.monotonic()-t0:.2f}s", flush=True)
         except Exception as exc:
             task["errors"].append({"index": idx, "name": name, "error": repr(exc)})
             task["failed"] += 1
             img_bytes_map.pop(idx, None)
+            print(f"[batch:{task_id}] ERROR idx={idx} name={name}: {exc}", flush=True)
 
         proc_completed += 1
         task["completed"] = task["success"] + task["failed"]
@@ -641,13 +700,17 @@ async def _run_batch_task(
     # Process in chunks equal to the CPU pool size to avoid OOM and head-of-line blocking
     chunk_size = max(4, _N_WORKERS)
     for i in range(0, len(fetched_items), chunk_size):
-        await asyncio.gather(*[process_one(item) for item in fetched_items[i:i + chunk_size]])
+        chunk = fetched_items[i:i + chunk_size]
+        print(f"[batch:{task_id}] chunk {i // chunk_size} starting — {len(chunk)} images", flush=True)
+        await asyncio.gather(*[process_one(item) for item in chunk])
+        print(f"[batch:{task_id}] chunk {i // chunk_size} done — completed={task['completed']}/{task['total']}", flush=True)
 
     task["done"] = True
     task["status"] = "done"
     task["current"] = ""
     task["eta_seconds"] = 0
     task["completed"] = task["total"]
+    print(f"[batch:{task_id}] done success={task['success']} failed={task['failed']}", flush=True)
 
 
 @router.post("/photo-edit/batch-async", summary="Start async batch (returns task_id for polling)")
@@ -750,13 +813,17 @@ async def photo_edit_batch_status(task_id: str):
             {k: v for k, v in r.items() if k != "data_url"}
             for r in response_data.get("results", [])
         ]
-        # During Phase A (downloading), synthesise a non-zero completed count
-        # so the frontend progress bar moves instead of sitting at 0%.
+        # Blend download-phase progress (0-30%) with processing-phase progress
+        # (30-100%) into a single monotonically non-decreasing "completed" count.
+        # Both download_pct and real_completed only ever increase, so the
+        # blended value can never go backwards (fixes progress dropping from
+        # ~30% to ~1% when Phase B starts reporting real completions).
+        total = response_data.get("total", 0) or 1
+        real_completed = response_data.get("completed", 0)
         download_pct = task.get("_download_pct", 0)
-        if download_pct > 0 and response_data.get("completed", 0) == 0:
-            total = response_data.get("total", 1)
-            # Report up to 30% of total as virtual download progress
-            response_data["completed"] = max(response_data["completed"], int(total * download_pct / 100))
+        process_pct = (real_completed / total) * 70
+        blended_pct = min(100, download_pct + process_pct)
+        response_data["completed"] = max(real_completed, min(total, int(total * blended_pct / 100)))
     return _safe_json_response(response_data)
 
 

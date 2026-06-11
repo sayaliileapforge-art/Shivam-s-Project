@@ -24,6 +24,7 @@ import { bullBoardRouter } from './queues/bullBoard';
 // Start the BullMQ workers in-process.
 import './workers/bulkImportWorker';
 import './workers/photoProcessingWorker';
+import { checkRedisConnection } from './redis/connection';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
@@ -147,6 +148,9 @@ app.use(
     target: AI_SERVICE_URL,
     changeOrigin: true,
     onError: (_err: any, _req: any, res: any) => {
+      if (res.headersSent || res.writableEnded) {
+        return;
+      }
       res.status(503).json({
         success: false,
         error: 'AI service is starting up. Please retry in a few seconds.',
@@ -353,6 +357,9 @@ async function startServer() {
     }
     // Auto-start the Python AI service (non-blocking)
     startAIService().catch((e) => console.warn('[AI Service] Auto-start error:', e.message));
+
+    // Verify Redis connectivity for BullMQ queues/workers (non-blocking)
+    checkRedisConnection().catch((e) => console.warn('[Redis] Connectivity check error:', (e as Error).message));
 
     app.listen(PORT, () => {
       console.log(`\n✓ Backend server running on http://localhost:${PORT}`);

@@ -50,3 +50,27 @@ export const redisConnectionOptions: RedisOptions = {
 };
 
 export const redisInfo = `${resolvedHost}:${REDIS_PORT}`;
+
+/**
+ * One-off connectivity check for BullMQ's Redis backend.
+ * Logs success/failure so connection problems surface immediately at startup
+ * instead of manifesting later as silently-stalled queue jobs.
+ */
+export async function checkRedisConnection(): Promise<void> {
+  if (!REDIS_ENABLED) return;
+  const IORedis = (await import('ioredis')).default;
+  const client = new IORedis({
+    ...redisConnectionOptions,
+    lazyConnect: true,
+    retryStrategy: () => null,
+  });
+  try {
+    await client.connect();
+    await client.ping();
+    console.log(`[Redis] Connected to ${redisInfo} — BullMQ queues/workers active`);
+  } catch (err) {
+    console.error(`[Redis] Connection check failed for ${redisInfo}: ${(err as Error).message}`);
+  } finally {
+    client.disconnect();
+  }
+}

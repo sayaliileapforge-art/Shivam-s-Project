@@ -13,7 +13,7 @@
  *   • Action Buttons       (Download / Before/After / Compliance / Batch / Reset)
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import JSZip from "jszip";
 import {
   X, Upload, RefreshCw, Download, Layers, ShieldCheck,
@@ -123,7 +123,7 @@ interface SliderRowProps {
   onChange: (v: number) => void;
 }
 
-function SliderRow({ emoji, label, value, min, max, step = 0.1, tags, tagLine, color = "#818cf8", onChange }: SliderRowProps) {
+const SliderRow = memo(function SliderRow({ emoji, label, value, min, max, step = 0.1, tags, tagLine, color = "#818cf8", onChange }: SliderRowProps) {
   const pct = ((value - min) / (max - min)) * 100;
   return (
     <div className="mb-4">
@@ -167,7 +167,7 @@ function SliderRow({ emoji, label, value, min, max, step = 0.1, tags, tagLine, c
       )}
     </div>
   );
-}
+});
 
 // ── Int slider (whole number) ─────────────────────────────────────────────────
 
@@ -182,7 +182,7 @@ interface IntSliderProps {
   onChange: (v: number) => void;
 }
 
-function IntSliderRow({ label, value, min, max, step = 1, hint, color = "#64748b", onChange }: IntSliderProps) {
+const IntSliderRow = memo(function IntSliderRow({ label, value, min, max, step = 1, hint, color = "#64748b", onChange }: IntSliderProps) {
   const pct = ((value - min) / (max - min)) * 100;
   return (
     <div className="mb-3">
@@ -206,11 +206,11 @@ function IntSliderRow({ label, value, min, max, step = 1, hint, color = "#64748b
       {hint && <p className="text-[9px] text-gray-500 ml-22 mt-0.5 ml-[88px]">{hint}</p>}
     </div>
   );
-}
+});
 
 // ── Section header ────────────────────────────────────────────────────────────
 
-function SectionHeader({ children, color = "#3b82f6" }: { children: React.ReactNode; color?: string }) {
+const SectionHeader = memo(function SectionHeader({ children, color = "#3b82f6" }: { children: React.ReactNode; color?: string }) {
   return (
     <div className="flex items-center gap-2 mb-3 mt-1">
       <span className="text-[11px] font-semibold tracking-wider uppercase" style={{ color }}>
@@ -219,11 +219,11 @@ function SectionHeader({ children, color = "#3b82f6" }: { children: React.ReactN
       <div className="flex-1 h-px bg-[#2a2a2a]" />
     </div>
   );
-}
+});
 
 // ── Styled select ─────────────────────────────────────────────────────────────
 
-function DarkSelect({ value, onChange, options, className = "" }: {
+const DarkSelect = memo(function DarkSelect({ value, onChange, options, className = "" }: {
   value: string; onChange: (v: string) => void; options: string[]; className?: string;
 }) {
   return (
@@ -238,11 +238,11 @@ function DarkSelect({ value, onChange, options, className = "" }: {
       <ChevronDown className="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" size={12} />
     </div>
   );
-}
+});
 
 // ── Color input row ───────────────────────────────────────────────────────────
 
-function ColorRow({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+const ColorRow = memo(function ColorRow({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
   return (
     <div className="flex items-center gap-2 mb-2">
       <span className="text-[12px] text-gray-400 w-24 shrink-0">{label}</span>
@@ -260,11 +260,11 @@ function ColorRow({ label, value, onChange }: { label: string; value: string; on
       />
     </div>
   );
-}
+});
 
 // ── Checkbox row ──────────────────────────────────────────────────────────────
 
-function CheckRow({ checked, onChange, children }: {
+const CheckRow = memo(function CheckRow({ checked, onChange, children }: {
   checked: boolean; onChange: (v: boolean) => void; children: React.ReactNode;
 }) {
   return (
@@ -280,7 +280,54 @@ function CheckRow({ checked, onChange, children }: {
       <span className="text-[12px] text-gray-300 select-none">{children}</span>
     </label>
   );
-}
+});
+
+// ── Record selector (prev/next + dropdown) ────────────────────────────────────
+// Memoized so its <option> list (up to 1000+ entries for large batches) is not
+// rebuilt/reconciled on every batch-progress poll tick (every 800ms-2s).
+const RecordSelector = memo(function RecordSelector({
+  recordsWithPhoto, selectedRecordIdx, phase1Loading, onSelect,
+}: {
+  recordsWithPhoto: ProjectDataRecord[];
+  selectedRecordIdx: number;
+  phase1Loading: boolean;
+  onSelect: (idx: number) => void;
+}) {
+  if (recordsWithPhoto.length <= 1) return null;
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        onClick={() => onSelect(selectedRecordIdx > 0 ? selectedRecordIdx - 1 : recordsWithPhoto.length - 1)}
+        disabled={phase1Loading}
+        className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white disabled:opacity-40 transition-colors"
+        title="Previous student"
+      >
+        <ChevronLeft size={14} />
+      </button>
+      <span className="text-[11px] text-gray-500">{selectedRecordIdx + 1}/{recordsWithPhoto.length}</span>
+      <button
+        onClick={() => onSelect(selectedRecordIdx < recordsWithPhoto.length - 1 ? selectedRecordIdx + 1 : 0)}
+        disabled={phase1Loading}
+        className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white disabled:opacity-40 transition-colors"
+        title="Next student"
+      >
+        <ChevronRight size={14} />
+      </button>
+      <span className="text-[11px] text-gray-500">Editing:</span>
+      <select
+        value={selectedRecordIdx}
+        onChange={(e) => onSelect(parseInt(e.target.value))}
+        className="bg-[#1a1a1a] border border-[#333] text-gray-200 text-[12px] rounded px-2 py-1 focus:outline-none"
+      >
+        {recordsWithPhoto.map((r, i) => (
+          <option key={r.id} value={i}>
+            {(r as any).name || (r as any).studentName || r.id}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+});
 
 // ── Main component ────────────────────────────────────────────────────────────
 
@@ -322,7 +369,14 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
   // settings synchronously without putting `settings` in callback dependency arrays.
   const settingsRef = useRef<PhotoEditorSettings>({ ...DEFAULT_SETTINGS });
 
-  const recordsWithPhoto = records.filter((r) => Boolean(getPhotoSrc(r)));
+  // Memoized — without this, a new array (and 1000+ <option> elements in the
+  // record selector below) would be rebuilt on every state update, including
+  // every 800ms batch-progress poll tick. That's the main cause of the
+  // "Page Unresponsive" freeze on large (300-1000+) record batches.
+  const recordsWithPhoto = useMemo(
+    () => records.filter((r) => Boolean(getPhotoSrc(r))),
+    [records, getPhotoSrc],
+  );
   // Keep settingsRef in sync on every render
   settingsRef.current = settings;
 
@@ -435,6 +489,12 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
 
   // Always keep ref in sync so composition debounce can call latest version
   uploadForEditingRef.current = uploadForEditing;
+
+  const handleSelectRecord = useCallback((idx: number) => {
+    setSelectedRecordIdx(idx);
+    const rec = recordsWithPhoto[idx];
+    if (rec) void uploadForEditing(rec);
+  }, [recordsWithPhoto, uploadForEditing]);
 
   // Auto-upload when modal opens
   useEffect(() => {
@@ -605,11 +665,17 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
     return results;
   };
 
+  // Track consecutive poll errors to detect stuck/dead tasks
+  const pollErrorCountRef = useRef(0);
+  const pollLastProgressRef = useRef({ completed: 0, ts: 0 });
+
   const stopPolling = () => {
     if (pollIntervalRef.current !== null) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
     }
+    pollErrorCountRef.current = 0;
+    pollLastProgressRef.current = { completed: 0, ts: 0 };
   };
 
   /** Start (or re-start for retry) a batch job with the given subset of records. */
@@ -655,64 +721,116 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
         return r.name ?? r.studentName ?? r.student_name ?? rec.id;
       });
       const urls = validItems.map(({ url }) => url);
+      const batchStartedAt = Date.now();
+      console.info(`[batch] starting — ${validItems.length} image(s)`);
       const { task_id } = await photoEditorBatchStart(urls, names, settings);
       taskId = task_id;
 
-      // Step 3: poll every 600 ms for progress updates
+      // Step 3: poll for progress updates.
+      // Large batches (>200 images) poll less frequently — fewer re-renders
+      // and fewer /batch-status requests over what can be a 30+ min run.
       const startedTaskId = task_id;
+      const POLL_INTERVAL_MS = validItems.length > 200 ? 2000 : 800;
+      const STALE_TIMEOUT_MS = 5 * 60 * 1000; // 5 min no progress = stuck
+      const MAX_CONSECUTIVE_ERRORS = 8;        // ~6.4 s of failures = dead
+      pollLastProgressRef.current = { completed: 0, ts: Date.now() };
+      const lastLoggedPctRef = { current: -1 };
+
       pollIntervalRef.current = setInterval(async () => {
         try {
           const status = await photoEditorBatchStatus(startedTaskId);
+          pollErrorCountRef.current = 0; // reset on successful poll
+
           const pct = status.total > 0 ? Math.round((status.completed / status.total) * 100) : 0;
           setBatchProgress(pct);
           setBatchCompleted(status.completed);
           setBatchSuccessCount(status.success);
           setBatchFailedCount((prev) => Math.max(prev, status.failed));
-          // Show current name, but during download phase show a friendlier label
           const currentLabel = status.current?.startsWith('Downloading')
             ? status.current
             : status.current ?? '';
           setBatchCurrentName(currentLabel);
           setBatchEta(status.eta_seconds ?? null);
 
+          // Concise progress log every 10% so large-batch runs are traceable
+          // without flooding the console on every poll tick.
+          if (pct >= lastLoggedPctRef.current + 10 || status.done) {
+            lastLoggedPctRef.current = pct;
+            console.info(
+              `[batch] ${pct}% — ${status.completed}/${status.total} ` +
+              `(✓${status.success} ✗${status.failed})` +
+              (status.eta_seconds != null ? ` eta=${Math.round(status.eta_seconds)}s` : '')
+            );
+          }
+
+          // Update stale-progress tracker
+          if (status.completed > pollLastProgressRef.current.completed) {
+            pollLastProgressRef.current = { completed: status.completed, ts: Date.now() };
+          } else if (
+            !status.done &&
+            Date.now() - pollLastProgressRef.current.ts > STALE_TIMEOUT_MS
+          ) {
+            // No progress for 5 min — task is stuck/dead
+            stopPolling();
+            setBatchLoading(false);
+            setError(
+              `Batch stalled at ${pct}% (no progress for 5 min). ` +
+              `The AI service may have crashed. Restart it and retry.`
+            );
+            console.error(`[batch] task ${startedTaskId} stalled at ${pct}%`);
+            return;
+          }
+
           if (status.done) {
             stopPolling();
-
-            // Build final results mapping task result index → record id
-            // Store in ref, NOT state, to avoid holding 303 base64 strings in React
+            const elapsedSec = (Date.now() - batchStartedAt) / 1000;
+            const throughput = elapsedSec > 0 ? (status.total / elapsedSec) : 0;
+            console.info(
+              `[batch] done — ${status.total} image(s) in ${elapsedSec.toFixed(1)}s ` +
+              `(${throughput.toFixed(2)}/s, ✓${status.success} ✗${status.failed})`
+            );
             const allResults: Array<{ id: string; photo: string }> = [];
             for (const r of status.results ?? []) {
               const item = validItems[r.index];
               if (item) allResults.push({ id: item.rec.id, photo: r.data_url });
             }
-
             batchResultsRef.current = allResults;
             setBatchResultCount(allResults.length);
-            setBatchResults([]); // keep state empty — ref holds the data
+            setBatchResults([]);
             setBatchFailedItems(status.errors ?? []);
             setBatchFailedCount((status.errors?.length ?? 0) + invalidCount);
             setBatchDone(true);
             setBatchLoading(false);
-
             const succeededCount = allResults.length;
             const failedTotal = (status.errors?.length ?? 0) + invalidCount;
             if (failedTotal > 0 && succeededCount > 0) {
-              toast.error(
-                `${failedTotal} image${failedTotal !== 1 ? "s" : ""} failed · ${succeededCount} succeeded`,
-              );
+              toast.error(`${failedTotal} image${failedTotal !== 1 ? "s" : ""} failed · ${succeededCount} succeeded`);
             } else if (failedTotal > 0) {
               toast.error(`All ${failedTotal} images failed to process`);
             } else {
               toast.success(`All ${succeededCount} images processed successfully`);
             }
-
-            // Clean up task on server
             photoEditorBatchDelete(startedTaskId).catch(() => {});
           }
         } catch (pollErr: any) {
-          console.warn("[batch] poll error:", pollErr.message);
+          pollErrorCountRef.current += 1;
+          const msg: string = pollErr?.message ?? 'unknown';
+          console.warn(`[batch] poll error #${pollErrorCountRef.current}:`, msg);
+
+          if (pollErrorCountRef.current >= MAX_CONSECUTIVE_ERRORS) {
+            // Task 404 (server restarted) or persistent network failure
+            stopPolling();
+            setBatchLoading(false);
+            const isGone = msg.includes('404') || msg.includes('not found') || msg.includes('expired');
+            setError(
+              isGone
+                ? `Batch task lost (AI service restarted). Please click Batch again to restart.`
+                : `Batch polling failed after ${MAX_CONSECUTIVE_ERRORS} attempts: ${msg}`
+            );
+            console.error(`[batch] stopping poll — task ${startedTaskId} unreachable:`, msg);
+          }
         }
-      }, 800);
+      }, POLL_INTERVAL_MS);
     } catch (e: any) {
       stopPolling();
       setBatchLoading(false);
@@ -870,6 +988,12 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
     }
   };
 
+  // Cleanup polling on unmount (handles React StrictMode double-mount)
+  useEffect(() => {
+    return () => { stopPolling(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   if (!open) return null;
 
   const displayImg = showBefore ? originalImg : previewImg;
@@ -904,51 +1028,12 @@ export function AIPhotoEditorModal({ open, onClose, records, getPhotoSrc, onAppl
           </div>
 
           {/* Record selector with prev/next */}
-          {recordsWithPhoto.length > 1 && (
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => {
-                  const prev = selectedRecordIdx > 0 ? selectedRecordIdx - 1 : recordsWithPhoto.length - 1;
-                  setSelectedRecordIdx(prev);
-                  uploadForEditing(recordsWithPhoto[prev]);
-                }}
-                disabled={phase1Loading}
-                className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white disabled:opacity-40 transition-colors"
-                title="Previous student"
-              >
-                <ChevronLeft size={14} />
-              </button>
-              <span className="text-[11px] text-gray-500">{selectedRecordIdx + 1}/{recordsWithPhoto.length}</span>
-              <button
-                onClick={() => {
-                  const next = selectedRecordIdx < recordsWithPhoto.length - 1 ? selectedRecordIdx + 1 : 0;
-                  setSelectedRecordIdx(next);
-                  uploadForEditing(recordsWithPhoto[next]);
-                }}
-                disabled={phase1Loading}
-                className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white disabled:opacity-40 transition-colors"
-                title="Next student"
-              >
-                <ChevronRight size={14} />
-              </button>
-              <span className="text-[11px] text-gray-500">Editing:</span>
-              <select
-                value={selectedRecordIdx}
-                onChange={(e) => {
-                  const idx = parseInt(e.target.value);
-                  setSelectedRecordIdx(idx);
-                  uploadForEditing(recordsWithPhoto[idx]);
-                }}
-                className="bg-[#1a1a1a] border border-[#333] text-gray-200 text-[12px] rounded px-2 py-1 focus:outline-none"
-              >
-                {recordsWithPhoto.map((r, i) => (
-                  <option key={r.id} value={i}>
-                    {(r as any).name || (r as any).studentName || r.id}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
+          <RecordSelector
+            recordsWithPhoto={recordsWithPhoto}
+            selectedRecordIdx={selectedRecordIdx}
+            phase1Loading={phase1Loading}
+            onSelect={handleSelectRecord}
+          />
 
           <div className="flex items-center gap-2">
             {/* Metrics badges */}
