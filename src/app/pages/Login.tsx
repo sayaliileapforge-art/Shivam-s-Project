@@ -5,6 +5,7 @@ import { Button } from "../components/ui/button";
 import { Label } from "../components/ui/label";
 import { Input } from "../components/ui/input";
 import {
+  Building2,
   Eye,
   EyeOff,
   Lock,
@@ -19,14 +20,17 @@ import { MOCK_USERS } from "../../lib/rbac/mockUsers";
 import { forgotPassword, isValidMobile, login, setAuthToken, signup } from "../../lib/authApi";
 
 type AuthMode = "signin" | "signup";
+type AccountType = "vendor" | "other";
 
 interface FieldErrors {
   identifier?: string;
   loginPassword?: string;
+  loginSchoolCode?: string;
   signupName?: string;
   signupEmail?: string;
   signupMobile?: string;
   signupPassword?: string;
+  signupSchoolCode?: string;
   forgotEmail?: string;
 }
 
@@ -44,13 +48,17 @@ export function Login() {
   const [showSignupPassword, setShowSignupPassword] = useState(false);
   const [loginIdentifier, setLoginIdentifier] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [loginAccountType, setLoginAccountType] = useState<AccountType>("vendor");
+  const [loginSchoolCode, setLoginSchoolCode] = useState("");
   const [signupName, setSignupName] = useState("");
   const [signupEmail, setSignupEmail] = useState("");
   const [signupMobile, setSignupMobile] = useState("");
   const [signupPassword, setSignupPassword] = useState("");
+  const [signupSchoolCode, setSignupSchoolCode] = useState("");
   const [forgotEmail, setForgotEmail] = useState("");
 
   const emailRegex = useMemo(() => /^[^\s@]+@[^\s@]+\.[^\s@]+$/, []);
+  const schoolCodeRegex = useMemo(() => /^[A-Za-z0-9]{3,15}$/, []);
   const demoPassword = "PrintSaaS@123";
 
   useEffect(() => {
@@ -87,6 +95,14 @@ export function Login() {
     if (!identifier.includes("@") && !isValidMobile(identifier)) {
       nextErrors.identifier = "Invalid mobile number";
     }
+    if (loginAccountType === "vendor") {
+      const schoolCode = loginSchoolCode.trim();
+      if (!schoolCode) {
+        nextErrors.loginSchoolCode = "School code is required for vendor login";
+      } else if (!schoolCodeRegex.test(schoolCode)) {
+        nextErrors.loginSchoolCode = "Invalid school code format";
+      }
+    }
 
     setFieldErrors(nextErrors);
     if (Object.keys(nextErrors).length) {
@@ -95,7 +111,11 @@ export function Login() {
 
     setIsSubmitting(true);
     try {
-      const result = await login({ identifier, password: loginPassword });
+      const result = await login({
+        identifier,
+        password: loginPassword,
+        ...(loginAccountType === "vendor" ? { schoolCode: loginSchoolCode.trim().toUpperCase() } : {}),
+      });
       setAuthToken(result.token);
       if (rememberMe) {
         localStorage.setItem("auth-remembered-identifier", identifier);
@@ -164,6 +184,12 @@ export function Login() {
     if (!signupPassword) {
       nextErrors.signupPassword = "Password is required";
     }
+    const schoolCode = signupSchoolCode.trim();
+    if (!schoolCode) {
+      nextErrors.signupSchoolCode = "School code is required";
+    } else if (!schoolCodeRegex.test(schoolCode)) {
+      nextErrors.signupSchoolCode = "Invalid school code format";
+    }
 
     setFieldErrors(nextErrors);
     if (Object.keys(nextErrors).length) {
@@ -177,12 +203,14 @@ export function Login() {
         email,
         mobile,
         password: signupPassword,
+        schoolCode: schoolCode.toUpperCase(),
       });
       setSnackbar({ message: "Signup successful. Please sign in.", isError: false });
       setMode("signin");
       setLoginIdentifier(email);
       setLoginPassword("");
       setSignupPassword("");
+      setSignupSchoolCode("");
     } catch (e) {
       const message = (e as Error).message || "Signup failed";
       setApiError(message);
@@ -259,6 +287,26 @@ export function Login() {
             {mode === "signin" ? (
               <>
                 <div>
+                  <Label className="mb-1.5 text-xs font-semibold text-slate-700">Account Type</Label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setLoginAccountType("vendor")}
+                      className={`h-10 rounded-xl border text-sm font-semibold transition ${loginAccountType === "vendor" ? "border-indigo-300 bg-indigo-50 text-indigo-700" : "border-slate-200 bg-white/85 text-slate-500"}`}
+                    >
+                      Vendor
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLoginAccountType("other")}
+                      className={`h-10 rounded-xl border text-sm font-semibold transition ${loginAccountType === "other" ? "border-indigo-300 bg-indigo-50 text-indigo-700" : "border-slate-200 bg-white/85 text-slate-500"}`}
+                    >
+                      Staff / Admin
+                    </button>
+                  </div>
+                </div>
+
+                <div>
                   <Label htmlFor="identifier" className="mb-1.5 text-xs font-semibold text-slate-700">Email or Mobile</Label>
                   <div className="relative">
                     <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-slate-400">
@@ -299,6 +347,25 @@ export function Login() {
                   </div>
                   {fieldErrors.loginPassword && <p className="mt-1 text-xs text-rose-600">{fieldErrors.loginPassword}</p>}
                 </div>
+
+                {loginAccountType === "vendor" && (
+                  <div>
+                    <Label htmlFor="loginSchoolCode" className="mb-1.5 text-xs font-semibold text-slate-700">School Code</Label>
+                    <div className="relative">
+                      <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-slate-400">
+                        <Building2 className="h-4 w-4" />
+                      </span>
+                      <Input
+                        id="loginSchoolCode"
+                        placeholder="e.g. SCH1234"
+                        value={loginSchoolCode}
+                        onChange={(e) => setLoginSchoolCode(e.target.value.toUpperCase())}
+                        className="h-11 rounded-xl border-slate-200 bg-white/85 pl-10 focus-visible:ring-indigo-300"
+                      />
+                    </div>
+                    {fieldErrors.loginSchoolCode && <p className="mt-1 text-xs text-rose-600">{fieldErrors.loginSchoolCode}</p>}
+                  </div>
+                )}
 
                 <div className="flex items-center justify-between text-sm">
                   <label className="flex items-center gap-2 text-slate-600">
@@ -433,6 +500,23 @@ export function Login() {
                     </button>
                   </div>
                   {fieldErrors.signupPassword && <p className="mt-1 text-xs text-rose-600">{fieldErrors.signupPassword}</p>}
+                </div>
+
+                <div>
+                  <Label htmlFor="signupSchoolCode" className="mb-1.5 text-xs font-semibold text-slate-700">School Code</Label>
+                  <div className="relative">
+                    <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-slate-400">
+                      <Building2 className="h-4 w-4" />
+                    </span>
+                    <Input
+                      id="signupSchoolCode"
+                      placeholder="e.g. SCH1234"
+                      value={signupSchoolCode}
+                      onChange={(e) => setSignupSchoolCode(e.target.value.toUpperCase())}
+                      className="h-11 rounded-xl border-slate-200 bg-white/85 pl-10 focus-visible:ring-indigo-300"
+                    />
+                  </div>
+                  {fieldErrors.signupSchoolCode && <p className="mt-1 text-xs text-rose-600">{fieldErrors.signupSchoolCode}</p>}
                 </div>
 
                 <Button

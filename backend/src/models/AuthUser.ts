@@ -8,6 +8,7 @@ export interface IAuthUser extends Document {
   passwordHash: string;
   firmName?: string;
   profileImage?: string;
+  schoolCode?: string;
   lastLoginAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -22,6 +23,7 @@ const AuthUserSchema = new Schema<IAuthUser>(
     passwordHash: { type: String, required: true },
     firmName: { type: String, default: '' },
     profileImage: { type: String, default: '' },
+    schoolCode: { type: String, default: '', uppercase: true, trim: true },
     lastLoginAt: { type: Date, default: null },
   },
   { timestamps: true },

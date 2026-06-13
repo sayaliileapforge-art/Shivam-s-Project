@@ -1,8 +1,11 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const EpAuthUser = require('../models/EpAuthUser');
 
 const VALID_ROLES = ['student', 'teacher', 'principal', 'vendor'];
+// Vendor roles as defined by the Enterprise Portal (web admin) auth system.
+const EP_VENDOR_ROLES = ['master_vendor', 'sub_vendor'];
 
 function normalizeRole(value) {
   return (value || '').toString().trim().toLowerCase();
@@ -174,34 +177,77 @@ exports.login = async (req, res) => {
         .json({ message: 'schoolCode is required for this role' });
     }
 
+    const safePhone = phone.toString().trim();
+
     let user;
     if (isVendor) {
-      user = await User.findOne({ phone: phone.toString().trim(), role: 'vendor' });
+      user = await User.findOne({ phone: safePhone, role: 'vendor' });
     } else {
       user = await User.findOne({
-        phone: phone.toString().trim(),
+        phone: safePhone,
         role: normalizedRole,
         schoolCode: safeSchoolCode,
       });
     }
-    if (!user) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+
+    if (user) {
+      const validPassword = await bcrypt.compare(password.toString(), user.password);
+      if (!validPassword) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      const secret = process.env.JWT_SECRET || 'dev_secret_change_me';
+      const token = jwt.sign(
+        { id: user._id.toString(), phone: user.phone, role: user.role, schoolCode: user.schoolCode },
+        secret,
+        { expiresIn: '7d' }
+      );
+
+      const publicUser = await toPublicUser(user);
+      return res.json({ token, user: publicUser });
     }
 
-    const validPassword = await bcrypt.compare(password.toString(), user.password);
-    if (!validPassword) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+    // Fallback: vendor accounts created via the Enterprise Portal (web admin)
+    // live in a different collection/schema (authusers: email/mobile +
+    // passwordHash, role master_vendor/sub_vendor). Recognize the same
+    // vendor credentials here without duplicating or migrating the record.
+    if (isVendor) {
+      const epUser = await EpAuthUser.findOne({
+        role: { $in: EP_VENDOR_ROLES },
+        $or: [{ mobile: safePhone }, { email: safePhone.toLowerCase() }],
+      });
+
+      if (epUser && epUser.passwordHash) {
+        const validPassword = await bcrypt.compare(password.toString(), epUser.passwordHash);
+        if (!validPassword) {
+          return res.status(401).json({ message: 'Invalid credentials' });
+        }
+
+        const secret = process.env.JWT_SECRET || 'dev_secret_change_me';
+        const epSchoolCode = (epUser.schoolCode || '').toString().trim().toUpperCase();
+        const token = jwt.sign(
+          { id: epUser._id.toString(), phone: epUser.mobile, role: 'vendor', schoolCode: epSchoolCode },
+          secret,
+          { expiresIn: '7d' }
+        );
+
+        return res.json({
+          token,
+          user: {
+            id: epUser._id.toString(),
+            name: epUser.name,
+            phone: epUser.mobile,
+            role: 'vendor',
+            schoolCode: epSchoolCode,
+            schoolName: '',
+            vendorCode: epSchoolCode,
+            principalId: '',
+          },
+        });
+      }
     }
 
-    const secret = process.env.JWT_SECRET || 'dev_secret_change_me';
-    const token = jwt.sign(
-      { id: user._id.toString(), phone: user.phone, role: user.role, schoolCode: user.schoolCode },
-      secret,
-      { expiresIn: '7d' }
-    );
-
-    const publicUser = await toPublicUser(user);
-    return res.json({ token, user: publicUser });
+    return res.status(401).json({ message: 'Invalid credentials' });
   } catch (err) {
     console.error('[auth.login]', err);
     return res.status(500).json({ message: 'Server error' });

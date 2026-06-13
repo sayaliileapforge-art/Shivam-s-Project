@@ -20,6 +20,7 @@ router.post('/signup', async (req: Request, res: Response) => {
       email: typeof body.email === 'string' ? body.email : '',
       mobile: typeof body.mobile === 'string' ? body.mobile : '',
       password: typeof body.password === 'string' ? body.password : '',
+      schoolCode: typeof body.schoolCode === 'string' ? body.schoolCode : '',
     });
     res.status(result.status).json(result.body);
   } catch (error) {

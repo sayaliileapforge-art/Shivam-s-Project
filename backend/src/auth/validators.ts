@@ -1,4 +1,4 @@
-import { MOBILE_REGEX } from './constants';
+import { MOBILE_REGEX, SCHOOL_CODE_REGEX, VENDOR_ROLES } from './constants';
 
 export function isValidEmail(email: string): boolean {
   const normalized = email.trim().toLowerCase();
@@ -15,4 +15,16 @@ export function normalizeEmail(email: string): string {
 
 export function normalizeMobile(mobile: string): string {
   return mobile.trim();
+}
+
+export function normalizeSchoolCode(schoolCode: string): string {
+  return schoolCode.trim().toUpperCase();
+}
+
+export function isValidSchoolCode(schoolCode: string): boolean {
+  return SCHOOL_CODE_REGEX.test(normalizeSchoolCode(schoolCode));
+}
+
+export function isVendorRole(role: string): boolean {
+  return VENDOR_ROLES.includes(role);
 }

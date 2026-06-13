@@ -5,7 +5,15 @@ import jwt from 'jsonwebtoken';
 import { PoolClient } from 'pg';
 import { BCRYPT_ROUNDS, OTP_DIGITS, OTP_EXPIRY_MINUTES } from './constants';
 import { getAuthPool, hasPostgresConfig, withAuthClient } from '../config/postgres';
-import { isValidEmail, isValidMobile, normalizeEmail, normalizeMobile } from './validators';
+import {
+  isValidEmail,
+  isValidMobile,
+  isValidSchoolCode,
+  isVendorRole,
+  normalizeEmail,
+  normalizeMobile,
+  normalizeSchoolCode,
+} from './validators';
 import { sendPasswordOtp } from './mailer';
 import AuthUserModel from '../models/AuthUser';
 import AuthPasswordResetModel from '../models/AuthPasswordReset';
@@ -18,6 +26,7 @@ export interface AuthUser {
   role: 'sub_vendor' | string;
   firmName?: string;
   profileImage?: string;
+  schoolCode?: string;
   lastLoginAt?: string | null;
 }
 
@@ -29,6 +38,7 @@ interface DbAuthUser {
   role: string;
   firmName?: string;
   profileImage?: string;
+  schoolCode?: string;
   lastLoginAt?: string | null;
   password_hash: string;
 }
@@ -42,6 +52,7 @@ interface MongoAuthUser {
   role: string;
   firmName?: string;
   profileImage?: string;
+  schoolCode?: string;
   lastLoginAt?: string | null;
   passwordHash: string;
 }
@@ -57,6 +68,7 @@ interface RawMongoAuthUser {
   role?: unknown;
   firmName?: unknown;
   profileImage?: unknown;
+  schoolCode?: unknown;
   lastLoginAt?: unknown;
   passwordHash?: unknown;
   password?: unknown;
@@ -95,6 +107,7 @@ function mapMongoAuthUser(raw: RawMongoAuthUser | null): MongoAuthUser | null {
     role: readString(raw.role) || 'sub_vendor',
     firmName: readString(raw.firmName),
     profileImage: readString(raw.profileImage),
+    schoolCode: readString(raw.schoolCode),
     lastLoginAt: readIsoDate(raw.lastLoginAt),
     passwordHash,
   };
@@ -132,6 +145,7 @@ function toAuthUser(input: {
   role?: string;
   firmName?: string;
   profileImage?: string;
+  schoolCode?: string;
   lastLoginAt?: string | null;
 }): AuthUser {
   return {
@@ -142,6 +156,7 @@ function toAuthUser(input: {
     role: input.role || 'sub_vendor',
     firmName: input.firmName || '',
     profileImage: input.profileImage || '',
+    schoolCode: input.schoolCode || '',
     lastLoginAt: input.lastLoginAt || null,
   };
 }
@@ -156,6 +171,7 @@ async function findUserByEmailOrMobile(client: PoolClient, identifier: string): 
       role,
       firm_name AS "firmName",
       profile_image AS "profileImage",
+      school_code AS "schoolCode",
       last_login_at AS "lastLoginAt",
       password_hash
      FROM auth_users
@@ -190,11 +206,12 @@ async function findMongoUserByEmailOrMobile(identifier: string): Promise<MongoAu
   return mapMongoAuthUser(rawLegacyUser);
 }
 
-export async function signup(payload: { name: string; email: string; mobile: string; password: string }) {
+export async function signup(payload: { name: string; email: string; mobile: string; password: string; schoolCode?: string }) {
   const name = payload.name?.trim();
   const email = normalizeEmail(payload.email || '');
   const mobile = normalizeMobile(payload.mobile || '');
   const password = payload.password || '';
+  const role = 'sub_vendor';
 
   if (!name || !email || !mobile || !password) {
     return { status: 400, body: { success: false, error: 'All fields are required' } };
@@ -204,6 +221,18 @@ export async function signup(payload: { name: string; email: string; mobile: str
   }
   if (!isValidMobile(mobile)) {
     return { status: 400, body: { success: false, error: 'Invalid mobile number' } };
+  }
+
+  let schoolCode = '';
+  if (isVendorRole(role)) {
+    const schoolCodeRaw = payload.schoolCode || '';
+    if (!schoolCodeRaw.trim()) {
+      return { status: 400, body: { success: false, error: 'School code is required for vendor signup' } };
+    }
+    if (!isValidSchoolCode(schoolCodeRaw)) {
+      return { status: 400, body: { success: false, error: 'Invalid school code format' } };
+    }
+    schoolCode = normalizeSchoolCode(schoolCodeRaw);
   }
 
   if (!hasPostgresConfig()) {
@@ -222,8 +251,9 @@ export async function signup(payload: { name: string; email: string; mobile: str
       name,
       email,
       mobile,
-      role: 'sub_vendor',
+      role,
       passwordHash,
+      schoolCode,
     });
 
     const user = toAuthUser({
@@ -234,6 +264,7 @@ export async function signup(payload: { name: string; email: string; mobile: str
       role: created.role,
       firmName: created.firmName,
       profileImage: created.profileImage,
+      schoolCode: created.schoolCode,
       lastLoginAt: created.lastLoginAt ? new Date(created.lastLoginAt).toISOString() : null,
     });
 
@@ -253,8 +284,8 @@ export async function signup(payload: { name: string; email: string; mobile: str
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const inserted = await client.query<AuthUser>(
-      `INSERT INTO auth_users (name, email, mobile, role, password_hash)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO auth_users (name, email, mobile, role, password_hash, school_code)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING
         id,
         name,
@@ -263,17 +294,19 @@ export async function signup(payload: { name: string; email: string; mobile: str
         role,
         firm_name AS "firmName",
         profile_image AS "profileImage",
+        school_code AS "schoolCode",
         last_login_at AS "lastLoginAt"`,
-      [name, email, mobile, 'sub_vendor', passwordHash],
+      [name, email, mobile, role, passwordHash, schoolCode],
     );
 
     return { status: 201, body: { success: true, data: inserted.rows[0] } };
   });
 }
 
-export async function login(payload: { identifier: string; password: string }) {
+export async function login(payload: { identifier: string; password: string; schoolCode?: string }) {
   const identifierRaw = payload.identifier?.trim() || '';
   const password = payload.password || '';
+  const schoolCodeRaw = payload.schoolCode || '';
 
   if (!identifierRaw || !password) {
     return { status: 400, body: { success: false, error: 'Identifier and password are required' } };
@@ -290,6 +323,11 @@ export async function login(payload: { identifier: string; password: string }) {
     return { status: 400, body: { success: false, error: 'Invalid mobile number' } };
   }
 
+  if (schoolCodeRaw.trim() && !isValidSchoolCode(schoolCodeRaw)) {
+    return { status: 400, body: { success: false, error: 'Invalid school code format' } };
+  }
+  const schoolCode = schoolCodeRaw.trim() ? normalizeSchoolCode(schoolCodeRaw) : '';
+
   if (!hasPostgresConfig()) {
     const user = await findMongoUserByEmailOrMobile(identifier);
     if (!user) {
@@ -299,6 +337,11 @@ export async function login(payload: { identifier: string; password: string }) {
     const passwordOk = await bcrypt.compare(password, user.passwordHash);
     if (!passwordOk) {
       return { status: 401, body: { success: false, error: 'Invalid credentials' } };
+    }
+
+    const schoolCodeError = validateSchoolCodeForLogin(user.role, user.schoolCode, schoolCode);
+    if (schoolCodeError) {
+      return { status: schoolCodeError.status, body: { success: false, error: schoolCodeError.error } };
     }
 
     const now = new Date();
@@ -312,6 +355,7 @@ export async function login(payload: { identifier: string; password: string }) {
       role: user.role,
       firmName: user.firmName,
       profileImage: user.profileImage,
+      schoolCode: user.schoolCode,
       lastLoginAt: now.toISOString(),
     });
 
@@ -340,6 +384,11 @@ export async function login(payload: { identifier: string; password: string }) {
       return { status: 401, body: { success: false, error: 'Invalid credentials' } };
     }
 
+    const schoolCodeError = validateSchoolCodeForLogin(user.role, user.schoolCode, schoolCode);
+    if (schoolCodeError) {
+      return { status: schoolCodeError.status, body: { success: false, error: schoolCodeError.error } };
+    }
+
     const now = new Date();
     await client.query('UPDATE auth_users SET last_login_at = $1, updated_at = NOW() WHERE id = $2', [now, user.id]);
 
@@ -351,6 +400,7 @@ export async function login(payload: { identifier: string; password: string }) {
       role: user.role,
       firmName: user.firmName,
       profileImage: user.profileImage,
+      schoolCode: user.schoolCode,
       lastLoginAt: now.toISOString(),
     });
 
@@ -367,6 +417,30 @@ export async function login(payload: { identifier: string; password: string }) {
       },
     };
   });
+}
+
+function validateSchoolCodeForLogin(
+  role: string,
+  storedSchoolCode: string | undefined,
+  providedSchoolCode: string,
+): { status: number; error: string } | null {
+  const stored = (storedSchoolCode || '').trim().toUpperCase();
+
+  if (providedSchoolCode) {
+    if (!isVendorRole(role)) {
+      return { status: 400, error: 'School code is only applicable for vendor accounts' };
+    }
+    if (stored && stored !== providedSchoolCode) {
+      return { status: 401, error: 'Invalid school code' };
+    }
+    return null;
+  }
+
+  if (isVendorRole(role) && stored) {
+    return { status: 400, error: 'School code is required for vendor login' };
+  }
+
+  return null;
 }
 
 export async function getProfileByEmail(emailInput: string) {

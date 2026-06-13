@@ -26,6 +26,7 @@ export interface AuthUserDto {
   role: string;
   firmName?: string;
   profileImage?: string;
+  schoolCode?: string;
   lastLoginAt?: string | null;
 }
 
@@ -62,7 +63,7 @@ export function isValidMobile(value: string): boolean {
   return MOBILE_REGEX.test(value.trim());
 }
 
-export async function signup(payload: { name: string; email: string; mobile: string; password: string }) {
+export async function signup(payload: { name: string; email: string; mobile: string; password: string; schoolCode?: string }) {
   const res = await fetch(`${API_BASE}/auth/signup`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -77,7 +78,7 @@ export async function signup(payload: { name: string; email: string; mobile: str
   return result.data as AuthUserDto;
 }
 
-export async function login(payload: { identifier: string; password: string }) {
+export async function login(payload: { identifier: string; password: string; schoolCode?: string }) {
   const res = await fetch(`${API_BASE}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

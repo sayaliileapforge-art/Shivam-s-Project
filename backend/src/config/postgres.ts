@@ -98,6 +98,10 @@ export async function initAuthSchema(): Promise<void> {
       ALTER TABLE auth_users
       ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ NULL;
     `);
+    await client.query(`
+      ALTER TABLE auth_users
+      ADD COLUMN IF NOT EXISTS school_code VARCHAR(50) DEFAULT '';
+    `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS auth_password_resets (
